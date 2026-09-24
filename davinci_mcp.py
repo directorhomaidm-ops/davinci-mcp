@@ -362,15 +362,20 @@ def append_clips(
     if start_frame is None and end_frame is None:
         ok = pool.AppendToTimeline(clips)
     else:
-        ok = pool.AppendToTimeline([
+        infos = [
             {
                 "mediaPoolItem": c,
                 "startFrame": start_frame or 0,
                 "endFrame": end_frame if end_frame is not None else int(float(c.GetClipProperty("Frames") or 0)) - 1,
-                "trackIndex": track,
             }
             for c in clips
-        ])
+        ]
+        # Only pass trackIndex when asked: appends carrying it were measured to read back fine but render almost
+        # nothing on live Resolve 21.0.4, while Blackmagic's own example (no trackIndex) renders normally.
+        if track != 1:
+            for info in infos:
+                info["trackIndex"] = track
+        ok = pool.AppendToTimeline(infos)
     if not ok:
         raise ToolError("append failed")
     return f"appended {len(clips)} clip(s) to '{tl.GetName()}'"

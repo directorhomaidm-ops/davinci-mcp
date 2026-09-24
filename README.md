@@ -324,6 +324,16 @@ The server writes one JSON object per line to stderr (stdout is the MCP protocol
 
 `outcome` is `ok` (INFO), `error` (WARNING, with `error` holding the message returned to the client) or `crash` (ERROR, with the traceback in `exc`).
 
+## Live check
+
+`scripts/live_check.py` runs the tools against your running Resolve and writes a pass/fail report:
+
+```bash
+uv run scripts/live_check.py            # add --studio on Resolve Studio only
+```
+
+It saves the open project, works in a scratch project it creates and deletes at the end, generates its own test media (PNG image sequences and a WAV tone, no ffmpeg needed), and writes `report.md` / `report.json` plus all outputs to a temporary folder it prints. It checks the points the unit tests cannot: that renders contain frames, exact color space names, the Fusion Tracker's input names, the comp frame range on media clips, page switching, and the Resolve 21.1 calls when available.
+
 ## Development
 
 The tests run against an in-memory fake of Resolve's scripting API, so Resolve does not need to be installed:

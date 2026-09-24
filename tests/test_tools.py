@@ -96,7 +96,14 @@ def test_append_whole_clips(project):
 def test_append_subclips(project):
     d.append_clips(["a.mov"], start_frame=10, end_frame=19, track=1)
     (entry,) = project.pool.appended[-1]
-    assert (entry["startFrame"], entry["endFrame"], entry["trackIndex"]) == (10, 19, 1)
+    assert (entry["startFrame"], entry["endFrame"]) == (10, 19)
+    assert "trackIndex" not in entry  # the form Blackmagic's example uses, which renders
+
+
+def test_append_subclips_other_track(project):
+    d.append_clips(["a.mov"], start_frame=0, end_frame=9, track=2)
+    (entry,) = project.pool.appended[-1]
+    assert entry["trackIndex"] == 2
 
 
 def test_append_subclip_defaults_end_to_last_frame(project):
