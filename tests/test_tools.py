@@ -181,7 +181,8 @@ def test_all_tools_registered():
         "render_queue", "start_render", "delete_render_jobs", "save_render_preset", "browse_storage", "create_bin",
         "move_clips", "delete_clips", "import_image_sequence", "clip_info", "tag_clips", "relink_clips", "link_proxy",
         "replace_clip", "export_metadata", "export_timeline", "import_timeline", "save_project", "export_project",
-        "import_project",
+        "import_project", "color_management_info", "set_color_management", "apply_color_preset", "set_hdr",
+        "set_clip_color_space", "analyze_dolby_vision",
     }
 
 
@@ -1293,3 +1294,99 @@ def test_project_save_export_import(project, resolve, tmp_path):
     assert "Demo copy" in d.list_projects()
     with pytest.raises(ToolError, match="name already in use"):
         d.import_project(out["path"], name="Demo")
+
+
+# --- color management and HDR ---
+
+
+def test_color_management_info(project):
+    info = d.color_management_info()
+    assert info == {"scope": "project", "color": {"colorScienceMode": "davinciYRGB"},
+                    "hdr": {"hdrMasteringOn": "0", "hdrDolbyControlsOn": "0"}}
+    tl_info = d.color_management_info(timeline=True)
+    assert (tl_info["scope"], tl_info["uses_own_settings"]) == ("timeline 'Main'", False)
+    assert tl_info["color"] == info["color"]  # falls back to the project
+
+
+def test_set_color_management_orders_keys(project):
+    # Given in the "wrong" order: spaces before the color science that unlocks them.
+    out = d.set_color_management({"colorSpaceOutput": "Rec.2100 ST2084", "colorSpaceTimeline": "DaVinci WG/Intermediate",
+                                  "isAutoColorManage": False, "colorScienceMode": "davinciYRGBColorManagedv2",
+                                  "graphicsWhiteLevel": 203})
+    assert out["applied"] == {"colorScienceMode": "davinciYRGBColorManagedv2", "isAutoColorManage": "0",
+                              "colorSpaceTimeline": "DaVinci WG/Intermediate", "colorSpaceOutput": "Rec.2100 ST2084",
+                              "graphicsWhiteLevel": "203"}
+    assert list(out["applied"])[0] == "colorScienceMode"
+
+
+def test_set_color_management_reports_what_was_not_applied(project):
+    d.apply_color_preset("rcm_sdr")
+    # Automatic RCM locks the spaces: Resolve returns True but keeps the old value; the read-back catches it.
+    with pytest.raises(ToolError, match="did not apply colorSpaceOutput: wanted 'Rec.709 Gamma 2.4', is ''"):
+        d.set_color_management({"colorSpaceOutput": "Rec.709 Gamma 2.4"})
+    d.apply_color_preset("rcm_custom")
+    with pytest.raises(ToolError, match="did not apply colorSpaceOutput: wanted 'Rec 709'"):
+        d.set_color_management({"colorSpaceOutput": "Rec 709"})
+    with pytest.raises(ToolError, match="not a color/HDR setting: timelineFrameRate"):
+        d.set_color_management({"timelineFrameRate": "25"})
+    with pytest.raises(ToolError, match="no settings"):
+        d.set_color_management({})
+
+
+def test_timeline_scope_leaves_project_alone(project):
+    d.apply_color_preset("aces_cct", timeline=True)
+    assert project.current.settings["useCustomSettings"] == "1"
+    assert project.current.settings["colorScienceMode"] == "acescct"
+    assert project.color["colorScienceMode"] == "davinciYRGB"
+    info = d.color_management_info(timeline=True)
+    assert (info["uses_own_settings"], info["color"]["colorScienceMode"]) == (True, "acescct")
+
+
+def test_apply_color_preset(project):
+    assert d.apply_color_preset("rcm_hdr")["applied"] == {"colorScienceMode": "davinciYRGBColorManagedv2",
+                                                          "isAutoColorManage": "1", "rcmPresetMode": "HDR"}
+    with pytest.raises(ToolError, match="unknown preset"):
+        d.apply_color_preset("filmic")
+
+
+def test_set_hdr(project):
+    out = d.set_hdr(mastering_nits=1000, dolby_vision="4.0", dolby_tuning="Balanced", hdr10_plus=True)
+    assert out["applied"] == {"hdrMasteringOn": "1", "hdrMasteringLuminanceMax": "1000", "hdrDolbyControlsOn": "1",
+                              "hdrDolbyVersion": "4.0", "hdrDolbyAnalysisTuning": "Balanced", "hdr10PlusControlsOn": "1"}
+    assert d.set_hdr(mastering_nits=0, dolby_vision="off")["applied"] == {"hdrMasteringOn": "0", "hdrDolbyControlsOn": "0"}
+
+
+def test_set_hdr_errors(project):
+    for kwargs, msg in [({"dolby_vision": "5"}, "dolby_vision must be"), ({"dolby_tuning": "Max"}, "dolby_tuning must be"),
+                        ({"mastering_nits": -1}, "0 or more"), ({}, "nothing to change")]:
+        with pytest.raises(ToolError, match=msg):
+            d.set_hdr(**kwargs)
+
+
+def test_set_clip_color_space(project):
+    out = d.set_clip_color_space(["a.mov"], color_space="ARRI LogC4", gamma="ARRI LogC4")
+    assert out == [{"clip": "a.mov", "Input Color Space": "ARRI LogC4", "Input Gamma": "ARRI LogC4"}]
+    with pytest.raises(ToolError, match="did not apply Input Color Space = 'LogC'"):
+        d.set_clip_color_space(["a.mov"], color_space="LogC")
+    with pytest.raises(ToolError, match="give color_space"):
+        d.set_clip_color_space(["a.mov"])
+
+
+def test_analyze_dolby_vision(project, resolve):
+    a, b = _two_items(project)
+    with pytest.raises(ToolError, match="Dolby Vision is off"):
+        d.analyze_dolby_vision()
+    d.set_hdr(dolby_vision="4.0")
+    assert d.analyze_dolby_vision() == "Dolby Vision analysis started on the whole timeline"
+    assert project.current.dolby_analyzed == (None, None)
+    d.analyze_dolby_vision([1, 2], blend_shots=True)
+    assert project.current.dolby_analyzed == ([a, b], resolve.DLB_BLEND_SHOTS)
+    with pytest.raises(ToolError, match="needs the items"):
+        d.analyze_dolby_vision(blend_shots=True)
+
+
+def test_analyze_dolby_vision_uses_timeline_settings(project):
+    _two_items(project)
+    d.set_hdr(dolby_vision="4.0", timeline=True)  # on for this timeline only
+    assert project.color["hdrDolbyControlsOn"] == "0"
+    assert "whole timeline" in d.analyze_dolby_vision()

@@ -48,7 +48,8 @@ DEFAULTS = {
 mcp = MCPServer(
     "davinci",
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
-    "clip properties, transitions, titles, markers, color grading, Fusion compositing, audio, media management, "
+    "clip properties, transitions, titles, markers, color grading and management, HDR, Fusion compositing, audio, "
+    "media management, "
     "interchange export and rendering. "
     "Start with timeline_overview to see the edit and view_frame to see the picture. "
     "Frames are absolute timeline frames.",
@@ -2077,6 +2078,218 @@ def import_project(path: str, name: str | None = None) -> str:
     if not ok:
         raise ToolError("ImportProject failed (name already in use?)")
     return f"imported project {name or os.path.splitext(os.path.basename(path))[0]}"
+
+
+
+# --- Color management and HDR ---
+#
+# Keys and documented values come from Resolve's typed API stub (ProjectSettings / TimelineSettings). Values are
+# strings. Writes go in dependency order (color science, then RCM mode, then color spaces, then HDR) and every
+# key is read back: Resolve can return True, or False, without applying a value, and some keys are read-only in
+# some modes (e.g. color spaces while automatic color management is on).
+
+COLOR_KEYS = (
+    "colorScienceMode", "acesVersion", "isAutoColorManage", "rcmPresetMode", "separateColorSpaceAndGamma",
+    "colorAcesIDT", "colorAcesODT", "colorAcesGamutCompressType", "colorAcesNodeLUTProcessingSpace", "colorAcesMidGray",
+    "colorSpaceInput", "colorSpaceInputGamma", "colorSpaceTimeline", "colorSpaceTimelineGamma",
+    "colorSpaceOutput", "colorSpaceOutputGamma", "timelineWorkingLuminanceMode", "timelineWorkingLuminance",
+    "inputDRT", "outputDRT", "useInverseDRT", "colorSpaceOutputToneMapping", "colorSpaceOutputToneLuminanceMax",
+    "colorSpaceOutputGamutMapping", "colorSpaceOutputGamutLimit", "colorSpaceOutputGamutSaturationKnee",
+    "colorSpaceOutputGamutSaturationMax", "inputDRTSatRolloffStart", "inputDRTSatRolloffLimit",
+    "outputDRTSatRolloffStart", "outputDRTSatRolloffLimit", "imageResizingGamma", "graphicsWhiteLevel",
+    "useCATransform", "disableFusionToneMapping", "useColorSpaceAwareGradingTools",
+)
+HDR_KEYS = (
+    "hdrMasteringOn", "hdrMasteringLuminanceMax", "hdrDolbyControlsOn", "hdrDolbyVersion", "hdrDolbyAnalysisTuning",
+    "hdrDolbyMasterDisplay", "hdrDolbyUseExternalCMU", "hdr10PlusControlsOn", "hdrVividControlsOn",
+    "hdrVividMasterDisplay",
+)
+SETTINGS_ORDER = (
+    "colorScienceMode", "acesVersion", "isAutoColorManage", "rcmPresetMode", "separateColorSpaceAndGamma",
+    "colorAcesIDT", "colorAcesNodeLUTProcessingSpace", "colorAcesODT", "colorSpaceInput", "colorSpaceInputGamma",
+    "colorSpaceTimeline", "colorSpaceTimelineGamma", "colorSpaceOutput", "colorSpaceOutputGamma",
+    "timelineWorkingLuminanceMode", "timelineWorkingLuminance", "hdrMasteringOn", "hdrMasteringLuminanceMax",
+    "hdrDolbyControlsOn", "hdrDolbyVersion",
+)
+# Only values documented in the stub, so the presets hold on any 18+ build.
+COLOR_PRESETS = {
+    "yrgb": {"colorScienceMode": "davinciYRGB"},
+    "rcm_sdr": {"colorScienceMode": "davinciYRGBColorManagedv2", "isAutoColorManage": "1", "rcmPresetMode": "SDR"},
+    "rcm_hdr": {"colorScienceMode": "davinciYRGBColorManagedv2", "isAutoColorManage": "1", "rcmPresetMode": "HDR"},
+    "rcm_custom": {"colorScienceMode": "davinciYRGBColorManagedv2", "isAutoColorManage": "0"},
+    "aces_cct": {"colorScienceMode": "acescct"},
+    "aces_cc": {"colorScienceMode": "acescc"},
+}
+
+
+def _setting_str(v):
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _settings_target(timeline):
+    """The project, or the current timeline switched to its own settings."""
+    proj, tl = _timeline() if timeline else (_project()[1], None)
+    if not timeline:
+        return proj, "project"
+    if str(tl.GetSetting("useCustomSettings")) != "1" and not tl.SetSetting("useCustomSettings", "1"):
+        raise ToolError(f"cannot give timeline '{tl.GetName()}' its own settings")
+    return tl, f"timeline '{tl.GetName()}'"
+
+
+def _apply_settings(target, label, values):
+    unknown = [k for k in values if k not in COLOR_KEYS + HDR_KEYS]
+    if unknown:
+        raise ToolError(f"not a color/HDR setting: {', '.join(unknown)} (see color_management_info)")
+    order = [k for k in SETTINGS_ORDER if k in values] + [k for k in values if k not in SETTINGS_ORDER]
+    applied, rejected = {}, {}
+    for key in order:
+        want = _setting_str(values[key])
+        target.SetSetting(key, want)
+        got = target.GetSetting(key)
+        if str(got) == want:
+            applied[key] = want
+        else:
+            rejected[key] = {"wanted": want, "is": got}
+    if rejected:
+        detail = "; ".join(f"{k}: wanted {v['wanted']!r}, is {v['is']!r}" for k, v in rejected.items())
+        raise ToolError(f"{label}: Resolve did not apply {detail}. Applied: {applied or 'nothing'}. Names must match "
+                        "Project Settings > Color Management exactly, and some keys are locked by the current mode.")
+    return {"scope": label, "applied": applied}
+
+
+@_tool
+def color_management_info(timeline: bool = False) -> dict:
+    """Color management and HDR settings of the project, or of the current timeline (timeline=True; a timeline
+    without its own settings reports the project's). Empty values are omitted."""
+    if timeline:
+        _, tl = _timeline()
+        custom = str(tl.GetSetting("useCustomSettings")) == "1"
+        source, label = (tl if custom else _project()[1]), f"timeline '{tl.GetName()}'"
+    else:
+        source, label, custom = _project()[1], "project", None
+    read = lambda keys: {k: v for k in keys if (v := source.GetSetting(k)) not in (None, "")}
+    out = {"scope": label, "color": read(COLOR_KEYS), "hdr": read(HDR_KEYS)}
+    if timeline:
+        out["uses_own_settings"] = custom
+    return out
+
+
+@_tool
+def set_color_management(settings: dict, timeline: bool = False) -> dict:
+    """Set color management keys on the project, or on the current timeline only (timeline=True switches it to its
+    own settings). Keys: colorScienceMode (davinciYRGB, davinciYRGBColorManaged, davinciYRGBColorManagedv2, acescc,
+    acescct), isAutoColorManage, rcmPresetMode (SDR/HDR when automatic), separateColorSpaceAndGamma,
+    colorSpaceInput/Timeline/Output (+Gamma), timelineWorkingLuminanceMode (e.g. "SDR 100", "HDR 1000"),
+    inputDRT/outputDRT (None, Simple, Luminance Mapping, DaVinci, Saturation Preserving, RED IPP2), useInverseDRT,
+    colorSpaceOutputGamutMapping, graphicsWhiteLevel, colorAcesIDT/ODT and the other keys color_management_info lists.
+    Color space names are exactly as in Project Settings. Every key is read back; any not applied is an error."""
+    if not settings:
+        raise ToolError("no settings given")
+    target, label = _settings_target(timeline)
+    return _apply_settings(target, label, settings)
+
+
+@_tool
+def apply_color_preset(preset: str, timeline: bool = False) -> dict:
+    """Switch the project (or current timeline) to a color workflow: yrgb (unmanaged DaVinci YRGB), rcm_sdr / rcm_hdr
+    (DaVinci color managed, automatic SDR or HDR), rcm_custom (color managed, spaces set by hand with
+    set_color_management), aces_cct, aces_cc."""
+    if preset not in COLOR_PRESETS:
+        raise ToolError(f"unknown preset: {preset} (one of {', '.join(COLOR_PRESETS)})")
+    target, label = _settings_target(timeline)
+    return {"preset": preset, **_apply_settings(target, label, COLOR_PRESETS[preset])}
+
+
+DOLBY_TUNINGS = ("Legacy", "Most Mapping", "More Mapping", "Balanced", "Less Mapping", "Least Mapping")
+
+
+@_tool
+def set_hdr(
+    mastering_nits: int | None = None,
+    dolby_vision: str | None = None,
+    dolby_tuning: str | None = None,
+    dolby_master_display: str | None = None,
+    hdr10_plus: bool | None = None,
+    timeline: bool = False,
+) -> dict:
+    """HDR mastering for the project (or current timeline): mastering_nits enables HDR mastering at that peak
+    (e.g. 1000, 4000; 0 turns it off); dolby_vision "2.9", "4.0" or "off" (Studio); dolby_tuning Legacy, Most
+    Mapping, More Mapping, Balanced, Less Mapping or Least Mapping; dolby_master_display as named in Resolve;
+    hdr10_plus on/off. Set the output color space (e.g. an ST2084 or HLG space) with set_color_management."""
+    values = {}
+    if mastering_nits is not None:
+        if mastering_nits < 0:
+            raise ToolError("mastering_nits must be 0 or more")
+        values["hdrMasteringOn"] = mastering_nits > 0
+        if mastering_nits:
+            values["hdrMasteringLuminanceMax"] = mastering_nits
+    if dolby_vision is not None:
+        if dolby_vision not in ("2.9", "4.0", "off"):
+            raise ToolError('dolby_vision must be "2.9", "4.0" or "off"')
+        values["hdrDolbyControlsOn"] = dolby_vision != "off"
+        if dolby_vision != "off":
+            values["hdrDolbyVersion"] = dolby_vision
+    if dolby_tuning is not None:
+        if dolby_tuning not in DOLBY_TUNINGS:
+            raise ToolError(f"dolby_tuning must be one of: {', '.join(DOLBY_TUNINGS)}")
+        values["hdrDolbyAnalysisTuning"] = dolby_tuning
+    if dolby_master_display is not None:
+        values["hdrDolbyMasterDisplay"] = dolby_master_display
+    if hdr10_plus is not None:
+        values["hdr10PlusControlsOn"] = hdr10_plus
+    if not values:
+        raise ToolError("nothing to change")
+    target, label = _settings_target(timeline)
+    return _apply_settings(target, label, values)
+
+
+@_tool
+def set_clip_color_space(
+    clips: list[str], color_space: str | None = None, gamma: str | None = None, idt: str | None = None
+) -> list[dict]:
+    """Tag media-pool clips (by name) with their source color space and gamma for color-managed projects (e.g. a
+    log camera clip), or their ACES IDT in ACES projects. Names exactly as in Resolve's Input Color Space menu.
+    Read back after writing."""
+    props = {k: v for k, v in (("Input Color Space", color_space), ("Input Gamma", gamma), ("IDT", idt)) if v}
+    if not props:
+        raise ToolError("give color_space, gamma or idt")
+    _, proj = _project()
+    out = []
+    for c in _pool_clips(proj, clips):
+        for key, value in props.items():
+            c.SetClipProperty(key, value)
+            if c.GetClipProperty(key) != value:
+                raise ToolError(f"{c.GetName()}: Resolve did not apply {key} = {value!r} (is {c.GetClipProperty(key)!r}; "
+                                "the project must be color managed for Input Color Space, ACES for IDT)")
+        out.append({"clip": c.GetName(), **{k: c.GetClipProperty(k) for k in props}})
+    return out
+
+
+@_tool
+def analyze_dolby_vision(items: list[int] | None = None, blend_shots: bool = False, track: int = 1) -> str:
+    """Run Dolby Vision analysis (Studio) on the whole current timeline, or on video items (1-based indexes).
+    blend_shots=True analyzes the given items together, as one blended shot. Dolby Vision must be on
+    (set_hdr(dolby_vision="4.0")). Analysis can continue after this returns."""
+    resolve = _resolve()
+    proj, tl = _timeline()
+    source = tl if str(tl.GetSetting("useCustomSettings")) == "1" else proj
+    if str(source.GetSetting("hdrDolbyControlsOn")) != "1":
+        raise ToolError('Dolby Vision is off: turn it on with set_hdr(dolby_vision="4.0")')
+    analyze = _method(tl, "AnalyzeDolbyVision", "18")
+    if blend_shots and not items:
+        raise ToolError("blend_shots needs the items to blend")
+    if items:
+        targets = [_item(tl, i, track) for i in items]
+        ok = analyze(targets, _constant(resolve, "DLB_BLEND_SHOTS")) if blend_shots else analyze(targets, None)
+    else:
+        ok = analyze()
+    if not ok:
+        raise ToolError("AnalyzeDolbyVision failed (Studio only)")
+    return f"Dolby Vision analysis started on {f'{len(items)} item(s)' if items else 'the whole timeline'}"
 
 
 if __name__ == "__main__":
