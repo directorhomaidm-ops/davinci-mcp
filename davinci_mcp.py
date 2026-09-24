@@ -14,6 +14,7 @@ Register with Claude Code:
 Override API locations with RESOLVE_SCRIPT_API / RESOLVE_SCRIPT_LIB if Resolve is installed elsewhere.
 Logs one JSON object per line to stderr; set DAVINCI_MCP_LOG_LEVEL (default INFO) to change verbosity.
 """
+import contextlib
 import functools
 import inspect
 import json
@@ -21,6 +22,7 @@ import logging
 import os
 import sys
 import time
+from typing import Any
 from datetime import datetime, timezone
 
 from mcp.server.mcpserver import MCPServer
@@ -44,7 +46,8 @@ DEFAULTS = {
 mcp = MCPServer(
     "davinci",
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
-    "clip properties, titles, markers, color grading and rendering. Frames are absolute timeline frames.",
+    "clip properties, titles, markers, color grading, Fusion compositing and rendering. "
+    "Frames are absolute timeline frames.",
 )
 
 log = logging.getLogger("davinci_mcp")
@@ -585,6 +588,300 @@ def grab_still(export_dir: str | None = None, prefix: str = "still", format: str
             raise ToolError(f"still grabbed but export to {export_dir} failed")
         out["exported_to"] = export_dir
     return out
+
+
+
+# --- Fusion ---
+#
+# Measured on live Resolve (Studio 19.1.3) by other Resolve automation projects and followed here:
+# - Structural edits (AddTool, ConnectInput, Delete) run under comp.Lock().
+# - Value writes and keyframes must NOT: under the lock they read back fine but the render ignores them.
+#   They run inside StartUndo/EndUndo instead, so each call is one undo step in Resolve.
+# - Assigning a value at a frame only creates a keyframe once a spline modifier is attached
+#   (BezierSpline for numbers, Path for points); otherwise it silently sets a static value.
+# - Point inputs (e.g. Center) take [x, y] or {1: x, 2: y} depending on the build.
+
+ANIMATION_MODIFIERS = {"BezierSpline", "PolyPath", "Path", "XYPath"}
+
+
+@contextlib.contextmanager
+def _locked(comp):
+    comp.Lock()
+    try:
+        yield
+    finally:
+        comp.Unlock()
+
+
+@contextlib.contextmanager
+def _undo(comp, name):
+    comp.StartUndo(name)
+    try:
+        yield
+    finally:
+        comp.EndUndo(True)
+
+
+def _comp(item, comp, track):
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    count = int(it.GetFusionCompCount() or 0)
+    if not 1 <= comp <= count:
+        raise ToolError(f"comp {comp} not found on '{it.GetName()}' ({count} comp(s); see add_fusion_comp)")
+    return it, it.GetFusionCompByIndex(comp)
+
+
+def _node(comp, name):
+    tool = comp.FindTool(name)
+    if not tool:
+        raise ToolError(f"node not found: {name} (see fusion_nodes)")
+    return tool
+
+
+def _tool_attrs(tool):
+    attrs = tool.GetAttrs() or {}
+    return attrs.get("TOOLS_Name", ""), attrs.get("TOOLS_RegID", "")
+
+
+def _source(inp):
+    """(name, type) of the tool feeding an input, or (None, None)."""
+    out = inp.GetConnectedOutput()
+    return _tool_attrs(out.GetTool()) if out else (None, None)
+
+
+def _plain(v):
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, dict):
+        return {str(k): _plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_plain(x) for x in v]
+    return str(v)
+
+
+def _write(assign, value, point):
+    """Write a value through `assign`, trying the point encodings the bridge may want."""
+    if not point:
+        assign(value)
+        return
+    if isinstance(value, dict):
+        candidates = [value]
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        candidates = [list(value), {1: value[0], 2: value[1]}]
+    else:
+        raise ToolError(f"point input needs [x, y], got {value!r}")
+    for i, cand in enumerate(candidates):
+        try:
+            assign(cand)
+            return
+        except Exception:
+            if i == len(candidates) - 1:
+                raise
+
+
+@_tool
+def fusion_comps(item: int, track: int = 1) -> list[str]:
+    """Fusion compositions on a video item (1-based index from list_items), in comp index order."""
+    _, tl = _timeline()
+    return list(_item(tl, item, track).GetFusionCompNameList() or [])
+
+
+@_tool
+def add_fusion_comp(item: int, import_path: str | None = None, track: int = 1) -> dict:
+    """Add a Fusion composition to a video item: empty (MediaIn → MediaOut), or imported from a .comp file."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    if import_path:
+        import_path = os.path.abspath(import_path)
+        if not os.path.exists(import_path):
+            raise ToolError(f"file not found: {import_path}")
+        comp = it.ImportFusionComp(import_path)
+    else:
+        comp = it.AddFusionComp()
+    if not comp:
+        raise ToolError("could not add Fusion composition")
+    names = list(it.GetFusionCompNameList() or [])
+    return {"item": it.GetName(), "comp": len(names), "comps": names}
+
+
+@_tool
+def export_fusion_comp(item: int, path: str, comp: int = 1, track: int = 1) -> str:
+    """Save a video item's Fusion composition as a .comp file (reusable template)."""
+    it, _ = _comp(item, comp, track)
+    path = os.path.abspath(path)
+    if not it.ExportFusionComp(path, comp):
+        raise ToolError(f"export failed: {path}")
+    return f"exported comp {comp} of '{it.GetName()}' to {path}"
+
+
+@_tool
+def insert_fusion(kind: str = "composition", name: str | None = None) -> dict:
+    """Insert at the playhead a Fusion composition clip (kind=composition) or a Fusion generator by name
+    (kind=generator). Titles go through insert_title(fusion=True)."""
+    _, tl = _timeline()
+    if kind == "composition":
+        it = tl.InsertFusionCompositionIntoTimeline()
+    elif kind == "generator":
+        if not name:
+            raise ToolError("a generator name is required")
+        it = tl.InsertFusionGeneratorIntoTimeline(name)
+    else:
+        raise ToolError(f"unknown kind: {kind} (composition or generator)")
+    if not it:
+        raise ToolError(f"could not insert Fusion {kind}" + (f": {name}" if name else ""))
+    return {"name": it.GetName(), "start": it.GetStart(), "end": it.GetEnd()}
+
+
+@_tool
+def create_fusion_clip(items: list[int], track: int = 1) -> dict:
+    """Combine video items (1-based indexes) into one Fusion clip, to composite them together."""
+    _, tl = _timeline()
+    targets = [_item(tl, i, track) for i in items]
+    if not targets:
+        raise ToolError("no items given")
+    it = tl.CreateFusionClip(targets)
+    if not it:
+        raise ToolError("CreateFusionClip failed")
+    return {"name": it.GetName(), "start": it.GetStart(), "end": it.GetEnd()}
+
+
+@_tool
+def fusion_nodes(item: int, comp: int = 1, track: int = 1) -> list[dict]:
+    """Nodes of a Fusion composition with type and wiring: `inputs` maps each connected input to its source
+    node; `animated` lists inputs driven by a spline or path."""
+    _, c = _comp(item, comp, track)
+    out = []
+    for tool in (c.GetToolList(False) or {}).values():
+        name, kind = _tool_attrs(tool)
+        if kind in ANIMATION_MODIFIERS:
+            continue
+        inputs, animated = {}, []
+        for inp in (tool.GetInputList() or {}).values():
+            src, src_kind = _source(inp)
+            if src is None:
+                continue
+            inp_id = (inp.GetAttrs() or {}).get("INPS_ID", "")
+            if src_kind in ANIMATION_MODIFIERS:
+                animated.append(inp_id)
+            else:
+                inputs[inp_id] = src
+        out.append({"name": name, "type": kind, "inputs": inputs, "animated": animated})
+    return out
+
+
+@_tool
+def fusion_inputs(item: int, node: str, filter: str | None = None, comp: int = 1, track: int = 1) -> list[dict]:
+    """Inputs of a Fusion node: id, name, type, current value, and source node or animation.
+    `filter` keeps only inputs whose id or name contains it (case-insensitive); Text+ has hundreds."""
+    _, c = _comp(item, comp, track)
+    tool = _node(c, node)
+    rows = []
+    for inp in (tool.GetInputList() or {}).values():
+        attrs = inp.GetAttrs() or {}
+        inp_id, inp_name = attrs.get("INPS_ID", ""), attrs.get("INPS_Name", "")
+        if filter and filter.lower() not in f"{inp_id} {inp_name}".lower():
+            continue
+        kind = attrs.get("INPS_DataType", "")
+        src, src_kind = _source(inp)
+        rows.append({
+            "id": inp_id,
+            "name": inp_name,
+            "type": kind,
+            "value": None if kind in ("Image", "Mask") else _plain(tool.GetInput(inp_id)),
+            "animated": src_kind in ANIMATION_MODIFIERS,
+            "source": src if src_kind not in ANIMATION_MODIFIERS else None,
+        })
+    return rows
+
+
+@_tool
+def add_fusion_node(
+    item: int,
+    tool_type: str,
+    name: str | None = None,
+    connect_from: str | None = None,
+    input: str = "Input",
+    comp: int = 1,
+    track: int = 1,
+) -> dict:
+    """Add a node by registry id (e.g. Blur, Transform, TextPlus, Merge, Glow, ColorCorrector, EllipseMask,
+    RectangleMask, Background, FastNoise). Optionally rename it and feed `connect_from`'s output into `input`."""
+    _, c = _comp(item, comp, track)
+    src = _node(c, connect_from) if connect_from else None
+    if name and c.FindTool(name):
+        raise ToolError(f"a node named {name} already exists")
+    with _locked(c):
+        tool = c.AddTool(tool_type, -1, -1)
+        if not tool:
+            raise ToolError(f"unknown tool type: {tool_type}")
+        if name:
+            tool.SetAttrs({"TOOLS_Name": name})
+        connected = bool(tool.ConnectInput(input, src)) if src else False
+    if src and not connected:
+        raise ToolError(f"added {_tool_attrs(tool)[0]} but could not connect {connect_from} to its {input}")
+    final, kind = _tool_attrs(tool)
+    return {"name": final, "type": kind, "connected": {input: connect_from} if connected else {}}
+
+
+@_tool
+def connect_fusion_nodes(
+    item: int, target: str, source: str | None, input: str = "Input", comp: int = 1, track: int = 1
+) -> str:
+    """Feed `source`'s main output into `target`'s `input` (e.g. Input, Background, Foreground, EffectMask).
+    source=null disconnects the input."""
+    _, c = _comp(item, comp, track)
+    dst = _node(c, target)
+    src = _node(c, source) if source else None
+    with _locked(c):
+        ok = dst.ConnectInput(input, src)
+    if not ok:
+        raise ToolError(f"cannot connect {source} to {target}.{input} (see fusion_inputs for valid inputs)")
+    return f"{source} → {target}.{input}" if source else f"disconnected {target}.{input}"
+
+
+@_tool
+def delete_fusion_node(item: int, node: str, comp: int = 1, track: int = 1) -> str:
+    """Delete a node from a Fusion composition."""
+    _, c = _comp(item, comp, track)
+    tool = _node(c, node)
+    with _locked(c):
+        tool.Delete()
+    return f"deleted {node}"
+
+
+@_tool
+def set_fusion_input(
+    item: int,
+    node: str,
+    input: str,
+    value: Any = None,
+    keyframes: dict[int, Any] | None = None,
+    comp: int = 1,
+    track: int = 1,
+) -> dict:
+    """Set a Fusion node input to a static `value`, or animate it with `keyframes` ({frame: value}, frames
+    relative to the comp). Numbers get a Bezier spline, points ([x, y], e.g. Center) a path; text is static only."""
+    if (value is None) == (keyframes is None):
+        raise ToolError("give either value or keyframes")
+    _, c = _comp(item, comp, track)
+    tool = _node(c, node)
+    inp = tool[input]
+    if not inp:
+        raise ToolError(f"{node} has no input {input} (see fusion_inputs)")
+    kind = (inp.GetAttrs() or {}).get("INPS_DataType", "")
+    point = kind == "Point"
+    with _undo(c, f"{node}.{input}"):
+        if keyframes is None:
+            _write(lambda v: tool.SetInput(input, v), value, point)
+            return {"node": node, "input": input, "value": _plain(tool.GetInput(input))}
+        if _source(inp)[1] not in ANIMATION_MODIFIERS:
+            tool.AddModifier(input, "Path" if point else "BezierSpline")
+            if _source(tool[input])[1] not in ANIMATION_MODIFIERS:
+                raise ToolError(f"{node}.{input} ({kind or 'unknown type'}) cannot be animated")
+        for frame, v in sorted(keyframes.items()):
+            _write(lambda x, f=frame: tool[input].__setitem__(f, x), v, point)
+    frames = sorted(float(f) for f in (tool[input].GetKeyFrames() or {}).values())
+    return {"node": node, "input": input, "keyframes": frames}
 
 
 if __name__ == "__main__":

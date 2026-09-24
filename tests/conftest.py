@@ -66,7 +66,7 @@ class ColorGroup:
 class Item:
     def __init__(self, name, start, end):
         self.name, self.start, self.end, self.props = name, start, end, {}
-        self.comp = None
+        self.comps, self.exported_comp = [], None
         self.graph = Graph(("Primary", "Look"))
         self.cdl, self.color_group = None, None
         self.versions = {0: ["Version 1"], 1: []}
@@ -128,24 +128,179 @@ class Item:
         self.props[key] = value
         return True
 
+    def GetFusionCompCount(self):
+        return len(self.comps)
+
     def GetFusionCompByIndex(self, i):
-        return self.comp
+        return self.comps[i - 1] if 1 <= i <= len(self.comps) else None
+
+    def GetFusionCompNameList(self):
+        return [c.name for c in self.comps]
+
+    def AddFusionComp(self):
+        comp = FuComp(f"Composition {len(self.comps) + 1}")
+        self.comps.append(comp)
+        return comp
+
+    def ImportFusionComp(self, path):
+        if not path.endswith(".comp"):
+            return None
+        comp = FuComp(Path(path).stem)
+        self.comps.append(comp)
+        return comp
+
+    def ExportFusionComp(self, path, index):
+        self.exported_comp = (path, index)
+        return 1 <= index <= len(self.comps)
 
 
-class FusionTool:
-    def __init__(self):
-        self.inputs = {}
+TOOL_INPUTS = {
+    "MediaIn": {},
+    "MediaOut": {"Input": "Image"},
+    "Blur": {"Input": "Image", "XBlurSize": "Number", "EffectMask": "Mask"},
+    "Transform": {"Input": "Image", "Size": "Number", "Center": "Point"},
+    "Merge": {"Background": "Image", "Foreground": "Image", "Blend": "Number"},
+    "TextPlus": {"StyledText": "Text", "Size": "Number", "Center": "Point"},
+    "EllipseMask": {"Width": "Number", "Center": "Point"},
+    "BezierSpline": {},
+    "PolyPath": {},
+}
+DEFAULTS = {"Number": 0.0, "Point": {1: 0.5, 2: 0.5}, "Text": ""}
 
-    def SetInput(self, key, value):
-        self.inputs[key] = value
+
+class FuOutput:
+    def __init__(self, tool):
+        self.tool = tool
+
+    def GetTool(self):
+        return self.tool
 
 
-class Comp:
-    def __init__(self):
-        self.template = FusionTool()
+class FuInput:
+    def __init__(self, tool, inp_id, kind):
+        self.tool, self.id, self.kind = tool, inp_id, kind
+        self.value, self.source, self.keys = DEFAULTS.get(kind), None, {}
+
+    def GetAttrs(self):
+        return {"INPS_ID": self.id, "INPS_Name": self.id, "INPS_DataType": self.kind}
+
+    def GetConnectedOutput(self):
+        return self.source
+
+    def _store(self, value):
+        self.tool.comp.value_write()
+        if self.kind == "Point" and not isinstance(value, dict):
+            raise TypeError("this build wants a {1: x, 2: y} table")  # exercises the fallback encoding
+        return value
+
+    def animated(self):
+        return self.source is not None and self.source.tool.kind in ("BezierSpline", "PolyPath")
+
+    def __setitem__(self, frame, value):
+        value = self._store(value)
+        if self.animated():
+            self.keys[frame] = value
+        else:
+            self.value = value  # no spline: a timed write is just a static value
+
+    def GetKeyFrames(self):
+        return {i: float(f) for i, f in enumerate(sorted(self.keys), 1)}
+
+
+class FuTool:
+    def __init__(self, comp, kind, name):
+        self.comp, self.kind, self.name = comp, kind, name
+        self.inputs = {k: FuInput(self, k, t) for k, t in TOOL_INPUTS[kind].items()}
+        self.output = FuOutput(self)
+
+    def GetAttrs(self):
+        return {"TOOLS_Name": self.name, "TOOLS_RegID": self.kind}
+
+    def SetAttrs(self, attrs):
+        self.comp.structural()
+        self.name = attrs.get("TOOLS_Name", self.name)
+
+    def __getitem__(self, inp_id):
+        return self.inputs.get(inp_id)
+
+    def GetInputList(self):
+        return dict(enumerate(self.inputs.values(), 1))
+
+    def SetInput(self, inp_id, value, time=None):
+        inp = self.inputs[inp_id]
+        inp.value = inp._store(value)
+
+    def GetInput(self, inp_id, time=None):
+        return self.inputs[inp_id].value
+
+    def AddModifier(self, inp_id, modifier):
+        inp = self.inputs.get(inp_id)
+        wanted = {"Number": "BezierSpline", "Point": "Path"}.get(inp.kind if inp else None)
+        if modifier != wanted:
+            return False
+        mod = self.comp.AddTool("BezierSpline" if modifier == "BezierSpline" else "PolyPath", -1, -1, locked_ok=True)
+        inp.source = mod.output
+        return True
+
+    def ConnectInput(self, inp_id, src):
+        self.comp.structural()
+        inp = self.inputs.get(inp_id)
+        if not inp or inp.kind not in ("Image", "Mask"):
+            return False
+        inp.source = src.output if src else None
+        return True
+
+    def Delete(self):
+        self.comp.structural()
+        self.comp.tools.remove(self)
+
+
+class FuComp:
+    def __init__(self, name, template=False):
+        self.name, self.tools, self.locked = name, [], False
+        self.value_writes_under_lock = self.unlocked_structural_edits = 0
+        self.undo_open = self.undo_steps = 0
+        self.AddTool("MediaIn", -1, -1, locked_ok=True)
+        self.AddTool("MediaOut", -1, -1, locked_ok=True)
+        if template:
+            self.AddTool("TextPlus", -1, -1, locked_ok=True).name = "Template"
+
+    def structural(self):
+        if not self.locked:
+            self.unlocked_structural_edits += 1
+
+    def value_write(self):
+        if self.locked:
+            self.value_writes_under_lock += 1
+
+    def Lock(self):
+        self.locked = True
+
+    def Unlock(self):
+        self.locked = False
+
+    def StartUndo(self, name):
+        self.undo_open += 1
+
+    def EndUndo(self, keep):
+        self.undo_open -= 1
+        self.undo_steps += 1
+
+    def AddTool(self, kind, x, y, locked_ok=False):
+        if kind not in TOOL_INPUTS:
+            return None
+        if not locked_ok:
+            self.structural()
+        n = 1 + sum(t.kind == kind for t in self.tools)
+        tool = FuTool(self, kind, f"{kind}{n}")
+        self.tools.append(tool)
+        return tool
 
     def FindTool(self, name):
-        return self.template if name == "Template" else None
+        return next((t for t in self.tools if t.name == name), None)
+
+    def GetToolList(self, selected=False, kind=None):
+        return dict(enumerate((t for t in self.tools if kind is None or t.kind == kind), 1))
 
 
 class Still:
@@ -211,8 +366,20 @@ class Timeline:
 
     def InsertFusionTitleIntoTimeline(self, name):
         item = self._append(name, 120)
-        item.comp = Comp()
+        item.comps = [FuComp("Composition 1", template=True)]
         return item
+
+    def InsertFusionCompositionIntoTimeline(self):
+        item = self._append("Fusion Composition", 150)
+        item.comps = [FuComp("Composition 1")]
+        return item
+
+    def InsertFusionGeneratorIntoTimeline(self, name):
+        return self._append(name, 150) if name in ("Contours", "Noise Gradient") else None
+
+    def CreateFusionClip(self, items):
+        self.fusion_clip_of = items
+        return Item("Fusion Clip 1", items[0].start, items[-1].end)
 
     def AddMarker(self, frame, color, name, note, duration):
         if frame in self.markers:

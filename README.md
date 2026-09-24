@@ -92,6 +92,44 @@ Notes:
 - `grab_still` needs the Color page open (`open_page("color")`). The still goes into the current gallery album; with `export_dir` it is also written as an image (`dpx` `cin` `tif` `jpg` `png` `ppm` `bmp` `xpm`).
 - `export_lut` needs Resolve 18 or later. Node reads/writes use Resolve 19's node graph when present and fall back to the older per-item calls on earlier versions.
 
+### Fusion (VFX and motion graphics)
+
+`item` is the 1-based index from `list_items` on video `track` (default 1); `comp` is the 1-based composition index on that item (default 1). Nodes are addressed by name (`MediaIn1`, `Blur1`, …).
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `insert_fusion` | `kind: "composition" \| "generator" = "composition"`, `name: str \| None` (generator name) | `{name, start, end}` of the clip inserted at the playhead | Unknown kind; generator not found |
+| `create_fusion_clip` | `items: list[int]`, `track: int = 1` | `{name, start, end}` of the new Fusion clip | Item not found; empty `items` |
+| `fusion_comps` | `item: int`, `track: int = 1` | Composition names, in index order | |
+| `add_fusion_comp` | `item: int`, `import_path: str \| None` (.comp file), `track: int = 1` | `{item, comp, comps}`; `comp` is the new index | File missing; add/import rejected |
+| `export_fusion_comp` | `item: int`, `path: str`, `comp: int = 1`, `track: int = 1` | Confirmation string | Comp not found; export rejected |
+| `fusion_nodes` | `item: int`, `comp: int = 1`, `track: int = 1` | `[{name, type, inputs: {input: source node}, animated: [input]}]` | Comp not found |
+| `fusion_inputs` | `item: int`, `node: str`, `filter: str \| None`, `comp`, `track` | `[{id, name, type, value, animated, source}]` | Node not found |
+| `add_fusion_node` | `item: int`, `tool_type: str`, `name: str \| None`, `connect_from: str \| None`, `input: str = "Input"`, `comp`, `track` | `{name, type, connected}` | Unknown type; name taken; source not found or not connectable |
+| `connect_fusion_nodes` | `item: int`, `target: str`, `source: str \| None`, `input: str = "Input"`, `comp`, `track` | Confirmation string; `source: null` disconnects | Node not found; input not connectable |
+| `delete_fusion_node` | `item: int`, `node: str`, `comp`, `track` | Confirmation string | Node not found |
+| `set_fusion_input` | `item: int`, `node: str`, `input: str`, `value` **or** `keyframes: {frame: value}`, `comp`, `track` | `{node, input, value}` or `{node, input, keyframes}` | Neither or both given; unknown input; input cannot be animated |
+
+Notes:
+
+- `tool_type` is Fusion's registry id: `Blur`, `Glow`, `Transform`, `Merge`, `TextPlus`, `ColorCorrector`, `BrightnessContrast`, `Background`, `FastNoise`, `EllipseMask`, `RectangleMask`, `PolylineMask`, `Tracker`, `DeltaKeyer`, `Shape3D`, `Renderer3D`, and so on. Fusion names new nodes itself (`Blur1`, `Blur2`) unless you pass `name`.
+- Common inputs: `Input` (main image), `Background`/`Foreground` (Merge), `EffectMask` (limits a node's effect to a mask).
+- Frames in `keyframes` are relative to the composition, starting at 0. Numbers get a Bézier spline and points (`Center`, `[x, y]` in 0–1 image space) get a motion path. Adding more keyframes later extends the same curve. Text inputs can only be set statically.
+- Every structural change (add, connect, delete) runs under `comp.Lock()`. Value and keyframe writes deliberately run outside it: Resolve renders ignore values written under the lock. Each write is one undo step in Resolve.
+
+Example: a blur limited to an elliptical area, then an animated push-in:
+
+```
+add_fusion_comp(item=1)
+add_fusion_node(item=1, tool_type="Blur", connect_from="MediaIn1")
+add_fusion_node(item=1, tool_type="EllipseMask", name="Area")
+connect_fusion_nodes(item=1, target="Blur1", source="Area", input="EffectMask")
+add_fusion_node(item=1, tool_type="Transform", name="Push", connect_from="Blur1")
+connect_fusion_nodes(item=1, target="MediaOut1", source="Push")
+set_fusion_input(item=1, node="Blur1", input="XBlurSize", value=8)
+set_fusion_input(item=1, node="Push", input="Size", keyframes={"0": 1.0, "120": 1.15})
+```
+
 ## Configuration
 
 | Variable | Default | Purpose |

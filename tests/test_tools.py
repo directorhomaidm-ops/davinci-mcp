@@ -138,7 +138,7 @@ def test_insert_fusion_title_sets_text(project):
     out = d.insert_title("Text+", fusion=True, text="Hello")
     assert out["text_set"] is True
     item = project.current.tracks[("video", 1)][-1]
-    assert item.comp.template.inputs == {"StyledText": "Hello"}
+    assert item.comps[0].FindTool("Template").inputs["StyledText"].value == "Hello"
 
 
 def test_add_marker(project):
@@ -169,6 +169,9 @@ def test_all_tools_registered():
         "set_item_properties", "insert_title", "add_marker", "list_render_presets", "render", "render_status",
         "list_render_formats", "stop_render", "open_page", "color_info", "apply_lut", "set_cdl", "copy_grade",
         "apply_drx", "add_color_version", "load_color_version", "export_lut", "grab_still",
+        "fusion_comps", "add_fusion_comp", "export_fusion_comp", "insert_fusion", "create_fusion_clip",
+        "fusion_nodes", "fusion_inputs", "add_fusion_node", "connect_fusion_nodes", "delete_fusion_node",
+        "set_fusion_input",
     }
 
 
@@ -411,3 +414,187 @@ def test_stop_render(project, tmp_path):
     d.render(str(tmp_path))
     assert d.stop_render() == "stopped"
     assert project.rendering is False
+
+
+# --- Fusion ---
+
+
+@pytest.fixture
+def fusion(project):
+    """Item 1 on V1 is a Fusion composition clip with an empty MediaIn -> MediaOut comp."""
+    d.insert_fusion()
+    item = project.current.tracks[("video", 1)][0]
+    return item.comps[0]
+
+
+def _assert_lock_rules(comp):
+    # Live Resolve ignores value writes made under Lock() at render; structural edits need it.
+    assert comp.value_writes_under_lock == 0
+    assert comp.unlocked_structural_edits == 0
+    assert comp.undo_open == 0
+
+
+def test_insert_fusion(project):
+    assert d.insert_fusion() == {"name": "Fusion Composition", "start": 86400, "end": 86550}
+    assert d.insert_fusion("generator", "Contours")["name"] == "Contours"
+    with pytest.raises(ToolError, match="generator name is required"):
+        d.insert_fusion("generator")
+    with pytest.raises(ToolError, match="could not insert Fusion generator: Nope"):
+        d.insert_fusion("generator", "Nope")
+    with pytest.raises(ToolError, match="unknown kind"):
+        d.insert_fusion("title")
+
+
+def test_fusion_comps_add_import_export(project, tmp_path):
+    d.append_clips(["a.mov"])
+    assert d.fusion_comps(1) == []
+    assert d.add_fusion_comp(1) == {"item": "a.mov", "comp": 1, "comps": ["Composition 1"]}
+    tpl = tmp_path / "glow_template.comp"
+    tpl.write_text("")
+    assert d.add_fusion_comp(1, import_path=str(tpl))["comps"] == ["Composition 1", "glow_template"]
+    assert d.fusion_comps(1) == ["Composition 1", "glow_template"]
+    with pytest.raises(ToolError, match="file not found"):
+        d.add_fusion_comp(1, import_path=str(tmp_path / "missing.comp"))
+
+    out = tmp_path / "out.comp"
+    d.export_fusion_comp(1, str(out), comp=2)
+    assert project.current.tracks[("video", 1)][0].exported_comp == (str(out), 2)
+    with pytest.raises(ToolError, match=r"comp 3 not found on 'a.mov' \(2 comp"):
+        d.export_fusion_comp(1, str(out), comp=3)
+
+
+def test_create_fusion_clip(project):
+    d.append_clips(["a.mov", "b.mov"])
+    assert d.create_fusion_clip([1, 2]) == {"name": "Fusion Clip 1", "start": 86400, "end": 86550}
+    assert [i.name for i in project.current.fusion_clip_of] == ["a.mov", "b.mov"]
+    with pytest.raises(ToolError, match="no items"):
+        d.create_fusion_clip([])
+
+
+def test_build_blur_chain(fusion):
+    # MediaIn1 -> Blur -> MediaOut1, the basic VFX insert.
+    assert d.add_fusion_node(1, "Blur", name="Soften", connect_from="MediaIn1") == {
+        "name": "Soften",
+        "type": "Blur",
+        "connected": {"Input": "MediaIn1"},
+    }
+    assert d.connect_fusion_nodes(1, "MediaOut1", "Soften") == "Soften → MediaOut1.Input"
+    nodes = {n["name"]: n for n in d.fusion_nodes(1)}
+    assert nodes["Soften"]["inputs"] == {"Input": "MediaIn1"}
+    assert nodes["MediaOut1"]["inputs"] == {"Input": "Soften"}
+    _assert_lock_rules(fusion)
+
+
+def test_add_fusion_node_errors(fusion):
+    with pytest.raises(ToolError, match="unknown tool type: Blurr"):
+        d.add_fusion_node(1, "Blurr")
+    with pytest.raises(ToolError, match="node not found: Nope"):
+        d.add_fusion_node(1, "Blur", connect_from="Nope")
+    with pytest.raises(ToolError, match="already exists"):
+        d.add_fusion_node(1, "Blur", name="MediaIn1")
+    with pytest.raises(ToolError, match="could not connect MediaIn1 to its Size"):
+        d.add_fusion_node(1, "Transform", connect_from="MediaIn1", input="Size")
+    _assert_lock_rules(fusion)
+
+
+def test_auto_names(fusion):
+    assert d.add_fusion_node(1, "Blur")["name"] == "Blur1"
+    assert d.add_fusion_node(1, "Blur")["name"] == "Blur2"
+
+
+def test_mask_and_disconnect(fusion):
+    d.add_fusion_node(1, "Blur", connect_from="MediaIn1")
+    d.add_fusion_node(1, "EllipseMask", name="Vignette")
+    d.connect_fusion_nodes(1, "Blur1", "Vignette", input="EffectMask")
+    assert {n["name"]: n for n in d.fusion_nodes(1)}["Blur1"]["inputs"] == {"Input": "MediaIn1", "EffectMask": "Vignette"}
+    assert d.connect_fusion_nodes(1, "Blur1", None, input="EffectMask") == "disconnected Blur1.EffectMask"
+    with pytest.raises(ToolError, match="cannot connect Vignette to Blur1.XBlurSize"):
+        d.connect_fusion_nodes(1, "Blur1", "Vignette", input="XBlurSize")
+    _assert_lock_rules(fusion)
+
+
+def test_delete_fusion_node(fusion):
+    d.add_fusion_node(1, "Blur")
+    assert d.delete_fusion_node(1, "Blur1") == "deleted Blur1"
+    assert [n["name"] for n in d.fusion_nodes(1)] == ["MediaIn1", "MediaOut1"]
+    with pytest.raises(ToolError, match="node not found"):
+        d.delete_fusion_node(1, "Blur1")
+    _assert_lock_rules(fusion)
+
+
+def test_set_static_values(fusion):
+    d.add_fusion_node(1, "TextPlus", name="Title")
+    assert d.set_fusion_input(1, "Title", "StyledText", "Breaking News")["value"] == "Breaking News"
+    assert d.set_fusion_input(1, "Title", "Size", 0.12)["value"] == 0.12
+    # Point: this build rejects [x, y], so the {1: x, 2: y} encoding is used.
+    assert d.set_fusion_input(1, "Title", "Center", [0.5, 0.2])["value"] == {"1": 0.5, "2": 0.2}
+    _assert_lock_rules(fusion)
+    assert fusion.undo_steps == 3
+
+
+def test_set_input_errors(fusion):
+    d.add_fusion_node(1, "Transform")
+    with pytest.raises(ToolError, match="either value or keyframes"):
+        d.set_fusion_input(1, "Transform1", "Size")
+    with pytest.raises(ToolError, match="either value or keyframes"):
+        d.set_fusion_input(1, "Transform1", "Size", 1.0, keyframes={0: 1.0})
+    with pytest.raises(ToolError, match="Transform1 has no input Sise"):
+        d.set_fusion_input(1, "Transform1", "Sise", 1.0)
+    with pytest.raises(ToolError, match=r"point input needs \[x, y\]"):
+        d.set_fusion_input(1, "Transform1", "Center", 0.5)
+
+
+def test_keyframe_number_attaches_spline(fusion):
+    d.add_fusion_node(1, "Transform", connect_from="MediaIn1")
+    out = d.set_fusion_input(1, "Transform1", "Size", keyframes={0: 1.0, 75: 1.4})
+    assert out == {"node": "Transform1", "input": "Size", "keyframes": [0.0, 75.0]}
+    tool = fusion.FindTool("Transform1")
+    assert tool.inputs["Size"].keys == {0: 1.0, 75: 1.4}
+    # Adding more keys reuses the existing spline instead of attaching another.
+    d.set_fusion_input(1, "Transform1", "Size", keyframes={150: 1.0})
+    assert sum(t.kind == "BezierSpline" for t in fusion.tools) == 1
+    node = {n["name"]: n for n in d.fusion_nodes(1)}["Transform1"]
+    assert node["animated"] == ["Size"]
+    assert "BezierSpline1" not in [n["name"] for n in d.fusion_nodes(1)]
+    _assert_lock_rules(fusion)
+
+
+def test_keyframe_point_uses_path(fusion):
+    d.add_fusion_node(1, "Transform")
+    d.set_fusion_input(1, "Transform1", "Center", keyframes={0: [0.2, 0.5], 48: [0.8, 0.5]})
+    tool = fusion.FindTool("Transform1")
+    assert tool.inputs["Center"].source.tool.kind == "PolyPath"
+    assert tool.inputs["Center"].keys == {0: {1: 0.2, 2: 0.5}, 48: {1: 0.8, 2: 0.5}}
+    _assert_lock_rules(fusion)
+
+
+def test_keyframe_text_is_rejected(fusion):
+    d.add_fusion_node(1, "TextPlus")
+    with pytest.raises(ToolError, match=r"TextPlus1.StyledText \(Text\) cannot be animated"):
+        d.set_fusion_input(1, "TextPlus1", "StyledText", keyframes={0: "a"})
+    # Nothing was written as a static value by mistake.
+    assert fusion.FindTool("TextPlus1").inputs["StyledText"].value == ""
+
+
+def test_keyframes_through_mcp_with_json_keys(fusion):
+    d.add_fusion_node(1, "Transform")
+    args = {"item": 1, "node": "Transform1", "input": "Size", "keyframes": {"0": 1.0, "24": 2.0}}
+    result = asyncio.run(d.mcp.call_tool("set_fusion_input", args))
+    assert json.loads(result.content[0].text)["keyframes"] == [0.0, 24.0]
+
+
+def test_fusion_inputs(fusion):
+    d.add_fusion_node(1, "Blur", connect_from="MediaIn1")
+    d.set_fusion_input(1, "Blur1", "XBlurSize", keyframes={0: 0.0, 24: 20.0})
+    assert d.fusion_inputs(1, "Blur1") == [
+        {"id": "Input", "name": "Input", "type": "Image", "value": None, "animated": False, "source": "MediaIn1"},
+        {"id": "XBlurSize", "name": "XBlurSize", "type": "Number", "value": 0.0, "animated": True, "source": None},
+        {"id": "EffectMask", "name": "EffectMask", "type": "Mask", "value": None, "animated": False, "source": None},
+    ]
+    assert [r["id"] for r in d.fusion_inputs(1, "Blur1", filter="blur")] == ["XBlurSize"]
+
+
+def test_fusion_needs_a_comp(project):
+    d.append_clips(["a.mov"])
+    with pytest.raises(ToolError, match=r"comp 1 not found on 'a.mov' \(0 comp\(s\); see add_fusion_comp\)"):
+        d.fusion_nodes(1)
