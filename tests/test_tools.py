@@ -194,6 +194,7 @@ def test_all_tools_registered():
         "rename_project", "delete_project", "list_databases", "switch_database", "create_cloud_project",
         "load_cloud_project", "refresh_collaboration", "duplicate_timeline", "rename_timeline", "delete_timelines",
         "review_notes", "add_review_note", "resolve_review_note", "delete_markers", "export_review_notes",
+        "get_transcript", "export_transcript", "write_subtitles", "list_titles", "set_title_text",
     }
 
 
@@ -1587,3 +1588,132 @@ def test_notes_timecode_on_drop_frame(project):
     project.current.settings["timelineDropFrameTimecode"] = "1"
     d.add_review_note(10, "df")
     assert d.review_notes()[0]["timecode"] is None  # frames stay exact; no guessed drop-frame timecode
+
+
+# --- transcripts, subtitle files, titles ---
+
+TRANSCRIPT = {
+    "language": "en",
+    "segments": [
+        {"start": "01:00:00:12", "end": "01:00:02:00", "text": "Welcome to the show", "speaker": "Sara",
+         "words": [{"start": "01:00:00:12", "end": "01:00:01:00", "text": "Welcome"}]},
+        {"start": "01:00:02:00", "end": "01:00:03:00", "text": "(...)", "speaker": None, "words": []},
+        {"start": "01:00:03:00", "end": "01:00:05:12", "text": "Today we talk about color", "speaker": None, "words": []},
+    ],
+}
+
+
+@pytest.fixture
+def transcribed(project):
+    """a.mov carries a Resolve 21.1 transcript."""
+    clip = next(c for c in project.pool.root.clips if c.name == "a.mov")
+    clip.GetTranscription = lambda nested=False: TRANSCRIPT
+    return clip
+
+
+def test_get_transcript_full(transcribed):
+    t = d.get_transcript("a.mov")
+    assert (t["language"], t["complete"], len(t["segments"])) == ("en", True, 3)
+    first = t["segments"][0]
+    assert (first["start_seconds"], first["end_seconds"], first["speaker"]) == (0.5, 2.0, "Sara")  # from clip start
+    assert "words" not in first
+    assert d.get_transcript("a.mov", words=True)["segments"][0]["words"][0]["text"] == "Welcome"
+    found = d.get_transcript("a.mov", query="COLOR")["segments"]
+    assert [s_["start"] for s_ in found] == ["01:00:03:00"]
+
+
+def test_get_transcript_preview_before_21_1(project):
+    clip = next(c for c in project.pool.root.clips if c.name == "a.mov")
+    clip.props["Transcription"] = "Welcome to the show today we…"
+    t = d.get_transcript("a.mov")
+    assert (t["complete"], t["preview"], t["segments"]) == (False, "Welcome to the show today we…", [])
+    with pytest.raises(ToolError, match="exporting needs Resolve 21.1"):
+        d.export_transcript("a.mov", "/tmp/x.srt")
+
+
+def test_get_transcript_missing(project):
+    with pytest.raises(ToolError, match="has no transcription: run transcribe_audio"):
+        d.get_transcript("a.mov")
+
+
+def test_export_transcript_srt_vtt_txt(transcribed, tmp_path):
+    out = d.export_transcript("a.mov", str(tmp_path / "a.srt"))
+    assert (out["segments"], out["language"]) == (2, "en")  # the silence is skipped
+    assert (tmp_path / "a.srt").read_text(encoding="utf-8") == (
+        "1\n00:00:00,500 --> 00:00:02,000\nSara: Welcome to the show\n\n"
+        "2\n00:00:03,000 --> 00:00:05,500\nToday we talk about color\n"
+    )
+    d.export_transcript("a.mov", str(tmp_path / "a.vtt"), speakers=False)
+    vtt = (tmp_path / "a.vtt").read_text(encoding="utf-8")
+    assert vtt.startswith("WEBVTT\n\n00:00:00.500 --> 00:00:02.000\nWelcome to the show")
+    d.export_transcript("a.mov", str(tmp_path / "a.txt"))
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8").splitlines()[0] == "[00:00:00] Sara: Welcome to the show"
+    d.export_transcript("a.mov", str(tmp_path / "a.json"))
+    assert json.loads((tmp_path / "a.json").read_text(encoding="utf-8"))["language"] == "en"
+    with pytest.raises(ToolError, match="must end in"):
+        d.export_transcript("a.mov", str(tmp_path / "a.doc"))
+
+
+def test_write_subtitles_arabic_rtl(project, tmp_path):
+    captions = [{"start": 0.5, "end": 2, "text": "مرحبًا بكم في البرنامج!"},
+                {"start": "00:00:03,000", "end": "00:00:05,500", "text": "اليوم نتحدث عن الألوان."}]
+    out = d.write_subtitles(str(tmp_path / "ar.srt"), captions, rtl=True)
+    assert out["captions"] == 2
+    text = (tmp_path / "ar.srt").read_text(encoding="utf-8")
+    assert text == ("1\n00:00:00,500 --> 00:00:02,000\n\u200fمرحبًا بكم في البرنامج!\n\n"
+                    "2\n00:00:03,000 --> 00:00:05,500\n\u200fاليوم نتحدث عن الألوان.\n")
+
+
+def test_write_subtitles_timecodes_use_timeline_fps(project, tmp_path):
+    d.write_subtitles(str(tmp_path / "tc.vtt"), [{"start": "00:00:01:12", "end": "00:00:02:00", "text": "Hi"}])
+    assert "00:00:01.500 --> 00:00:02.000" in (tmp_path / "tc.vtt").read_text()  # 24 fps timeline
+
+
+def test_write_subtitles_errors(project, tmp_path):
+    path = str(tmp_path / "x.srt")
+    for captions, msg in [([], "no captions"), ([{"start": 2, "end": 1, "text": "a"}], "ends before it starts"),
+                          ([{"start": 0, "end": 1, "text": " "}], "has no text"),
+                          ([{"start": 0, "end": 2, "text": "a"}, {"start": 1, "end": 3, "text": "b"}], "starts before caption 1 ends"),
+                          ([{"start": "soon", "end": 1, "text": "a"}], "not a time")]:
+        with pytest.raises(ToolError, match=msg):
+            d.write_subtitles(path, captions)
+    with pytest.raises(ToolError, match=".srt or .vtt"):
+        d.write_subtitles(str(tmp_path / "x.ass"), [{"start": 0, "end": 1, "text": "a"}])
+
+
+def test_list_and_set_titles(project):
+    _two_items(project)
+    d.insert_title("Text+", fusion=True, text="Hello")
+    assert d.list_titles() == [{"track": 1, "item": 3, "name": "Text+", "start": 86550, "end": 86670,
+                                "texts": {"Template": "Hello"}}]
+    out = d.set_title_text(3, text="أهلًا وسهلًا", font="Noto Naskh Arabic", style="Bold", size=0.1, color=[1, 0.8, 0])
+    assert out["set"] == {"StyledText": "أهلًا وسهلًا", "Font": "Noto Naskh Arabic", "Style": "Bold", "Size": 0.1,
+                          "Red1": 1.0, "Green1": 0.8, "Blue1": 0.0}
+    assert d.list_titles()[0]["texts"] == {"Template": "أهلًا وسهلًا"}
+    comp = project.current.tracks[("video", 1)][2].comps[0]
+    _assert_lock_rules(comp)
+
+
+def test_set_title_text_errors(project):
+    _two_items(project)
+    with pytest.raises(ToolError, match="is not a Fusion title"):
+        d.set_title_text(1, text="x")
+    d.insert_title("Text+", fusion=True)
+    d.add_fusion_node(3, "TextPlus", name="Subtitle")
+    with pytest.raises(ToolError, match="several Text\\+ nodes: pass node= one of Template, Subtitle"):
+        d.set_title_text(3, text="x")
+    assert d.set_title_text(3, text="lower third", node="Subtitle")["node"] == "Subtitle"
+    with pytest.raises(ToolError, match="color needs"):
+        d.set_title_text(3, color=[2, 0, 0], node="Subtitle")
+    with pytest.raises(ToolError, match="nothing to change"):
+        d.set_title_text(3, node="Subtitle")
+
+
+def test_render_subtitles_needs_21(project, tmp_path, resolve, monkeypatch):
+    with pytest.raises(ToolError, match="needs Resolve 21"):
+        d.render(str(tmp_path), subtitles="burn_in")
+    monkeypatch.setattr(type(resolve), "GetVersionString", lambda self: "21.0.2")
+    d.render(str(tmp_path), subtitles="separate_file")
+    assert (project.render_settings["ExportSubtitle"], project.render_settings["SubtitleFormat"]) == (True, "SeparateFile")
+    with pytest.raises(ToolError, match="subtitles must be"):
+        d.render(str(tmp_path), subtitles="srt")

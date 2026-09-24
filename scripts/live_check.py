@@ -223,6 +223,14 @@ def run_checks(args, work, is_211):
          note="link_mask_to_tracker assumes TrackedCenter1")
     step("fusion: view_frame after effects", lambda: _frame(work / "frame_fusion.png"), needs=have_items)
 
+    print("\nTitles and subtitles")
+    step("titles: insert Text+ and set_title_text (text, font, style, size, color)", lambda: _title(),
+         needs=have_items, note="confirms the Text+ input names Font / Style / Red1")
+    step("subtitles: write_subtitles Arabic .srt", lambda: d.write_subtitles(
+        str(work / "ar.srt"), [{"start": 0.5, "end": 2, "text": "مرحبًا بكم"}], rtl=True))
+    step("subtitles: probe ImportMedia(.srt)", lambda: _srt_probe(work),
+         note="informational: does the API accept an SRT into the media pool?")
+
     print("\nReview and timelines")
     step("review: add/resolve/export notes", lambda: _notes(work))
     step("timeline: duplicate_timeline keeps current", lambda: _dup())
@@ -289,6 +297,21 @@ def _tracker_inputs():
     d.add_fusion_node(1, "Tracker", connect_from="MediaIn1")
     ids = [r["id"] for r in d.fusion_inputs(1, "Tracker1") if r["type"] == "Point"]
     return {"point_inputs": ids, "has_TrackedCenter1": "TrackedCenter1" in ids}
+
+
+def _title():
+    d.insert_title("Text+", fusion=True, text="live check")
+    titles = d.list_titles()
+    expect(titles, "no Fusion title found after insert_title")
+    t = titles[-1]
+    return d.set_title_text(t["item"], text="أهلًا live check", font="Arial", style="Bold", size=0.1,
+                            color=[1, 0.8, 0], track=t["track"])
+
+
+def _srt_probe(work):
+    pool = d._project()[1].GetMediaPool()
+    items = pool.ImportMedia([str(work / "ar.srt")]) or []
+    return {"imported": [i.GetName() for i in items]}
 
 
 def _notes(work):

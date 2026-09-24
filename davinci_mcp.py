@@ -49,7 +49,7 @@ mcp = MCPServer(
     "davinci",
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
     "clip properties, transitions, titles, markers, color grading and management, HDR, Fusion compositing, audio, "
-    "media management, projects and review notes, "
+    "media management, projects and review notes, transcripts, subtitle files and titles, "
     "interchange export and rendering. "
     "Start with timeline_overview to see the edit and view_frame to see the picture. "
     "Frames are absolute timeline frames.",
@@ -472,6 +472,16 @@ def list_render_presets() -> list[str]:
     return list(proj.GetRenderPresetList())
 
 
+SUBTITLE_DELIVERY = {"burn_in": "BurnIn", "separate_file": "SeparateFile", "embedded": "EmbeddedCaptions"}
+
+
+def _major_version():
+    try:
+        return int(str(_resolve().GetVersionString()).split(".")[0])
+    except (TypeError, ValueError):
+        return 0
+
+
 @_tool
 def render(
     target_dir: str,
@@ -489,6 +499,7 @@ def render(
     audio: bool | None = None,
     individual_clips: bool = False,
     settings: dict | None = None,
+    subtitles: str | None = None,
     start: bool = True,
 ) -> dict:
     """Queue a render of the current timeline and start it (start=False only queues it).
@@ -497,7 +508,9 @@ def render(
     quality: 0 auto, a bitrate, or Least/Low/Medium/High/Best. individual_clips=True renders one file per clip.
     settings: any other SetRenderSettings key (AudioCodec, AudioBitDepth, AudioSampleRate, ColorSpaceTag, GammaTag,
     ExportAlpha, AlphaMode, EncodingProfile, MultiPassEncode, NetworkOptimization, PixelAspectRatio...).
-    Unset values inherit the Deliver page's current state, so pass a `preset` to start from a known base."""
+    Unset values inherit the Deliver page's current state, so pass a `preset` to start from a known base.
+    subtitles: burn_in, separate_file or embedded delivers the timeline's subtitle track (Resolve 21+; on 19.x these
+    settings were measured to have no effect, so they are refused there). Check the output for the subtitles."""
     if (format is None) != (codec is None):
         raise ToolError("format and codec must be given together")
     if (mark_in is None) != (mark_out is None):
@@ -520,6 +533,13 @@ def render(
         raise ToolError("could not set render mode")
     values = dict(settings or {})
     values["TargetDir"] = os.path.abspath(target_dir)
+    if subtitles is not None:
+        if subtitles not in SUBTITLE_DELIVERY:
+            raise ToolError(f"subtitles must be one of: {', '.join(SUBTITLE_DELIVERY)}")
+        if _major_version() < 21:
+            raise ToolError("subtitle delivery through the API needs Resolve 21 (inert on earlier versions); "
+                            "use the Deliver page's Subtitle Settings")
+        values.update(ExportSubtitle=True, SubtitleFormat=SUBTITLE_DELIVERY[subtitles])
     for key, value in (("CustomName", file_name), ("FormatWidth", width), ("FormatHeight", height),
                        ("FrameRate", frame_rate), ("VideoQuality", quality), ("ExportVideo", video),
                        ("ExportAudio", audio)):
@@ -2654,6 +2674,232 @@ def export_review_notes(path: str, status: str | None = None) -> dict:
                 note = (r["note"] or "").replace("|", "\\|").replace("\n", " ")
                 f.write(f"| {r['timecode'] or r['frame']} | {r['status'] or ''} | {r['author'] or ''} | {note} |\n")
     return {"timeline": tl.GetName(), "path": path, "notes": len(rows)}
+
+
+
+# --- Transcripts, subtitle files and titles ---
+#
+# Resolve's API cannot read or edit subtitle items (text or timing), import an SRT onto a subtitle track, or style
+# subtitles. So subtitles are made as files: from a clip's transcript (Resolve 21.1 GetTranscription, with word
+# timing and speakers), or from captions the model writes or translates, e.g. into Arabic, which Resolve's
+# auto-captions do not support. The file is then imported in Resolve (File > Import > Subtitle).
+
+SILENCE = "(...)"
+
+
+def _tc_frames(tc, fps):
+    """Frames in a "HH:MM:SS:FF" (or ;FF) timecode at the nominal rate of `fps`."""
+    parts = str(tc).replace(";", ":").split(":")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        raise ToolError(f"not a timecode: {tc!r}")
+    h, m, sec, f = (int(p) for p in parts)
+    return ((h * 60 + m) * 60 + sec) * round(fps) + f
+
+
+def _seconds(value, fps=None):
+    """Seconds from a number, "HH:MM:SS,mmm" / "HH:MM:SS.mmm", or a "HH:MM:SS:FF" timecode (needs fps)."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if text.count(":") == 3:
+        if not fps:
+            raise ToolError(f"{text!r} is a frame timecode: give fps")
+        return _tc_frames(text, fps) / float(fps)
+    try:
+        h, m, rest = text.replace(",", ".").split(":")
+        return int(h) * 3600 + int(m) * 60 + float(rest)
+    except ValueError:
+        raise ToolError(f"not a time: {value!r} (seconds, HH:MM:SS,mmm or HH:MM:SS:FF)") from None
+
+
+def _stamp(sec, sep):
+    ms = round(sec * 1000)
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s_, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s_:02d}{sep}{ms:03d}"
+
+
+RLM = "\u200f"
+
+
+def _write_captions(path, captions, rtl=False):
+    """Write [{start, end, text}] (seconds) as .srt or .vtt."""
+    path = os.path.abspath(path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".srt", ".vtt"):
+        raise ToolError("path must end in .srt or .vtt")
+    if not os.path.isdir(os.path.dirname(path)):
+        raise ToolError(f"folder not found: {os.path.dirname(path)}")
+    blocks = []
+    for n, c in enumerate(captions, 1):
+        lines = str(c["text"]).strip().splitlines()
+        if rtl:
+            lines = [RLM + line for line in lines]  # keeps punctuation on the right side in Arabic/Hebrew
+        sep = "," if ext == ".srt" else "."
+        head = [str(n)] if ext == ".srt" else []
+        blocks.append("\n".join(head + [f"{_stamp(c['start'], sep)} --> {_stamp(c['end'], sep)}"] + lines))
+    body = ("WEBVTT\n\n" if ext == ".vtt" else "") + "\n\n".join(blocks) + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    return path
+
+
+def _transcript(clip):
+    """(transcript dict, complete) for a media-pool clip: full on 21.1+, else the truncated preview property."""
+    get = getattr(clip, "GetTranscription", None)
+    if callable(get):
+        t = get(False) or {}
+        if not t.get("segments"):
+            raise ToolError(f"{clip.GetName()} has no transcription: run transcribe_audio first (Studio)")
+        return t, True
+    preview = clip.GetClipProperty("Transcription") or ""
+    if not preview:
+        raise ToolError(f"{clip.GetName()} has no transcription: run transcribe_audio first (Studio)")
+    return {"language": None, "segments": [], "preview": preview}, not preview.endswith(("…", "..."))
+
+
+def _clip_timing(clip):
+    fps = float(clip.GetClipProperty("FPS") or 0) or 24.0
+    start_tc = clip.GetClipProperty("Start TC")
+    return fps, (_tc_frames(start_tc, fps) if start_tc else 0)
+
+
+@_tool
+def get_transcript(clip: str, query: str | None = None, words: bool = False) -> dict:
+    """A media-pool clip's transcript (after transcribe_audio): segments with start/end timecodes, seconds from the
+    clip start, speaker and text; words=True adds per-word timing. query keeps only segments containing it
+    (case-insensitive), to find where something is said. Full on Resolve 21.1+; earlier versions only expose a
+    preview, marked complete=False when Resolve cut it short."""
+    _, proj = _project()
+    (c,) = _pool_clips(proj, [clip])
+    t, complete = _transcript(c)
+    if not t["segments"]:
+        return {"clip": c.GetName(), "complete": complete, "preview": t["preview"], "segments": []}
+    fps, origin = _clip_timing(c)
+    rows = []
+    for seg in t["segments"]:
+        if query and query.lower() not in (seg.get("text") or "").lower():
+            continue
+        row = {"start": seg["start"], "end": seg["end"],
+               "start_seconds": round((_tc_frames(seg["start"], fps) - origin) / fps, 3),
+               "end_seconds": round((_tc_frames(seg["end"], fps) - origin) / fps, 3),
+               "speaker": seg.get("speaker"), "text": seg.get("text", "")}
+        if words:
+            row["words"] = seg.get("words", [])
+        rows.append(row)
+    return {"clip": c.GetName(), "language": t.get("language"), "complete": True, "segments": rows}
+
+
+@_tool
+def export_transcript(clip: str, path: str, speakers: bool = True, rtl: bool = False) -> dict:
+    """Write a clip's transcript (Resolve 21.1+) as subtitles (.srt, .vtt) or a document (.txt, .json), timed from
+    the clip start. speakers=True prefixes each line with the speaker when Resolve detected one; silences are
+    skipped. Import the .srt in Resolve with File > Import > Subtitle."""
+    t = get_transcript(clip)
+    if not t.get("language") and not t["segments"]:
+        raise ToolError("this Resolve only exposes a transcript preview; exporting needs Resolve 21.1")
+    segs = [s_ for s_ in t["segments"] if s_["text"].strip() and s_["text"].strip() != SILENCE]
+    label = (lambda s_: f"{s_['speaker']}: {s_['text']}" if speakers and s_.get("speaker") else s_["text"])
+    path = os.path.abspath(path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".srt", ".vtt"):
+        _write_captions(path, [{"start": s_["start_seconds"], "end": s_["end_seconds"], "text": label(s_)} for s_ in segs], rtl)
+    elif ext in (".txt", ".json"):
+        if not os.path.isdir(os.path.dirname(path)):
+            raise ToolError(f"folder not found: {os.path.dirname(path)}")
+        with open(path, "w", encoding="utf-8") as f:
+            if ext == ".json":
+                json.dump(t, f, ensure_ascii=False, indent=2)
+            else:
+                f.write("\n".join(f"[{_stamp(s_['start_seconds'], '.')[:8]}] {label(s_)}" for s_ in segs) + "\n")
+    else:
+        raise ToolError("path must end in .srt, .vtt, .txt or .json")
+    return {"clip": t["clip"], "path": path, "segments": len(segs), "language": t.get("language")}
+
+
+@_tool
+def write_subtitles(path: str, captions: list[dict], fps: float | None = None, rtl: bool = False) -> dict:
+    """Write captions as an .srt or .vtt file, e.g. a translation of a transcript (any language, UTF-8).
+    captions: [{"start", "end", "text"}] with times in seconds, "HH:MM:SS,mmm", or "HH:MM:SS:FF" timecodes (these
+    need fps; default: the current timeline's). rtl=True marks lines right-to-left (Arabic, Hebrew, Persian) so
+    punctuation lands on the correct side. Import in Resolve with File > Import > Subtitle."""
+    if not captions:
+        raise ToolError("no captions given")
+    if fps is None and any(str(c.get("start", "")).count(":") == 3 for c in captions):
+        _, tl = _timeline()
+        fps = float(tl.GetSetting("timelineFrameRate") or 24)
+    rows, prev_end = [], 0.0
+    for n, c in enumerate(captions, 1):
+        if not str(c.get("text", "")).strip():
+            raise ToolError(f"caption {n} has no text")
+        start, end = _seconds(c.get("start"), fps), _seconds(c.get("end"), fps)
+        if end <= start:
+            raise ToolError(f"caption {n} ends before it starts")
+        if start < prev_end:
+            raise ToolError(f"caption {n} starts before caption {n - 1} ends")
+        rows.append({"start": start, "end": end, "text": c["text"]})
+        prev_end = end
+    return {"path": _write_captions(path, rows, rtl), "captions": len(rows)}
+
+
+def _text_nodes(it):
+    comp = it.GetFusionCompByIndex(1) if int(_opt(it, "GetFusionCompCount") or 0) else None
+    return comp, (list((comp.GetToolList(False, "TextPlus") or {}).values()) if comp else [])
+
+
+@_tool
+def list_titles() -> list[dict]:
+    """Every Fusion title (Text+) on the current timeline's video tracks, with its text: the titles set_title_text
+    can edit. Resolve's standard (non-Fusion) titles are not editable through the API."""
+    _, tl = _timeline()
+    out = []
+    for n in range(1, int(tl.GetTrackCount("video") or 0) + 1):
+        for i, it in enumerate(tl.GetItemListInTrack("video", n) or [], 1):
+            _, nodes = _text_nodes(it)
+            if nodes:
+                out.append({"track": n, "item": i, "name": it.GetName(), "start": it.GetStart(), "end": it.GetEnd(),
+                            "texts": {_tool_attrs(t)[0]: t.GetInput("StyledText") for t in nodes}})
+    return out
+
+
+@_tool
+def set_title_text(
+    item: int,
+    text: str | None = None,
+    font: str | None = None,
+    style: str | None = None,
+    size: float | None = None,
+    color: list[float] | None = None,
+    node: str | None = None,
+    track: int = 1,
+) -> dict:
+    """Edit a Fusion title (Text+) on the timeline: its text (any language), font family and style (e.g. "Bold"),
+    size (0-1 of frame width, Text+ default about 0.08), fill color [r, g, b] in 0-1. node picks the Text+ node when a
+    title has several (see list_titles). Insert new Fusion titles with insert_title(fusion=True)."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    comp, nodes = _text_nodes(it)
+    if not nodes:
+        raise ToolError(f"'{it.GetName()}' is not a Fusion title (no Text+ node); see list_titles")
+    if node:
+        nodes = [t for t in nodes if _tool_attrs(t)[0] == node]
+        if not nodes:
+            raise ToolError(f"no Text+ node named {node} in '{it.GetName()}'")
+    elif len(nodes) > 1:
+        raise ToolError(f"'{it.GetName()}' has several Text+ nodes: pass node= one of "
+                        f"{', '.join(_tool_attrs(t)[0] for t in nodes)}")
+    tool = nodes[0]
+    name = _tool_attrs(tool)[0]
+    values = {k: v for k, v in (("StyledText", text), ("Font", font), ("Style", style), ("Size", size)) if v is not None}
+    if color is not None:
+        if len(color) != 3 or not all(0 <= float(v) <= 1 for v in color):
+            raise ToolError("color needs [r, g, b] with values 0-1")
+        values.update(Red1=float(color[0]), Green1=float(color[1]), Blue1=float(color[2]))
+    if not values:
+        raise ToolError("nothing to change")
+    applied = {k: _set_input(comp, tool, name, k, value=v)["value"] for k, v in values.items()}
+    return {"item": it.GetName(), "node": name, "set": applied}
 
 
 if __name__ == "__main__":
