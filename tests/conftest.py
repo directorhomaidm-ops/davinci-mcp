@@ -10,6 +10,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 UI = {"page": "edit"}
 
+KNOWN_SPACES = {"Rec.709 Gamma 2.4", "Rec.2100 ST2084", "Rec.2100 HLG", "DaVinci WG/Intermediate", "ARRI LogC4"}
+SETTING_ENUMS = {
+    "colorScienceMode": {"davinciYRGB", "davinciYRGBColorManaged", "davinciYRGBColorManagedv2", "acescc", "acescct"},
+    "rcmPresetMode": {"SDR", "HDR"},
+    "hdrDolbyVersion": {"2.9", "4.0"},
+    "hdrDolbyAnalysisTuning": {"Legacy", "Most Mapping", "More Mapping", "Balanced", "Less Mapping", "Least Mapping"},
+}
+
+
+def color_set(store, key, value):
+    """Resolve-like color setting rules: enums, mode-dependent locks, and a lie while RCM is automatic."""
+    managed = store.get("colorScienceMode", "davinciYRGB").startswith("davinciYRGBColorManaged")
+    if key.startswith("colorSpace"):
+        if store.get("isAutoColorManage") == "1":
+            return True  # locked by automatic color management: reports success, applies nothing
+        if not managed:
+            return False
+        if not key.endswith("Gamma") and value not in KNOWN_SPACES:
+            return False
+    if key == "rcmPresetMode" and store.get("isAutoColorManage") != "1":
+        return False
+    if key in SETTING_ENUMS and value not in SETTING_ENUMS[key]:
+        return False
+    store[key] = value
+    return True
+
 
 class Clip:
     def __init__(self, name, frames=100, path=None):
@@ -67,6 +93,12 @@ class Clip:
 
     def GetName(self):
         return self.name
+
+    def SetClipProperty(self, key, value):
+        if key == "Input Color Space" and value not in KNOWN_SPACES:
+            return False
+        self.props[key] = value
+        return True
 
     def GetClipProperty(self, key=None):
         allp = {"Frames": str(self.frames), "File Path": self.path, "FPS": "24", "Resolution": "1920x1080",
@@ -468,7 +500,8 @@ class Timeline:
         self.markers = {}
         self.playhead_item, self.page_is_color, self.drx = None, True, None
         self.playhead, self.settings = "01:00:00:00", {"timelineFrameRate": "24", "timelineResolutionWidth": "1920",
-                                                         "timelineResolutionHeight": "1080", "timelineDropFrameTimecode": "0"}
+                                                         "timelineResolutionHeight": "1080", "timelineDropFrameTimecode": "0",
+                                                         "useCustomSettings": "0"}
         self.deleted, self.scene_cuts = None, False
         self.track_names, self.track_formats, self.track_locked, self.track_enabled = {}, {("audio", 1): "stereo"}, {}, {}
         self.voice, self.normalized, self.captioned_with = {}, None, None
@@ -535,6 +568,16 @@ class Timeline:
 
     def GetSetting(self, key):
         return self.settings.get(key)
+
+    def SetSetting(self, key, value):
+        if key == "useCustomSettings":
+            self.settings[key] = value
+            return True
+        return color_set(self.settings, key, value)
+
+    def AnalyzeDolbyVision(self, items=None, analysis=None):
+        self.dolby_analyzed = (items, analysis)
+        return True
 
     def GetTrackCount(self, kind):
         return len([k for k in self.tracks if k[0] == kind])
@@ -749,10 +792,17 @@ class Project:
         self.presets = ["H.264 Master", "YouTube 1080p"]
         self.loaded_preset, self.render_settings, self.jobs = None, {}, {}
         self.format_codec, self.rendering = None, False
+        self.color = {"colorScienceMode": "davinciYRGB", "hdrMasteringOn": "0", "hdrDolbyControlsOn": "0"}
         self.gallery = Gallery()
 
     def GetGallery(self):
         return self.gallery
+
+    def GetSetting(self, key):
+        return self.color.get(key, "")
+
+    def SetSetting(self, key, value):
+        return color_set(self.color, key, value)
 
     def ApplyFairlightPresetToCurrentTimeline(self, name):
         self.fairlight_preset = name
@@ -924,6 +974,7 @@ class Resolve:
     AUTO_CAPTION_AUTO, AUTO_CAPTION_ENGLISH, AUTO_CAPTION_FRENCH = 100, 101, 102
     AUTO_CAPTION_SUBTITLE_DEFAULT, AUTO_CAPTION_TELETEXT, AUTO_CAPTION_NETFLIX = 200, 201, 202
     AUTO_CAPTION_LINE_SINGLE, AUTO_CAPTION_LINE_DOUBLE = 300, 301
+    DLB_BLEND_SHOTS = 400
 
     def GetFairlightPresets(self):
         return ["Dialogue Mix", "Podcast"]

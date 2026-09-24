@@ -211,6 +211,26 @@ Notes:
 - `magic_mask` only tracks: Magic Mask needs clicks on the subject and the API cannot place them. Seed it once in the Color page (select the clip, open the Magic Mask palette, click the subject), then call `magic_mask`. Power Windows and their tracker have no API at all. Studio only.
 - `export_lut` needs Resolve 18 or later and switches to the Color page for the export (Resolve refuses it on other pages), then back. Node reads/writes use Resolve 19's node graph when present and fall back to the older per-item calls on earlier versions.
 
+### Color management and HDR
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `color_management_info` | `timeline: bool = False` | `{scope, color, hdr}` (+ `uses_own_settings` for a timeline) | |
+| `apply_color_preset` | `preset: str`, `timeline: bool = False` | `{preset, scope, applied}` | Unknown preset; a value not applied |
+| `set_color_management` | `settings: dict`, `timeline: bool = False` | `{scope, applied}` | Not a color/HDR key; a value not applied |
+| `set_hdr` | `mastering_nits: int`, `dolby_vision: "2.9" \| "4.0" \| "off"`, `dolby_tuning: str`, `dolby_master_display: str`, `hdr10_plus: bool`, `timeline: bool = False` (any of them) | `{scope, applied}` | Bad value; nothing to change; a value not applied |
+| `set_clip_color_space` | `clips: list[str]`, `color_space`, `gamma`, `idt` (any of them) | `[{clip, <property>: value}]` | Value not applied |
+| `analyze_dolby_vision` | `items: list[int] \| None` (whole timeline when omitted), `blend_shots: bool = False`, `track: int = 1` | Confirmation string | Dolby Vision off; Studio only |
+
+Notes:
+
+- Presets: `yrgb` (unmanaged DaVinci YRGB), `rcm_sdr` / `rcm_hdr` (DaVinci color managed, automatic SDR or HDR), `rcm_custom` (color managed, spaces set by hand), `aces_cct`, `aces_cc`. They use only values documented in Resolve's API stub.
+- `set_color_management` takes Resolve's setting keys: `colorScienceMode`, `isAutoColorManage`, `rcmPresetMode`, `separateColorSpaceAndGamma`, `colorSpaceInput` / `colorSpaceTimeline` / `colorSpaceOutput` (and their `…Gamma`), `timelineWorkingLuminanceMode` (e.g. `"SDR 100"`, `"HDR 1000"`), `inputDRT` / `outputDRT` (`None`, `Simple`, `Luminance Mapping`, `DaVinci`, `Saturation Preserving`, `RED IPP2`), `useInverseDRT`, `colorSpaceOutputGamutMapping`, `graphicsWhiteLevel`, `colorAcesIDT` / `colorAcesODT` and the rest listed by `color_management_info`. Color space names must match Project Settings > Color Management exactly (e.g. `Rec.709 Gamma 2.4`, `Rec.2100 ST2084`, `DaVinci WG/Intermediate` when color space and gamma are combined).
+- Writes are applied in dependency order (color science, then automatic/preset mode, then color spaces, then HDR), whatever order they are given in, and every key is read back: Resolve can report success without applying a value, and color spaces are locked while automatic color management is on (`isAutoColorManage` = 1). Anything not applied is an error that lists what was.
+- `timeline=True` gives the current timeline its own settings (`useCustomSettings`) and changes only that timeline, e.g. an HDR deliverable timeline in an SDR project.
+- A typical HDR10 setup: `apply_color_preset("rcm_custom")`, `set_color_management({"colorSpaceTimeline": "DaVinci WG/Intermediate", "colorSpaceOutput": "Rec.2100 ST2084", "timelineWorkingLuminanceMode": "HDR 1000"})`, `set_hdr(mastering_nits=1000)`, then `export_timeline(path, "hdr10_a")` for the metadata. Dolby Vision: `set_hdr(dolby_vision="4.0")`, `analyze_dolby_vision()`, `export_timeline(path, "dolby_vision_4_0")`.
+- `set_clip_color_space` needs a color-managed project for `Input Color Space` / `Input Gamma`, and an ACES project for `IDT`.
+
 ### Fusion (VFX and motion graphics)
 
 `item` is the 1-based index from `list_items` on video `track` (default 1); `comp` is the 1-based composition index on that item (default 1). Nodes are addressed by name (`MediaIn1`, `Blur1`, …).
