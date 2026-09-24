@@ -55,7 +55,7 @@ def test_projects(resolve):
     assert d.list_projects() == ["Demo"]
     assert d.create_project("New") == "created: New"
     assert resolve.pm.current.name == "New"
-    with pytest.raises(ToolError, match="already exists"):
+    with pytest.raises(ToolError, match="name taken"):
         d.create_project("New")
     assert d.open_project("Demo") == "opened: Demo"
     with pytest.raises(ToolError, match="cannot open project: Nope"):
@@ -144,7 +144,8 @@ def test_insert_fusion_title_sets_text(project):
 
 def test_add_marker(project):
     assert d.add_marker(24, note="cut here", color="Red") == "marker @ 24 (Red)"
-    assert project.current.markers[24] == {"color": "Red", "name": "cut here", "note": "cut here", "duration": 1}
+    assert project.current.markers[24] == {"color": "Red", "name": "cut here", "note": "cut here", "duration": 1,
+                                           "customData": ""}
     d.add_marker(48)
     assert project.current.markers[48]["name"] == "frame 48"
     with pytest.raises(ToolError, match="duplicate frame"):
@@ -182,7 +183,10 @@ def test_all_tools_registered():
         "move_clips", "delete_clips", "import_image_sequence", "clip_info", "tag_clips", "relink_clips", "link_proxy",
         "replace_clip", "export_metadata", "export_timeline", "import_timeline", "save_project", "export_project",
         "import_project", "color_management_info", "set_color_management", "apply_color_preset", "set_hdr",
-        "set_clip_color_space", "analyze_dolby_vision",
+        "set_clip_color_space", "analyze_dolby_vision", "project_browser", "create_project_folder",
+        "rename_project", "delete_project", "list_databases", "switch_database", "create_cloud_project",
+        "load_cloud_project", "refresh_collaboration", "duplicate_timeline", "rename_timeline", "delete_timelines",
+        "review_notes", "add_review_note", "resolve_review_note", "delete_markers", "export_review_notes",
     }
 
 
@@ -1390,3 +1394,189 @@ def test_analyze_dolby_vision_uses_timeline_settings(project):
     d.set_hdr(dolby_vision="4.0", timeline=True)  # on for this timeline only
     assert project.color["hdrDolbyControlsOn"] == "0"
     assert "whole timeline" in d.analyze_dolby_vision()
+
+
+# --- projects and databases ---
+
+
+def test_switching_projects_saves_first(resolve):
+    resolve.pm.LoadProject("Demo")
+    d.create_project("Next")
+    assert resolve.pm.saves == 1  # Demo saved before CreateProject replaced it
+    d.open_project("Demo")
+    assert resolve.pm.saves == 2
+
+
+def test_untitled_project_is_never_saved(resolve):
+    from conftest import Project
+
+    resolve.pm.current = resolve.pm._add(Project("Untitled Project"))
+    with pytest.raises(ToolError, match="Untitled Project cannot be saved"):
+        d.save_project()
+    d.create_project("Named")  # switching away from Untitled skips the (impossible) save
+    assert resolve.pm.saves == 0
+
+
+def test_failed_save_blocks_switch(resolve, monkeypatch):
+    resolve.pm.LoadProject("Demo")
+    monkeypatch.setattr(resolve.pm, "SaveProject", lambda: False)
+    with pytest.raises(ToolError, match="could not save the current project 'Demo'; nothing was switched"):
+        d.create_project("Next")
+    assert "Next" not in resolve.pm.projects
+
+
+def test_project_browser_and_folders(resolve):
+    assert d.project_browser("/Clients/Acme")["folder"] == "Acme"
+    assert d.create_project_folder("2026") == "created project folder 2026"
+    assert d.project_browser()["folders"] == ["2026"]
+    root = d.project_browser("/")
+    assert (root["folders"], root["projects"], root["database"]["DbName"]) == (["Clients"], ["Demo"], "Local Database")
+    with pytest.raises(ToolError, match="project folder not found: Nope .*now at the root folder"):
+        d.project_browser("Clients/Nope")
+    assert d.project_browser()["folder"] == ""
+    with pytest.raises(ToolError, match="already exists"):
+        d.create_project_folder("Clients")
+
+
+def test_rename_and_delete_project(resolve):
+    resolve.pm.LoadProject("Demo")
+    d.create_project("Old")
+    assert d.rename_project("Archive") == "renamed project Old → Archive"
+    with pytest.raises(ToolError, match="is the open project"):
+        d.delete_project("Archive")
+    d.open_project("Demo")
+    # Archive was open a moment ago: the first DeleteProject fails on live Resolve, the retry succeeds.
+    assert d.delete_project("Archive") == "deleted project Archive"
+    with pytest.raises(ToolError, match="project not found"):
+        d.delete_project("Archive")
+
+
+def test_databases(resolve):
+    resolve.pm.LoadProject("Demo")
+    assert [db["DbName"] for db in d.list_databases()["databases"]] == ["Local Database", "Studio"]
+    out = d.switch_database("Studio")
+    assert out["database"]["DbType"] == "PostgreSQL"
+    assert resolve.pm.saves == 1
+    with pytest.raises(ToolError, match="database not found"):
+        d.switch_database("Nope")
+
+
+def test_cloud_projects(resolve, tmp_path):
+    resolve.pm.LoadProject("Demo")
+    out = d.create_cloud_project("Series S01", str(tmp_path), sync="proxy_and_original")
+    assert out == "created and opened cloud project Series S01"
+    assert resolve.pm.cloud_settings == {"cloud_name": "Series S01", "cloud_media": str(tmp_path), "cloud_sync": 502,
+                                         "cloud_collab": True, "cloud_cam": False}
+    assert d.load_cloud_project("Series S01", str(tmp_path)) == "opened cloud project Series S01"
+    with pytest.raises(ToolError, match="not found or not shared"):
+        d.load_cloud_project("Other", str(tmp_path))
+    with pytest.raises(ToolError, match="sync must be"):
+        d.create_cloud_project("X", str(tmp_path), sync="all")
+    with pytest.raises(ToolError, match="media folder not found"):
+        d.create_cloud_project("X", str(tmp_path / "missing"))
+
+
+def test_refresh_collaboration(project):
+    from conftest import Folder
+
+    stuck = Folder("Locked")
+    stuck.stays_stale = True
+    project.pool.root.subfolders.append(stuck)
+    project.pool.root.stale = True
+    assert d.refresh_collaboration() == {"refreshed": True, "stale_bins": ["Locked"]}
+
+
+# --- timelines ---
+
+
+def test_duplicate_timeline_keeps_current(project):
+    out = d.duplicate_timeline("Main v2")
+    assert out == {"copy": "Main v2", "of": "Main", "current": "Main"}
+    assert project.current.name == "Main"  # DuplicateTimeline moved it; the tool moved it back
+    with pytest.raises(ToolError, match="already exists"):
+        d.duplicate_timeline("Main v2")
+    assert d.duplicate_timeline("Old copy", timeline="Main v2")["of"] == "Main v2"
+
+
+def test_rename_and_delete_timelines(project):
+    d.duplicate_timeline("Scratch")
+    assert d.rename_timeline("Scratch 1", timeline="Scratch") == "renamed timeline Scratch → Scratch 1"
+    assert d.delete_timelines(["Scratch 1"]) == "deleted 1 timeline(s)"
+    assert [t["name"] for t in d.list_timelines()] == ["Main"]
+    with pytest.raises(ToolError, match="refusing to delete every timeline"):
+        d.delete_timelines(["Main"])
+    with pytest.raises(ToolError, match="timeline not found"):
+        d.rename_timeline("X", timeline="Nope")
+
+
+# --- review notes ---
+
+
+def test_review_notes_workflow(project, tmp_path):
+    note = d.add_review_note(48, "Logo too small", author="Sara")
+    assert note == {"frame": 48, "timecode": "01:00:02:00", "color": "Red", "name": "Sara: Logo too small",
+                    "note": "Logo too small", "duration": 1, "author": "Sara", "status": "open"}
+    d.add_marker(12, note="plain marker")
+    assert [n["frame"] for n in d.review_notes()] == [12, 48]
+    assert [n["frame"] for n in d.review_notes(status="open")] == [48]
+
+    resolved = d.resolve_review_note(48)
+    assert (resolved["status"], resolved["color"], resolved["author"]) == ("resolved", "Green", "Sara")
+    reopened = d.resolve_review_note(48, reopen=True)
+    assert (reopened["status"], reopened["color"]) == ("open", "Red")
+
+    out = d.export_review_notes(str(tmp_path / "notes.csv"))
+    lines = (tmp_path / "notes.csv").read_text().splitlines()
+    assert out["notes"] == 2
+    assert lines[0] == "timecode,frame,status,author,color,note"
+    assert lines[2] == "01:00:02:00,48,open,Sara,Red,Logo too small"
+
+    d.export_review_notes(str(tmp_path / "notes.md"), status="open")
+    md = (tmp_path / "notes.md").read_text()
+    assert "| 01:00:02:00 | open | Sara | Logo too small |" in md and "plain marker" not in md
+
+
+def test_review_note_errors(project, tmp_path):
+    with pytest.raises(ToolError, match="unknown marker color"):
+        d.add_review_note(10, "x", color="Orange")
+    d.add_review_note(10, "x")
+    with pytest.raises(ToolError, match="marker is already there"):
+        d.add_review_note(10, "y")
+    with pytest.raises(ToolError, match="no marker at frame 11"):
+        d.resolve_review_note(11)
+    with pytest.raises(ToolError, match=r"\.csv or \.md"):
+        d.export_review_notes(str(tmp_path / "notes.txt"))
+
+
+def test_resolve_note_restores_marker_on_failure(project, monkeypatch):
+    d.add_review_note(10, "keep me", author="Ali")
+    real_add = project.current.AddMarker
+    calls = []
+
+    def flaky_add(*args):
+        calls.append(args)
+        return False if len(calls) == 1 else real_add(*args)
+
+    monkeypatch.setattr(project.current, "AddMarker", flaky_add)
+    with pytest.raises(ToolError, match="the original was put back"):
+        d.resolve_review_note(10)
+    assert project.current.markers[10]["note"] == "keep me"
+    assert json.loads(project.current.markers[10]["customData"])["status"] == "open"
+
+
+def test_delete_markers(project):
+    d.add_marker(1, color="Red")
+    d.add_marker(2, color="Red")
+    d.add_marker(3, color="Blue")
+    assert d.delete_markers(color="Red") == "deleted 2 marker(s)"
+    assert d.delete_markers(frame=3) == "deleted marker at frame 3"
+    with pytest.raises(ToolError, match="give frame or color"):
+        d.delete_markers()
+    with pytest.raises(ToolError, match="no marker at frame 3"):
+        d.delete_markers(frame=3)
+
+
+def test_notes_timecode_on_drop_frame(project):
+    project.current.settings["timelineDropFrameTimecode"] = "1"
+    d.add_review_note(10, "df")
+    assert d.review_notes()[0]["timecode"] is None  # frames stay exact; no guessed drop-frame timecode

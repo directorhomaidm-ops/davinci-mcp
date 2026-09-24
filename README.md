@@ -26,8 +26,42 @@ All frames are absolute timeline frames unless noted. Item and track indexes are
 |---|---|---|---|
 | `status` | — | `{product, version, page, project, timeline, start_frame, end_frame}`; project/timeline fields are `null` when none is open | Resolve not reachable |
 | `list_projects` | — | Project names in the current project-manager folder | |
-| `open_project` | `name: str` | `"opened: <name>"` | Project cannot be opened |
-| `create_project` | `name: str` | `"created: <name>"`; the new project becomes current | Name already exists |
+| `open_project` | `name: str` | `"opened: <name>"` | Project cannot be opened; current project could not be saved |
+| `create_project` | `name: str` | `"created: <name>"`; the new project becomes current | Name taken; current project could not be saved |
+
+Notes:
+
+- `open_project`, `create_project`, `switch_database` and the cloud tools save the current project first: `CreateProject` replaces the current project, and an unsaved one is lost without warning. The default "Untitled Project" is never saved (Resolve cannot save it from a script: `False` in the GUI, an endless hang headless), so work in a named project.
+
+### Project management and collaboration
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `project_browser` | `folder: str \| None` (`"/"`, `"Clients/Acme"`) | `{database, folder, folders, projects, current_project}` | Folder not found (returns to the root) |
+| `create_project_folder` | `name: str` | Confirmation string | Name taken |
+| `rename_project` | `new_name: str` | Confirmation string | Name taken |
+| `delete_project` | `name: str` | Confirmation string | It is the open project; not found; refused |
+| `list_databases` | — | `{current, databases: [{DbType, DbName, IpAddress?}]}` | |
+| `switch_database` | `name: str`, `db_type: "Disk" \| "PostgreSQL" \| None` | `{database, projects}` | Not found; ambiguous; save or switch failed |
+| `create_cloud_project` | `name: str`, `media_path: str`, `collaboration: bool = True`, `sync: "none" \| "proxy_only" \| "proxy_and_original"`, `camera_access: bool = False` | Confirmation string | Folder missing; not signed in; name taken |
+| `load_cloud_project` | `name: str`, `media_path: str`, `sync` | Confirmation string | Not found or not shared |
+| `refresh_collaboration` | — | `{refreshed, stale_bins}` | Not a collaboration project |
+| `duplicate_timeline` | `new_name: str`, `timeline: str \| None` | `{copy, of, current}` | Name taken; not found |
+| `rename_timeline` | `new_name: str`, `timeline: str \| None` | Confirmation string | Name taken; not found |
+| `delete_timelines` | `names: list[str]` | Confirmation string | Not found; would delete every timeline |
+| `review_notes` | `status: "open" \| "resolved" \| None` | `[{frame, timecode, color, name, note, duration, author, status}]` | |
+| `add_review_note` | `frame: int`, `note: str`, `author: str \| None`, `color: str = "Red"`, `duration: int = 1` | The note | Unknown color; a marker already there |
+| `resolve_review_note` | `frame: int`, `reopen: bool = False` | The note | No marker there |
+| `delete_markers` | `frame: int` **or** `color: str` (`"All"` for every marker) | Confirmation string | No marker there; unknown color |
+| `export_review_notes` | `path: str` (`.csv` or `.md`), `status` | `{timeline, path, notes}` | Wrong extension; folder missing |
+
+Notes:
+
+- Review notes are ordinary timeline markers, so every editor sees them in Resolve's marker index, in collaboration projects too. `add_review_note` stores the author and an open/resolved status in the marker's hidden `customData`; resolving turns the marker green (a marker's color can only change by replacing it, and the original is put back if that fails). Frames are relative to the timeline start, like `add_marker`; timecodes are left empty on drop-frame timelines rather than guessed.
+- `duplicate_timeline` keeps the current timeline current: Resolve's `DuplicateTimeline` silently switches to the copy.
+- `delete_project` refuses the open project and retries once, because Resolve's first attempt on a recently open project fails.
+- Blackmagic Cloud: only creating and opening cloud projects is scriptable. Listing cloud projects and inviting or removing collaborators can only be done in Resolve's UI.
+- `project_browser` navigation changes the project manager's current folder (where `list_projects`, `create_project` and `import_project` act). A path that does not exist returns to the root rather than leaving you part-way down it.
 
 ### Media pool
 

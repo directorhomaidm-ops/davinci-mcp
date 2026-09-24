@@ -126,6 +126,9 @@ class Folder:
     def GetSubFolderList(self):
         return self.subfolders
 
+    def GetIsFolderStale(self):
+        return getattr(self, "stale", False)
+
 
 class Graph:
     """Resolve 19+ node graph."""
@@ -671,11 +674,32 @@ class Timeline:
         self.fusion_clip_of = items
         return Item("Fusion Clip 1", items[0].start, items[-1].end)
 
-    def AddMarker(self, frame, color, name, note, duration):
+    def AddMarker(self, frame, color, name, note, duration, customData=""):
         if frame in self.markers:
             return False
-        self.markers[frame] = {"color": color, "name": name, "note": note, "duration": duration}
+        self.markers[frame] = {"color": color, "name": name, "note": note, "duration": duration,
+                               "customData": customData or ""}
         return True
+
+    def DeleteMarkerAtFrame(self, frame):
+        return self.markers.pop(frame, None) is not None
+
+    def DeleteMarkersByColor(self, color):
+        self.markers = {} if color == "All" else {f: m for f, m in self.markers.items() if m["color"] != color}
+        return True
+
+    def SetName(self, name):
+        if any(t.name == name for t in self.project.timelines):
+            return False
+        self.name = name
+        return True
+
+    def DuplicateTimeline(self, name):
+        copy = Timeline(name, self.start)
+        copy.project = self.project
+        self.project.timelines.append(copy)
+        self.project.current = copy  # measured: the copy silently becomes current
+        return copy
 
 
 class MediaPool:
@@ -686,6 +710,18 @@ class MediaPool:
 
     def GetRootFolder(self):
         return self.root
+
+    def DeleteTimelines(self, timelines):
+        for t in timelines:
+            self.project.timelines.remove(t)
+        if self.project.current in timelines:
+            self.project.current = self.project.timelines[0] if self.project.timelines else None
+        return True
+
+    def RefreshFolders(self):
+        for f in self._folders():
+            f.stale = False if not getattr(f, "stays_stale", False) else True
+        return True
 
     def AutoSyncAudio(self, clips, settings):
         self.synced_with = (clips, settings)
@@ -758,6 +794,7 @@ class MediaPool:
         if existing:
             return existing if path.endswith(".xml") else None
         tl = Timeline(name)
+        tl.project = self.project
         self.project.timelines.append(tl)
         self.imported_options = options
         return tl
@@ -766,6 +803,7 @@ class MediaPool:
         if any(t.name == name for t in self.project.timelines):
             return None
         tl = Timeline(name)
+        tl.project = self.project
         self.project.timelines.append(tl)
         self.project.current = tl
         return tl
@@ -862,6 +900,13 @@ class Project:
     def GetName(self):
         return self.name
 
+    def SetName(self, name):
+        if name in self.manager.projects:
+            return False
+        self.manager.projects[name] = self.manager.projects.pop(self.name)
+        self.name = name
+        return True
+
     def GetMediaPool(self):
         return self.pool
 
@@ -911,8 +956,75 @@ class Project:
 
 class ProjectManager:
     def __init__(self):
-        self.projects = {"Demo": Project("Demo")}
+        self.projects = {}
+        self._add(Project("Demo"))
         self.current = None
+        self.folder_path, self.folders = [], {(): ["Clients"], ("Clients",): ["Acme"], ("Clients", "Acme"): []}
+        self.databases = [{"DbType": "Disk", "DbName": "Local Database"},
+                          {"DbType": "PostgreSQL", "DbName": "Studio", "IpAddress": "10.0.0.5"}]
+        self.db = self.databases[0]
+        self.recently_open, self.saves, self.cloud = set(), 0, {}
+
+    def _add(self, proj):
+        proj.manager = self
+        self.projects[proj.name] = proj
+        return proj
+
+    def GetCurrentDatabase(self):
+        return self.db
+
+    def GetDatabaseList(self):
+        return self.databases
+
+    def SetCurrentDatabase(self, info):
+        self.db, self.current = info, None
+        return True
+
+    def GotoRootFolder(self):
+        self.folder_path = []
+        return True
+
+    def OpenFolder(self, name):
+        if name not in self.folders.get(tuple(self.folder_path), []):
+            return False
+        self.folder_path.append(name)
+        return True
+
+    def GetCurrentFolder(self):
+        return self.folder_path[-1] if self.folder_path else ""
+
+    def GetFolderListInCurrentFolder(self):
+        return self.folders.get(tuple(self.folder_path), [])
+
+    def CreateFolder(self, name):
+        here = self.folders.setdefault(tuple(self.folder_path), [])
+        if name in here:
+            return False
+        here.append(name)
+        self.folders[tuple(self.folder_path) + (name,)] = []
+        return True
+
+    def DeleteProject(self, name):
+        if self.current and self.current.name == name:
+            return False
+        if name in self.recently_open:
+            self.recently_open.discard(name)  # measured: flaky first attempt
+            return False
+        return self.projects.pop(name, None) is not None
+
+    def CreateCloudProject(self, settings):
+        if not settings.get("cloud_name"):
+            return None
+        self.cloud_settings = settings
+        self.current = self._add(Project(settings["cloud_name"]))
+        return self.current
+
+    def LoadCloudProject(self, settings):
+        self.cloud_settings = settings
+        proj = self.projects.get(settings.get("cloud_name"))
+        if proj:
+            self.current = proj
+        return proj
 
     def GetCurrentProject(self):
         return self.current
@@ -921,11 +1033,16 @@ class ProjectManager:
         return list(self.projects)
 
     def LoadProject(self, name):
+        if self.current:
+            self.recently_open.add(self.current.name)
         self.current = self.projects.get(name)
         return self.current
 
     def SaveProject(self):
+        if self.current is None or self.current.name == "Untitled Project":
+            return False
         self.saved = True
+        self.saves += 1
         return True
 
     def ExportProject(self, name, path, with_stills):
@@ -937,13 +1054,13 @@ class ProjectManager:
         name = name or Path(path).stem
         if name in self.projects:
             return False
-        self.projects[name] = Project(name)
+        self._add(Project(name))
         return True
 
     def CreateProject(self, name):
         if name in self.projects:
             return None
-        self.projects[name] = self.current = Project(name)
+        self.current = self._add(Project(name))
         return self.current
 
 
@@ -975,6 +1092,9 @@ class Resolve:
     AUTO_CAPTION_SUBTITLE_DEFAULT, AUTO_CAPTION_TELETEXT, AUTO_CAPTION_NETFLIX = 200, 201, 202
     AUTO_CAPTION_LINE_SINGLE, AUTO_CAPTION_LINE_DOUBLE = 300, 301
     DLB_BLEND_SHOTS = 400
+    CLOUD_SETTING_PROJECT_NAME, CLOUD_SETTING_PROJECT_MEDIA_PATH = "cloud_name", "cloud_media"
+    CLOUD_SETTING_IS_COLLAB, CLOUD_SETTING_SYNC_MODE, CLOUD_SETTING_IS_CAMERA_ACCESS = "cloud_collab", "cloud_sync", "cloud_cam"
+    CLOUD_SYNC_NONE, CLOUD_SYNC_PROXY_ONLY, CLOUD_SYNC_PROXY_AND_ORIG = 500, 501, 502
 
     def GetFairlightPresets(self):
         return ["Dialogue Mix", "Podcast"]
