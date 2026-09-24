@@ -12,9 +12,16 @@ Register with Claude Code:
     claude mcp add davinci -- uv run /path/to/davinci_mcp.py
 
 Override API locations with RESOLVE_SCRIPT_API / RESOLVE_SCRIPT_LIB if Resolve is installed elsewhere.
+Logs one JSON object per line to stderr; set DAVINCI_MCP_LOG_LEVEL (default INFO) to change verbosity.
 """
+import functools
+import inspect
+import json
+import logging
 import os
 import sys
+import time
+from datetime import datetime, timezone
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -39,6 +46,59 @@ mcp = MCPServer(
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
     "clip properties, titles, markers and rendering. Frames are absolute timeline frames.",
 )
+
+log = logging.getLogger("davinci_mcp")
+
+
+class _JsonFormatter(logging.Formatter):
+    """One JSON object per line. Structured fields come from `extra={"fields": {...}}`."""
+
+    def format(self, record):
+        entry = {
+            "ts": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        entry.update(getattr(record, "fields", {}))
+        if record.exc_info:
+            entry["exc"] = self.formatException(record.exc_info)
+        return json.dumps(entry, default=str)
+
+
+def _setup_logging():
+    # stdout carries the MCP stdio protocol, so logs must go to stderr.
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_JsonFormatter())
+    log.addHandler(handler)
+    level = os.environ.get("DAVINCI_MCP_LOG_LEVEL", "INFO").upper()
+    log.setLevel(level if isinstance(logging.getLevelName(level), int) else logging.INFO)
+    log.propagate = False
+
+
+def _tool(fn):
+    """Register `fn` as an MCP tool and log each call with its arguments, duration and outcome."""
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        fields = {"tool": fn.__name__, "args": dict(sig.bind(*args, **kwargs).arguments)}
+        start = time.perf_counter()
+        try:
+            result = fn(*args, **kwargs)
+        except ToolError as e:
+            fields.update(outcome="error", error=str(e), duration_ms=round((time.perf_counter() - start) * 1000, 1))
+            log.warning("tool call failed", extra={"fields": fields})
+            raise
+        except Exception:
+            fields.update(outcome="crash", duration_ms=round((time.perf_counter() - start) * 1000, 1))
+            log.exception("tool call crashed", extra={"fields": fields})
+            raise
+        fields.update(outcome="ok", duration_ms=round((time.perf_counter() - start) * 1000, 1))
+        log.info("tool call", extra={"fields": fields})
+        return result
+
+    return mcp.tool()(wrapper)
 
 
 def _resolve():
@@ -84,7 +144,7 @@ def _clips_by_name(proj):
     return {c.GetName(): c for _, c in _walk(proj.GetMediaPool().GetRootFolder())}
 
 
-@mcp.tool()
+@_tool
 def status() -> dict:
     """Connection check: Resolve version, current project and timeline."""
     resolve = _resolve()
@@ -101,13 +161,13 @@ def status() -> dict:
     }
 
 
-@mcp.tool()
+@_tool
 def list_projects() -> list[str]:
     """List projects in the current project-manager folder."""
     return list(_resolve().GetProjectManager().GetProjectListInCurrentFolder())
 
 
-@mcp.tool()
+@_tool
 def open_project(name: str) -> str:
     """Open a project by name."""
     if not _resolve().GetProjectManager().LoadProject(name):
@@ -115,7 +175,7 @@ def open_project(name: str) -> str:
     return f"opened: {name}"
 
 
-@mcp.tool()
+@_tool
 def create_project(name: str) -> str:
     """Create and open a new project."""
     if not _resolve().GetProjectManager().CreateProject(name):
@@ -123,7 +183,7 @@ def create_project(name: str) -> str:
     return f"created: {name}"
 
 
-@mcp.tool()
+@_tool
 def import_media(paths: list[str]) -> list[str]:
     """Import media files into the media pool. Returns imported clip names."""
     _, proj = _project()
@@ -137,7 +197,7 @@ def import_media(paths: list[str]) -> list[str]:
     return [it.GetName() for it in items]
 
 
-@mcp.tool()
+@_tool
 def list_clips() -> list[dict]:
     """List all media-pool clips (recursive) with folder path and frame count."""
     _, proj = _project()
@@ -147,7 +207,7 @@ def list_clips() -> list[dict]:
     ]
 
 
-@mcp.tool()
+@_tool
 def list_timelines() -> list[dict]:
     """List timelines in the current project; `current` marks the active one."""
     _, proj = _project()
@@ -160,7 +220,7 @@ def list_timelines() -> list[dict]:
     return out
 
 
-@mcp.tool()
+@_tool
 def create_timeline(name: str) -> str:
     """Create an empty timeline and make it current."""
     _, proj = _project()
@@ -169,7 +229,7 @@ def create_timeline(name: str) -> str:
     return f"created: {name}"
 
 
-@mcp.tool()
+@_tool
 def switch_timeline(name: str) -> str:
     """Make the named timeline current."""
     _, proj = _project()
@@ -182,7 +242,7 @@ def switch_timeline(name: str) -> str:
     raise ToolError(f"timeline not found: {name}")
 
 
-@mcp.tool()
+@_tool
 def append_clips(
     names: list[str], start_frame: int | None = None, end_frame: int | None = None, track: int = 1
 ) -> str:
@@ -212,7 +272,7 @@ def append_clips(
     return f"appended {len(clips)} clip(s) to '{tl.GetName()}'"
 
 
-@mcp.tool()
+@_tool
 def list_items(track: int = 1, track_type: str = "video") -> list[dict]:
     """List items on a timeline track (track_type: video|audio|subtitle). Index is 1-based."""
     _, tl = _timeline()
@@ -222,7 +282,7 @@ def list_items(track: int = 1, track_type: str = "video") -> list[dict]:
     ]
 
 
-@mcp.tool()
+@_tool
 def set_item_properties(item: int, properties: dict, track: int = 1) -> dict:
     """Set effect properties on a video timeline item (1-based index from list_items).
     Keys: ZoomX ZoomY Pan Tilt RotationAngle Opacity CropLeft CropRight CropTop CropBottom FlipX FlipY CompositeMode ..."""
@@ -237,7 +297,7 @@ def set_item_properties(item: int, properties: dict, track: int = 1) -> dict:
     return {"item": it.GetName(), "set": properties}
 
 
-@mcp.tool()
+@_tool
 def insert_title(name: str = "Text", fusion: bool = False, text: str | None = None) -> dict:
     """Insert a title template at the playhead of the current timeline.
     fusion=True uses a Fusion title (required for `text` to be applied)."""
@@ -256,7 +316,7 @@ def insert_title(name: str = "Text", fusion: bool = False, text: str | None = No
     return out
 
 
-@mcp.tool()
+@_tool
 def add_marker(frame: int, note: str = "", color: str = "Blue", duration: int = 1) -> str:
     """Add a marker on the current timeline. `frame` is relative to the timeline start."""
     _, tl = _timeline()
@@ -265,14 +325,14 @@ def add_marker(frame: int, note: str = "", color: str = "Blue", duration: int = 
     return f"marker @ {frame} ({color})"
 
 
-@mcp.tool()
+@_tool
 def list_render_presets() -> list[str]:
     """List available render presets."""
     _, proj = _project()
     return list(proj.GetRenderPresetList())
 
 
-@mcp.tool()
+@_tool
 def render(target_dir: str, preset: str | None = None, file_name: str | None = None) -> dict:
     """Queue and start rendering the current timeline. Returns the job id; progress is visible in Resolve."""
     _, proj = _project()
@@ -289,7 +349,7 @@ def render(target_dir: str, preset: str | None = None, file_name: str | None = N
     return {"job": job, "target_dir": settings["TargetDir"]}
 
 
-@mcp.tool()
+@_tool
 def render_status(job: str) -> dict:
     """Progress of a render job started with `render`."""
     _, proj = _project()
@@ -297,4 +357,6 @@ def render_status(job: str) -> dict:
 
 
 if __name__ == "__main__":
+    _setup_logging()
+    log.info("starting", extra={"fields": {"platform": sys.platform, "pid": os.getpid()}})
     mcp.run()
