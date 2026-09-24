@@ -187,7 +187,7 @@ Notes:
 |---|---|---|---|
 | `list_render_presets` | — | Preset names | |
 | `list_render_formats` | — | `{format id: {name, codecs: {codec id: description}}}` | |
-| `render` | `target_dir: str`, `preset`, `file_name`, `format`, `codec`, `mark_in`, `mark_out`, `width`, `height`, `frame_rate`, `quality`, `video`, `audio`, `individual_clips: bool = False`, `settings: dict \| None`, `start: bool = True` | `{job, target_dir, started}` | Unknown preset; format without codecs; unsupported format/codec; range outside the timeline; settings rejected |
+| `render` | `target_dir: str`, `preset`, `file_name`, `format`, `codec`, `mark_in`, `mark_out`, `width`, `height`, `frame_rate`, `quality`, `video`, `audio`, `individual_clips: bool = False`, `settings: dict \| None`, `subtitles: "burn_in" \| "separate_file" \| "embedded" \| None`, `start: bool = True` | `{job, target_dir, started}` | Unknown preset; format without codecs; unsupported format/codec; range outside the timeline; settings rejected |
 | `render_status` | `job: str` | Resolve's status plus `done`, `output` and (when done) `output_exists` | Job not found |
 | `render_queue` | — | Every queued job with its settings and status | |
 | `start_render` | `jobs: list[str] \| None` (whole queue when omitted) | Confirmation string | Nothing started |
@@ -264,6 +264,25 @@ Notes:
 - `timeline=True` gives the current timeline its own settings (`useCustomSettings`) and changes only that timeline, e.g. an HDR deliverable timeline in an SDR project.
 - A typical HDR10 setup: `apply_color_preset("rcm_custom")`, `set_color_management({"colorSpaceTimeline": "DaVinci WG/Intermediate", "colorSpaceOutput": "Rec.2100 ST2084", "timelineWorkingLuminanceMode": "HDR 1000"})`, `set_hdr(mastering_nits=1000)`, then `export_timeline(path, "hdr10_a")` for the metadata. Dolby Vision: `set_hdr(dolby_vision="4.0")`, `analyze_dolby_vision()`, `export_timeline(path, "dolby_vision_4_0")`.
 - `set_clip_color_space` needs a color-managed project for `Input Color Space` / `Input Gamma`, and an ACES project for `IDT`.
+
+### Transcripts, subtitles and titles
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `get_transcript` | `clip: str`, `query: str \| None`, `words: bool = False` | `{clip, language, complete, segments: [{start, end, start_seconds, end_seconds, speaker, text, words?}]}` | Not transcribed |
+| `export_transcript` | `clip: str`, `path: str` (`.srt`, `.vtt`, `.txt`, `.json`), `speakers: bool = True`, `rtl: bool = False` | `{clip, path, segments, language}` | Not transcribed; before Resolve 21.1; wrong extension |
+| `write_subtitles` | `path: str` (`.srt`, `.vtt`), `captions: [{start, end, text}]`, `fps: float \| None`, `rtl: bool = False` | `{path, captions}` | Empty text; end before start; overlapping captions; bad time |
+| `list_titles` | — | `[{track, item, name, start, end, texts}]` | |
+| `set_title_text` | `item: int`, `text`, `font`, `style`, `size`, `color: [r, g, b]` (0–1), `node: str \| None`, `track: int = 1` | `{item, node, set}` | Not a Fusion title; several Text+ nodes without `node`; bad color; nothing to change |
+
+Notes:
+
+- **What the API cannot do with subtitles:** read or change the text or timing of subtitle items, import an SRT onto a subtitle track, or style subtitles. Subtitles are therefore produced as files and imported in Resolve with *File > Import > Subtitle*.
+- Subtitle workflow for any language, including Arabic (not one of Resolve's auto-caption languages): `transcribe_audio` → `get_transcript` → translate the segments → `write_subtitles(path, captions, rtl=True)` → import the file. `rtl=True` marks each line right-to-left so punctuation sits on the correct side.
+- `get_transcript` needs Resolve 21.1 for the full transcript with word timing and speakers (`MediaPoolItem.GetTranscription`); earlier versions only expose a preview, reported with `complete: false` when Resolve truncated it. Times are given both as Resolve's source timecodes and as seconds from the clip start; `query` finds where something is said.
+- `write_subtitles` times can be seconds, `"HH:MM:SS,mmm"`, or `"HH:MM:SS:FF"` timecodes (converted at `fps`, default the current timeline's).
+- `set_title_text` edits Fusion titles (Text+), in any language; Resolve's standard titles have no scripting access. Color is Text+'s first shading element (`Red1`/`Green1`/`Blue1`).
+- `render(..., subtitles="burn_in" | "separate_file" | "embedded")` delivers the timeline's subtitle track on Resolve 21+. It is refused on earlier versions, where these settings were measured to have no effect; check the output.
 
 ### Fusion (VFX and motion graphics)
 

@@ -102,6 +102,7 @@ class Clip:
 
     def GetClipProperty(self, key=None):
         allp = {"Frames": str(self.frames), "File Path": self.path, "FPS": "24", "Resolution": "1920x1080",
+                "Start TC": "01:00:00:00",
                 "Proxy Media Path": self.proxy or "", "Reel Name": "", **self.props}
         return allp if key is None else allp.get(key)
 
@@ -322,7 +323,8 @@ TOOL_INPUTS = {
     "Blur": {"Input": "Image", "XBlurSize": "Number", "EffectMask": "Mask"},
     "Transform": {"Input": "Image", "Size": "Number", "Center": "Point"},
     "Merge": {"Background": "Image", "Foreground": "Image", "Blend": "Number"},
-    "TextPlus": {"StyledText": "Text", "Size": "Number", "Center": "Point"},
+    "TextPlus": {"StyledText": "Text", "Font": "Text", "Style": "Text", "Size": "Number", "Center": "Point",
+                 "Red1": "Number", "Green1": "Number", "Blue1": "Number"},
     "EllipseMask": {"Width": "Number", "Center": "Point"},
     "SoftGlow": {"Input": "Image", "Gain": "Number", "Threshold": "Number"},
     "Tracker": {"Input": "Image", "PatternCenter1": "Point", "TrackedCenter1": "Point", "TrackedCenter2": "Point"},
