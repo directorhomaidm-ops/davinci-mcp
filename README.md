@@ -52,9 +52,55 @@ All frames are absolute timeline frames unless noted. Item and track indexes are
 Notes:
 
 - `append_clips` appends to the end of the current timeline in the order given. Without `start_frame`/`end_frame` whole clips are used and `track` is ignored. With either set, each clip is trimmed to `start_frame`–`end_frame` (clip-relative, both inclusive: `0`–`23` is the first 24 frames; defaults `0` and the clip's last frame) and placed on `track`.
-- `set_item_properties` works on video tracks only. Typical keys: `ZoomX` `ZoomY` `Pan` `Tilt` `RotationAngle` `Opacity` `CropLeft` `CropRight` `CropTop` `CropBottom` `FlipX` `FlipY` `CompositeMode`.
+- `set_item_properties` works on video tracks only. Keys and ranges (from Resolve's API reference):
+
+  | Key | Value |
+  |---|---|
+  | `Pan`, `Tilt`, `AnchorPointX`, `AnchorPointY` | float, ±4 × frame width/height |
+  | `ZoomX`, `ZoomY` | float, 0–100 (1 = 100 %); `ZoomGang` bool links them |
+  | `RotationAngle` | float, −360–360 |
+  | `Pitch`, `Yaw` | float, −1.5–1.5 |
+  | `FlipX`, `FlipY`, `CropRetain` | bool |
+  | `CropLeft`, `CropRight`, `CropTop`, `CropBottom` | float, 0–frame width/height |
+  | `CropSoftness` | float, −100–100 |
+  | `Opacity` | float, 0–100 |
+  | `Distortion` | float, −1–1 |
+  | `CompositeMode` | `normal` `add` `subtract` `diff` `multiply` `screen` `overlay` `hardlight` `softlight` `darken` `lighten` `color_dodge` `color_burn` `exclusion` `hue` `saturate` `colorize` `luma_mask` `divide` `linear_dodge` `linear_burn` `linear_light` `vivid_light` `pin_light` `hard_mix` `lighter_color` `darker_color` `foreground` `alpha` `inverted_alpha` `lum` `inverted_lum` |
+  | `DynamicZoomEase` | `linear` `in` `out` `in_and_out` |
+  | `RetimeProcess` | `project` `nearest` `frame_blend` `optical_flow` |
+  | `MotionEstimation` | `project` `standard_faster` `standard_better` `enhanced_faster` `enhanced_better` `speed_warp` |
+  | `Scaling` | `project` `crop` `fit` `fill` `stretch` |
+  | `ResizeFilter` | `project` `sharper` `smoother` `bicubic` `bilinear` `bessel` `box` `catmull_rom` `cubic` `gaussian` `lanczos` `mitchell` `nearest_neighbor` `quadratic` `sinc` `linear` |
+
+  Enum keys take the name (case, spaces and hyphens are ignored) or Resolve's number. Clip speed cannot be set through the API; `RetimeProcess`/`MotionEstimation` only choose how an existing speed change is rendered.
 - `insert_title` inserts at the playhead. `text` is applied only when `fusion=True` and the Fusion title has a `Template` tool; `text_set` says whether it was.
 - `add_marker` takes `frame` relative to the timeline start, not an absolute frame. `note` is used as the marker name too (or `frame <n>` when empty).
+
+### Editing
+
+Start with `timeline_overview` to see the edit and `view_frame` to see the picture.
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `timeline_overview` | — | `{timeline, fps, resolution, start_frame, end_frame, playhead, tracks: {video, audio, subtitle: [{index, name, enabled, items: [{index, kind, name, source, start, end, duration, enabled, fusion_comps}]}]}, markers}` | |
+| `view_frame` | `timecode: str \| None` (absolute) **or** `frame: int \| None` (absolute), `save_to: str \| None` | The frame as an image, plus its timecode | Both given; playhead cannot move; drop-frame timeline with `frame`; export failed |
+| `add_transition` | `item: int`, `type: str = "Cross Dissolve"`, `position: "start" \| "end" = "end"`, `alignment: "left" \| "center" \| "right" = "center"`, `duration: int \| None`, `category: "simple" \| "fusion" \| "ofx" \| "audio" = "simple"`, `track`, `track_type` | `{name, start, end, duration}` | Bad option; Resolve older than 21.1; no transition created |
+| `delete_items` | `items: list[int]`, `ripple: bool = False`, `track`, `track_type` | Confirmation string | Index out of range |
+| `set_clip_enabled` | `item: int`, `enabled: bool`, `track`, `track_type` | Confirmation string | Index out of range |
+| `stabilize` | `item: int`, `track: int = 1` | Confirmation string | Unsupported clip; Resolve older than 18 |
+| `smart_reframe` | `item: int`, `track: int = 1` | Confirmation string | Studio only; Resolve older than 18 |
+| `detect_scene_cuts` | — | Confirmation string | Studio only |
+| `dynamic_zoom` | `item: int`, `start_zoom: float = 1.0`, `end_zoom: float = 1.2`, `start_center`, `end_center: [x, y] = [0.5, 0.5]`, `track` | `{item, node, frames, zoom, center}` | Zoom ≤ 0; clip already has one |
+| `insert_fusion_effect` | `item: int`, `tool_type: str`, `settings: dict \| None`, `name: str \| None`, `track` | `{item, node, type, settings}` | Unknown tool; bad setting (the node stays in the chain) |
+
+Notes:
+
+- `timeline_overview` classifies items as `clip` (has source media), `transition` (straddles a cut) or `other` (titles, generators, Fusion compositions). Transitions are items in Resolve, so they shift the indexes of everything after them.
+- `view_frame` returns the frame as Resolve renders it (grade and Fusion included), so the model can check the result of an edit. Frames and timecodes are absolute timeline positions (a timeline usually starts at `01:00:00:00` = frame 86400 at 24 fps).
+- `add_transition` needs Resolve 21.1+. It fails when either clip has no unused media (handles) past the cut, or when `type` is not the exact name of an installed transition.
+- `stabilize` and `smart_reframe` can keep analysing after they return. `smart_reframe` and `detect_scene_cuts` are Studio features: on the free edition Resolve opens an upgrade dialog that blocks further API calls until it is closed.
+- `dynamic_zoom` is a Ken Burns move built from a keyframed Fusion `Transform` over the clip's comp range, not Resolve's Dynamic Zoom checkbox (the API cannot switch that on). Refine it with `set_fusion_input(node="DynamicZoom", ...)`.
+- `insert_fusion_effect` adds each effect before `MediaOut1`, so repeated calls build a chain in the order given. `tool_type` is a Fusion registry id (`SoftGlow`, `Glow`, `Blur`, `Sharpen`, `FilmGrain`, `ColorCorrector`, `DirectionalBlur`, `Defocus`, …). ResolveFX plugins are available in Fusion under their OFX id; check the id in Resolve's Fusion page.
 
 ### Rendering
 
@@ -83,13 +129,13 @@ Notes:
 | `add_color_version` | `item: int`, `name: str`, `remote: bool = False`, `track: int = 1` | Confirmation string; the new version becomes current | Name taken |
 | `load_color_version` | `item: int`, `name: str`, `remote: bool = False`, `track: int = 1` | Confirmation string | Version not found |
 | `export_lut` | `item: int`, `path: str`, `size: 17 \| 33 \| 65 = 33`, `track: int = 1` | Confirmation string | Unsupported size; export rejected |
-| `grab_still` | `export_dir: str \| None`, `prefix: str = "still"`, `format: str = "png"` | `{grabbed, exported_to}` | Color page not open; unsupported format; export failed |
+| `grab_still` | — | Confirmation string | Color page not open |
 
 Notes:
 
 - `set_cdl` defaults are the identity grade (slope 1, offset 0, power 1, saturation 1), so pass only what you change.
 - `apply_lut` only accepts LUTs Resolve has already indexed. After copying a new `.cube` into a LUT folder, run *Project Settings → Color Management → Update Lists* first.
-- `grab_still` needs the Color page open (`open_page("color")`). The still goes into the current gallery album; with `export_dir` it is also written as an image (`dpx` `cin` `tif` `jpg` `png` `ppm` `bmp` `xpm`).
+- `grab_still` needs the Color page open (`open_page("color")`) and stores the still in the current gallery album as a grade reference. To get the image itself use `view_frame`: Resolve's gallery export only works while the Gallery panel is visible, while the frame export `view_frame` uses works on any page with a viewer.
 - `export_lut` needs Resolve 18 or later. Node reads/writes use Resolve 19's node graph when present and fall back to the older per-item calls on earlier versions.
 
 ### Fusion (VFX and motion graphics)

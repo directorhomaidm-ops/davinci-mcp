@@ -64,14 +64,46 @@ class ColorGroup:
 
 
 class Item:
-    def __init__(self, name, start, end):
+    def __init__(self, name, start, end, media=None, timeline=None):
         self.name, self.start, self.end, self.props = name, start, end, {}
+        self.media, self.timeline, self.enabled = media, timeline, True
+        self.stabilized = self.reframed = False
         self.comps, self.exported_comp = [], None
         self.graph = Graph(("Primary", "Look"))
         self.cdl, self.color_group = None, None
         self.versions = {0: ["Version 1"], 1: []}
         self.version = {"versionName": "Version 1", "versionType": 0}
         self.copied_to, self.exported_lut = None, None
+
+    def GetMediaPoolItem(self):
+        return self.media
+
+    def GetClipEnabled(self):
+        return self.enabled
+
+    def SetClipEnabled(self, enabled):
+        self.enabled = enabled
+        return True
+
+    def Stabilize(self):
+        self.stabilized = self.media is not None
+        return self.stabilized
+
+    def SmartReframe(self):
+        self.reframed = True
+        return True
+
+    def AddTransition(self, options):
+        """Resolve 21.1: needs handles; here clips named *_nohandles have none."""
+        if self.name.endswith("_nohandles") or options["type"] not in ("Cross Dissolve", "Dip To Color Dissolve"):
+            return None
+        self.transition_options = options
+        half = options.get("duration", 8) // 2
+        cut = self.end if options["position"] == "end" else self.start
+        tr = Item(options["type"], cut - half, cut + half)
+        items = self.timeline.tracks[("video", 1)]
+        items.insert(items.index(self) + (1 if options["position"] == "end" else 0), tr)
+        return tr
 
     def GetNodeGraph(self, layer=1):
         return self.graph
@@ -154,6 +186,8 @@ class Item:
         return 1 <= index <= len(self.comps)
 
 
+PNG = b"\x89PNG\r\n\x1a\n"
+
 TOOL_INPUTS = {
     "MediaIn": {},
     "MediaOut": {"Input": "Image"},
@@ -162,6 +196,7 @@ TOOL_INPUTS = {
     "Merge": {"Background": "Image", "Foreground": "Image", "Blend": "Number"},
     "TextPlus": {"StyledText": "Text", "Size": "Number", "Center": "Point"},
     "EllipseMask": {"Width": "Number", "Center": "Point"},
+    "SoftGlow": {"Input": "Image", "Gain": "Number", "Threshold": "Number"},
     "BezierSpline": {},
     "PolyPath": {},
 }
@@ -260,6 +295,7 @@ class FuComp:
         self.name, self.tools, self.locked = name, [], False
         self.value_writes_under_lock = self.unlocked_structural_edits = 0
         self.undo_open = self.undo_steps = 0
+        self.attrs = {"COMPN_RenderStart": 0.0, "COMPN_RenderEnd": 99.0}
         self.AddTool("MediaIn", -1, -1, locked_ok=True)
         self.AddTool("MediaOut", -1, -1, locked_ok=True)
         if template:
@@ -272,6 +308,9 @@ class FuComp:
     def value_write(self):
         if self.locked:
             self.value_writes_under_lock += 1
+
+    def GetAttrs(self):
+        return self.attrs
 
     def Lock(self):
         self.locked = True
@@ -330,6 +369,45 @@ class Timeline:
         self.tracks = {("video", 1): [], ("audio", 1): []}
         self.markers = {}
         self.playhead_item, self.page_is_color, self.drx = None, True, None
+        self.playhead, self.settings = "01:00:00:00", {"timelineFrameRate": "24", "timelineResolutionWidth": "1920",
+                                                         "timelineResolutionHeight": "1080", "timelineDropFrameTimecode": "0"}
+        self.deleted, self.scene_cuts = None, False
+
+    def GetSetting(self, key):
+        return self.settings.get(key)
+
+    def GetTrackCount(self, kind):
+        return len([k for k in self.tracks if k[0] == kind])
+
+    def GetTrackName(self, kind, n):
+        return f"{kind[0].upper()}{n}"
+
+    def GetIsTrackEnabled(self, kind, n):
+        return True
+
+    def GetCurrentTimecode(self):
+        return self.playhead
+
+    def SetCurrentTimecode(self, tc):
+        if len(tc.split(":")) != 4:
+            return False
+        self.playhead = tc
+        return True
+
+    def GetMarkers(self):
+        return {float(f): m for f, m in self.markers.items()}
+
+    def DeleteClips(self, items, ripple):
+        self.deleted = (items, ripple)
+        for it in items:
+            for track in self.tracks.values():
+                if it in track:
+                    track.remove(it)
+        return True
+
+    def DetectSceneCuts(self):
+        self.scene_cuts = True
+        return True
 
     def GetCurrentVideoItem(self):
         return self.playhead_item
@@ -354,10 +432,10 @@ class Timeline:
     def GetItemListInTrack(self, track_type, index):
         return self.tracks.get((track_type, index))
 
-    def _append(self, name, frames, track=1):
+    def _append(self, name, frames, track=1, media=None):
         items = self.tracks.setdefault(("video", track), [])
         start = items[-1].end if items else self.start
-        item = Item(name, start, start + frames)
+        item = Item(name, start, start + frames, media, self)
         items.append(item)
         return item
 
@@ -417,9 +495,9 @@ class MediaPool:
         for c in clips:
             if isinstance(c, dict):
                 frames = c["endFrame"] - c["startFrame"] + 1
-                tl._append(c["mediaPoolItem"].name, frames, c["trackIndex"])
+                tl._append(c["mediaPoolItem"].name, frames, c["trackIndex"], c["mediaPoolItem"])
             else:
-                tl._append(c.name, c.frames)
+                tl._append(c.name, c.frames, media=c)
         self.appended.append(clips)
         return True
 
@@ -436,6 +514,13 @@ class Project:
 
     def GetGallery(self):
         return self.gallery
+
+    def ExportCurrentFrameAsStill(self, path):
+        if not Path(path).parent.is_dir():
+            return False
+        Path(path).write_bytes(PNG + self.current.playhead.encode())
+        self.exported_frame = path
+        return True
 
     def GetRenderFormats(self):
         return {"QuickTime": "mov", "MP4": "mp4"}

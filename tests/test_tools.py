@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
@@ -171,7 +172,9 @@ def test_all_tools_registered():
         "apply_drx", "add_color_version", "load_color_version", "export_lut", "grab_still",
         "fusion_comps", "add_fusion_comp", "export_fusion_comp", "insert_fusion", "create_fusion_clip",
         "fusion_nodes", "fusion_inputs", "add_fusion_node", "connect_fusion_nodes", "delete_fusion_node",
-        "set_fusion_input",
+        "set_fusion_input", "timeline_overview", "view_frame", "add_transition", "delete_items",
+        "set_clip_enabled", "stabilize", "smart_reframe", "detect_scene_cuts", "dynamic_zoom",
+        "insert_fusion_effect",
     }
 
 
@@ -376,14 +379,8 @@ def test_export_lut(project, tmp_path, resolve):
         d.export_lut(1, str(out), size=32)
 
 
-def test_grab_still(project, tmp_path):
-    assert d.grab_still() == {"grabbed": True, "exported_to": None}
-    out = d.grab_still(str(tmp_path), prefix="shot", format="tif")
-    assert out["exported_to"] == str(tmp_path)
-    (stills, folder, prefix, fmt), = project.gallery.album.exported
-    assert (len(stills), folder, prefix, fmt) == (1, str(tmp_path), "shot", "tif")
-    with pytest.raises(ToolError, match="unsupported still format"):
-        d.grab_still(str(tmp_path), format="webp")
+def test_grab_still(project):
+    assert d.grab_still() == "still grabbed into the current gallery album"
     project.current.page_is_color = False
     with pytest.raises(ToolError, match="is the Color page open"):
         d.grab_still()
@@ -598,3 +595,194 @@ def test_fusion_needs_a_comp(project):
     d.append_clips(["a.mov"])
     with pytest.raises(ToolError, match=r"comp 1 not found on 'a.mov' \(0 comp\(s\); see add_fusion_comp\)"):
         d.fusion_nodes(1)
+
+
+# --- editing ---
+
+
+def test_set_item_properties_enum_names(project):
+    a, _ = _two_items(project)
+    d.set_item_properties(1, {"Opacity": 80})
+    a.SetProperty = lambda k, v: a.props.__setitem__(k, v) or True
+    d.set_item_properties(1, {"CompositeMode": "Screen", "RetimeProcess": "optical flow", "Scaling": "fill",
+                              "ResizeFilter": "lanczos", "DynamicZoomEase": "in-and-out", "ZoomX": 1.2})
+    assert a.props == {"Opacity": 80, "CompositeMode": 5, "RetimeProcess": 3, "Scaling": 3, "ResizeFilter": 10,
+                       "DynamicZoomEase": 3, "ZoomX": 1.2}
+    d.set_item_properties(1, {"CompositeMode": 2})  # raw constants still pass through
+    assert a.props["CompositeMode"] == 2
+    with pytest.raises(ToolError, match="CompositeMode must be one of: normal, add"):
+        d.set_item_properties(1, {"CompositeMode": "glow"})
+
+
+def test_timeline_overview(project):
+    d.append_clips(["a.mov", "b.mov"])
+    d.add_marker(24, note="beat")
+    a = project.current.tracks[("video", 1)][0]
+    a.AddTransition({"type": "Cross Dissolve", "category": "simple", "position": "end", "alignment": "center", "duration": 12})
+    ov = d.timeline_overview()
+    assert (ov["timeline"], ov["fps"], ov["resolution"], ov["playhead"]) == ("Main", "24", ["1920", "1080"], "01:00:00:00")
+    v1 = ov["tracks"]["video"][0]
+    assert (v1["index"], v1["name"], v1["enabled"]) == (1, "V1", True)
+    assert [(i["index"], i["kind"], i["name"], i["source"]) for i in v1["items"]] == [
+        (1, "clip", "a.mov", "a.mov"),
+        (2, "transition", "Cross Dissolve", None),
+        (3, "clip", "b.mov", "b.mov"),
+    ]
+    assert v1["items"][1]["duration"] == 12
+    assert v1["items"][0]["fusion_comps"] == 0
+    assert ov["tracks"]["audio"][0]["items"] == []
+    assert ov["markers"]["24"]["note"] == "beat"
+
+
+def test_overview_title_is_other(project):
+    d.append_clips(["a.mov"])
+    d.insert_title()
+    kinds = [i["kind"] for i in d.timeline_overview()["tracks"]["video"][0]["items"]]
+    assert kinds == ["clip", "other"]
+
+
+def test_view_frame_returns_image(project, tmp_path):
+    out = d.view_frame(frame=86424)
+    image, note = out
+    assert isinstance(image, d.Image)
+    assert image.data.startswith(b"\x89PNG") and image.data.endswith(b"01:00:01:00")
+    assert note == "frame at 01:00:01:00"
+    assert not os.path.exists(project.exported_frame)  # temp file cleaned up
+
+    saved = tmp_path / "shot.jpg"
+    _, note = d.view_frame(timecode="01:00:02:00", save_to=str(saved))
+    assert saved.exists() and note.endswith(f"saved to {saved}")
+    (only,) = d.view_frame(save_to=str(tmp_path / "shot.dpx"))
+    assert "not viewable inline" in only
+
+
+def test_view_frame_errors(project, tmp_path):
+    with pytest.raises(ToolError, match="not both"):
+        d.view_frame(timecode="01:00:00:00", frame=86400)
+    with pytest.raises(ToolError, match="cannot move playhead"):
+        d.view_frame(timecode="bogus")
+    project.current.settings["timelineDropFrameTimecode"] = "1"
+    with pytest.raises(ToolError, match="drop-frame"):
+        d.view_frame(frame=86400)
+    with pytest.raises(ToolError, match="ExportCurrentFrameAsStill failed"):
+        d.view_frame(save_to=str(tmp_path / "missing_dir" / "f.png"))
+
+
+def test_view_frame_cleans_temp_on_failure(project, monkeypatch):
+    import glob
+    import tempfile
+
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "davinci_mcp_*")))
+    monkeypatch.setattr(project, "ExportCurrentFrameAsStill", lambda path: False)
+    with pytest.raises(ToolError):
+        d.view_frame()
+    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "davinci_mcp_*"))) == before
+
+
+def test_view_frame_through_mcp_is_image_content(project):
+    result = asyncio.run(d.mcp.call_tool("view_frame", {}))
+    kinds = [c.type for c in result.content]
+    assert kinds == ["image", "text"]
+    assert result.content[0].mime_type == "image/png"
+
+
+def test_add_transition(project):
+    a, b = _two_items(project)
+    assert d.add_transition(1, duration=24) == {"name": "Cross Dissolve", "start": 86488, "end": 86512, "duration": 24}
+    assert a.transition_options == {"type": "Cross Dissolve", "category": "simple", "position": "end",
+                                    "alignment": "center", "duration": 24}
+    assert [i["name"] for i in d.list_items()] == ["a.mov", "Cross Dissolve", "b.mov"]
+
+
+def test_add_transition_errors(project, monkeypatch):
+    a, _ = _two_items(project)
+    for kwargs, msg in [({"position": "middle"}, "position must be"), ({"alignment": "top"}, "alignment must be"),
+                        ({"category": "3d"}, "category must be"), ({"duration": 0}, "positive")]:
+        with pytest.raises(ToolError, match=msg):
+            d.add_transition(1, **kwargs)
+    with pytest.raises(ToolError, match="handles"):
+        d.add_transition(1, type="Page Curl")
+    a.name = "a_nohandles"
+    with pytest.raises(ToolError, match="handles"):
+        d.add_transition(1)
+    monkeypatch.delattr(type(a), "AddTransition")
+    with pytest.raises(ToolError, match="AddTransition needs DaVinci Resolve 21.1 or later"):
+        d.add_transition(1)
+
+
+def test_delete_items(project):
+    a, b = _two_items(project)
+    assert d.delete_items([1], ripple=True) == "deleted 1 item(s) (ripple)"
+    assert project.current.deleted == ([a], True)
+    assert [i["name"] for i in d.list_items()] == ["b.mov"]
+    with pytest.raises(ToolError, match="items not found"):
+        d.delete_items([5])
+    with pytest.raises(ToolError, match="none given"):
+        d.delete_items([])
+
+
+def test_set_clip_enabled(project):
+    a, _ = _two_items(project)
+    assert d.set_clip_enabled(1, False) == "disabled 'a.mov'"
+    assert a.enabled is False
+    assert d.timeline_overview()["tracks"]["video"][0]["items"][0]["enabled"] is False
+
+
+def test_stabilize_and_reframe(project, monkeypatch):
+    a, _ = _two_items(project)
+    assert d.stabilize(1) == "stabilized 'a.mov'"
+    assert a.stabilized
+    assert d.smart_reframe(1) == "reframed 'a.mov'"
+    d.insert_title()
+    with pytest.raises(ToolError, match="Stabilize failed for 'Text'"):
+        d.stabilize(3)
+    monkeypatch.delattr(type(a), "SmartReframe")
+    with pytest.raises(ToolError, match="SmartReframe needs DaVinci Resolve 18"):
+        d.smart_reframe(1)
+
+
+def test_detect_scene_cuts(project):
+    assert "scene cuts detected" in d.detect_scene_cuts()
+    assert project.current.scene_cuts
+
+
+def test_dynamic_zoom(project):
+    a, _ = _two_items(project)
+    out = d.dynamic_zoom(1, start_zoom=1.0, end_zoom=1.3, start_center=[0.4, 0.5], end_center=[0.6, 0.5])
+    assert out["frames"] == [0, 99]
+    comp = a.comps[0]
+    zoom = comp.FindTool("DynamicZoom")
+    assert zoom.inputs["Size"].keys == {0: 1.0, 99: 1.3}
+    assert zoom.inputs["Center"].keys == {0: {1: 0.4, 2: 0.5}, 99: {1: 0.6, 2: 0.5}}
+    nodes = {n["name"]: n for n in d.fusion_nodes(1)}
+    assert nodes["DynamicZoom"]["inputs"] == {"Input": "MediaIn1"}
+    assert nodes["MediaOut1"]["inputs"] == {"Input": "DynamicZoom"}
+    _assert_lock_rules(comp)
+    with pytest.raises(ToolError, match="already has a DynamicZoom"):
+        d.dynamic_zoom(1)
+
+
+def test_dynamic_zoom_centered_skips_path(project):
+    a, _ = _two_items(project)
+    d.dynamic_zoom(1)
+    zoom = a.comps[0].FindTool("DynamicZoom")
+    assert zoom.inputs["Center"].source is None
+    with pytest.raises(ToolError, match="zoom must be positive"):
+        d.dynamic_zoom(2, end_zoom=0)
+
+
+def test_insert_fusion_effect_chains(project):
+    a, _ = _two_items(project)
+    out = d.insert_fusion_effect(1, "SoftGlow", settings={"Gain": 0.6, "Threshold": 0.8})
+    assert out == {"item": "a.mov", "node": "SoftGlow1", "type": "SoftGlow", "settings": {"Gain": 0.6, "Threshold": 0.8}}
+    d.insert_fusion_effect(1, "Blur", settings={"XBlurSize": 2.0}, name="Soft")
+    nodes = {n["name"]: n for n in d.fusion_nodes(1)}
+    # MediaIn1 -> SoftGlow1 -> Soft -> MediaOut1
+    assert nodes["SoftGlow1"]["inputs"] == {"Input": "MediaIn1"}
+    assert nodes["Soft"]["inputs"] == {"Input": "SoftGlow1"}
+    assert nodes["MediaOut1"]["inputs"] == {"Input": "Soft"}
+    _assert_lock_rules(a.comps[0])
+    with pytest.raises(ToolError, match="unknown tool type"):
+        d.insert_fusion_effect(1, "NoSuchFx")
+    with pytest.raises(ToolError, match="SoftGlow1 was added to the chain but a setting failed: SoftGlow1 has no input Strength"):
+        d.insert_fusion_effect(2, "SoftGlow", settings={"Strength": 1})

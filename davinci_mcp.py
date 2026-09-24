@@ -20,12 +20,14 @@ import inspect
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import time
 from typing import Any
 from datetime import datetime, timezone
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 DEFAULTS = {
@@ -46,7 +48,8 @@ DEFAULTS = {
 mcp = MCPServer(
     "davinci",
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
-    "clip properties, titles, markers, color grading, Fusion compositing and rendering. "
+    "clip properties, transitions, titles, markers, color grading, Fusion compositing and rendering. "
+    "Start with timeline_overview to see the edit and view_frame to see the picture. "
     "Frames are absolute timeline frames.",
 )
 
@@ -167,6 +170,20 @@ def _graph(it):
     except AttributeError:
         graph = None
     return graph or it
+
+
+def _method(obj, name, version):
+    """A method only newer Resolve versions have (missing ones resolve to None through the bridge)."""
+    fn = getattr(obj, name, None)
+    if not callable(fn):
+        raise ToolError(f"{name} needs DaVinci Resolve {version} or later")
+    return fn
+
+
+def _opt(obj, name, *args):
+    """Result of an optional read, or None where this Resolve version lacks the method."""
+    fn = getattr(obj, name, None)
+    return fn(*args) if callable(fn) else None
 
 
 def _check_node(it, node):
@@ -313,12 +330,46 @@ def list_items(track: int = 1, track_type: str = "video") -> list[dict]:
     ]
 
 
+# Resolve's enum-valued clip properties, in constant order (the index is the value Resolve takes).
+PROPERTY_ENUMS = {
+    "DynamicZoomEase": ["linear", "in", "out", "in_and_out"],
+    "CompositeMode": [
+        "normal", "add", "subtract", "diff", "multiply", "screen", "overlay", "hardlight", "softlight",
+        "darken", "lighten", "color_dodge", "color_burn", "exclusion", "hue", "saturate", "colorize",
+        "luma_mask", "divide", "linear_dodge", "linear_burn", "linear_light", "vivid_light", "pin_light",
+        "hard_mix", "lighter_color", "darker_color", "foreground", "alpha", "inverted_alpha", "lum",
+        "inverted_lum",
+    ],
+    "RetimeProcess": ["project", "nearest", "frame_blend", "optical_flow"],
+    "MotionEstimation": ["project", "standard_faster", "standard_better", "enhanced_faster", "enhanced_better", "speed_warp"],
+    "Scaling": ["project", "crop", "fit", "fill", "stretch"],
+    "ResizeFilter": [
+        "project", "sharper", "smoother", "bicubic", "bilinear", "bessel", "box", "catmull_rom", "cubic",
+        "gaussian", "lanczos", "mitchell", "nearest_neighbor", "quadratic", "sinc", "linear",
+    ],
+}
+
+
+def _prop_value(key, value):
+    names = PROPERTY_ENUMS.get(key)
+    if not names or not isinstance(value, str):
+        return value
+    norm = value.strip().lower().replace(" ", "_").replace("-", "_")
+    if norm not in names:
+        raise ToolError(f"{key} must be one of: {', '.join(names)} (got {value!r})")
+    return names.index(norm)
+
+
 @_tool
 def set_item_properties(item: int, properties: dict, track: int = 1) -> dict:
-    """Set effect properties on a video timeline item (1-based index from list_items).
-    Keys: ZoomX ZoomY Pan Tilt RotationAngle Opacity CropLeft CropRight CropTop CropBottom FlipX FlipY CompositeMode ..."""
+    """Set properties on a video timeline item (1-based index from list_items).
+    Transform: Pan Tilt ZoomX ZoomY ZoomGang RotationAngle AnchorPointX AnchorPointY Pitch Yaw FlipX FlipY.
+    Crop: CropLeft CropRight CropTop CropBottom CropSoftness CropRetain. Composite: Opacity (0-100), CompositeMode.
+    Other: Distortion, DynamicZoomEase, RetimeProcess, MotionEstimation, Scaling, ResizeFilter.
+    Enum keys take a name (e.g. CompositeMode "screen", RetimeProcess "optical_flow", Scaling "fill") or the number."""
     _, tl = _timeline()
     it = _item(tl, item, track)
+    properties = {k: _prop_value(k, v) for k, v in properties.items()}
     failed = [k for k, v in properties.items() if not it.SetProperty(k, v)]
     if failed:
         raise ToolError(f"SetProperty failed for: {', '.join(failed)} (bad key or out-of-range value?)")
@@ -567,27 +618,14 @@ def export_lut(item: int, path: str, size: int = 33, track: int = 1) -> str:
     return f"exported {size}-point LUT of '{it.GetName()}' to {path}"
 
 
-STILL_FORMATS = ("dpx", "cin", "tif", "jpg", "png", "ppm", "bmp", "xpm")
-
-
 @_tool
-def grab_still(export_dir: str | None = None, prefix: str = "still", format: str = "png") -> dict:
-    """Grab a still of the frame under the playhead into the current gallery album (Color page must be open;
-    see open_page). With export_dir, also write it as an image (dpx cin tif jpg png ppm bmp xpm)."""
-    proj, tl = _timeline()
-    if export_dir and format not in STILL_FORMATS:
-        raise ToolError(f"unsupported still format: {format} (one of {', '.join(STILL_FORMATS)})")
-    still = tl.GrabStill()
-    if not still:
+def grab_still() -> str:
+    """Grab a still of the frame under the playhead into the current gallery album, as a grade reference
+    (Color page must be open; see open_page). To get the image itself use view_frame."""
+    _, tl = _timeline()
+    if not tl.GrabStill():
         raise ToolError("GrabStill failed (is the Color page open?)")
-    out = {"grabbed": True, "exported_to": None}
-    if export_dir:
-        export_dir = os.path.abspath(export_dir)
-        album = proj.GetGallery().GetCurrentStillAlbum()
-        if not album or not album.ExportStills([still], export_dir, prefix, format):
-            raise ToolError(f"still grabbed but export to {export_dir} failed")
-        out["exported_to"] = export_dir
-    return out
+    return "still grabbed into the current gallery album"
 
 
 
@@ -864,7 +902,10 @@ def set_fusion_input(
     if (value is None) == (keyframes is None):
         raise ToolError("give either value or keyframes")
     _, c = _comp(item, comp, track)
-    tool = _node(c, node)
+    return _set_input(c, _node(c, node), node, input, value, keyframes)
+
+
+def _set_input(c, tool, node, input, value=None, keyframes=None):
     inp = tool[input]
     if not inp:
         raise ToolError(f"{node} has no input {input} (see fusion_inputs)")
@@ -882,6 +923,274 @@ def set_fusion_input(
             _write(lambda x, f=frame: tool[input].__setitem__(f, x), v, point)
     frames = sorted(float(f) for f in (tool[input].GetKeyFrames() or {}).values())
     return {"node": node, "input": input, "keyframes": frames}
+
+
+def _insert_before_output(c, tool_type, name):
+    """Add a node between MediaOut1 and whatever feeds it (MediaIn1 in a fresh comp)."""
+    out = _node(c, "MediaOut1")
+    src_name = _source(out["Input"])[0] or "MediaIn1"
+    src = _node(c, src_name)
+    if name and c.FindTool(name):
+        raise ToolError(f"a node named {name} already exists")
+    with _locked(c):
+        tool = c.AddTool(tool_type, -1, -1)
+        if not tool:
+            raise ToolError(f"unknown tool type: {tool_type}")
+        if name:
+            tool.SetAttrs({"TOOLS_Name": name})
+        if not (tool.ConnectInput("Input", src) and out.ConnectInput("Input", tool)):
+            raise ToolError(f"could not wire {tool_type} between {src_name} and MediaOut1")
+    return tool
+
+
+def _clip_comp(it):
+    """The item's first Fusion comp, created if it has none."""
+    if int(it.GetFusionCompCount() or 0) == 0 and not it.AddFusionComp():
+        raise ToolError(f"could not add a Fusion composition to '{it.GetName()}'")
+    return it.GetFusionCompByIndex(1)
+
+
+# --- Editing ---
+
+
+def _kind(items, i):
+    """clip, transition (straddles a cut) or other (title, generator, Fusion composition)."""
+    it = items[i]
+    if _opt(it, "GetMediaPoolItem"):
+        return "clip"
+    start, end = it.GetStart(), it.GetEnd()
+    before = i > 0 and items[i - 1].GetEnd() > start
+    after = i + 1 < len(items) and items[i + 1].GetStart() < end
+    return "transition" if before or after else "other"
+
+
+@_tool
+def timeline_overview() -> dict:
+    """The whole current timeline in one call: format, playhead, every track with its items (kind, source clip,
+    position, enabled, Fusion comps) and markers. Item indexes match list_items; transitions count as items."""
+    _, tl = _timeline()
+    tracks = {}
+    for kind in ("video", "audio", "subtitle"):
+        rows = []
+        for n in range(1, int(tl.GetTrackCount(kind) or 0) + 1):
+            items = list(tl.GetItemListInTrack(kind, n) or [])
+            entries = []
+            for i, it in enumerate(items):
+                mpi = _opt(it, "GetMediaPoolItem")
+                entry = {
+                    "index": i + 1,
+                    "kind": _kind(items, i),
+                    "name": it.GetName(),
+                    "source": mpi.GetName() if mpi else None,
+                    "start": it.GetStart(),
+                    "end": it.GetEnd(),
+                    "duration": it.GetDuration(),
+                    "enabled": _opt(it, "GetClipEnabled"),
+                }
+                if kind == "video":
+                    entry["fusion_comps"] = int(_opt(it, "GetFusionCompCount") or 0)
+                entries.append(entry)
+            rows.append({
+                "index": n,
+                "name": _opt(tl, "GetTrackName", kind, n),
+                "enabled": _opt(tl, "GetIsTrackEnabled", kind, n),
+                "items": entries,
+            })
+        tracks[kind] = rows
+    return {
+        "timeline": tl.GetName(),
+        "fps": _opt(tl, "GetSetting", "timelineFrameRate"),
+        "resolution": [_opt(tl, "GetSetting", "timelineResolutionWidth"), _opt(tl, "GetSetting", "timelineResolutionHeight")],
+        "start_frame": tl.GetStartFrame(),
+        "end_frame": tl.GetEndFrame(),
+        "playhead": _opt(tl, "GetCurrentTimecode"),
+        "tracks": tracks,
+        "markers": {str(int(f)) if float(f).is_integer() else str(f): m for f, m in (_opt(tl, "GetMarkers") or {}).items()},
+    }
+
+
+def _timecode(tl, frame):
+    if str(_opt(tl, "GetSetting", "timelineDropFrameTimecode")) in ("1", "True"):
+        raise ToolError("timeline uses drop-frame timecode; pass `timecode` instead of `frame`")
+    fps = round(float(_opt(tl, "GetSetting", "timelineFrameRate") or 24))
+    s, f = divmod(int(frame), fps)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}:{f:02d}"
+
+
+@_tool
+def view_frame(timecode: str | None = None, frame: int | None = None, save_to: str | None = None) -> list:
+    """See the picture: move the playhead (to an absolute `timecode`, or absolute timeline `frame` as in
+    list_items) and return that frame as an image, graded and composited as Resolve shows it.
+    save_to also keeps the file (.png/.jpg/.tif/.dpx...). Works on pages with a viewer (edit, cut, color...)."""
+    proj, tl = _timeline()
+    if timecode is not None and frame is not None:
+        raise ToolError("give timecode or frame, not both")
+    tc = timecode if timecode is not None else (_timecode(tl, frame) if frame is not None else None)
+    if tc and not tl.SetCurrentTimecode(tc):
+        raise ToolError(f"cannot move playhead to {tc}")
+    tmp = None if save_to else tempfile.mkdtemp(prefix="davinci_mcp_")
+    path = os.path.abspath(save_to) if save_to else os.path.join(tmp, "frame.png")
+    try:
+        if not proj.ExportCurrentFrameAsStill(path) or not os.path.exists(path):
+            raise ToolError("ExportCurrentFrameAsStill failed (is a page with a viewer open?)")
+        ext = os.path.splitext(path)[1].lower()
+        note = f"frame at {_opt(tl, 'GetCurrentTimecode') or tc}" + (f", saved to {path}" if save_to else "")
+        if ext not in (".png", ".jpg", ".jpeg"):
+            return [note + f" ({ext} is not viewable inline)"]
+        with open(path, "rb") as f:
+            data = f.read()
+        return [Image(data=data, format="jpeg" if ext != ".png" else "png"), note]
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+TRANSITION_CATEGORIES = ("simple", "fusion", "ofx", "audio")
+
+
+@_tool
+def add_transition(
+    item: int,
+    type: str = "Cross Dissolve",
+    position: str = "end",
+    alignment: str = "center",
+    duration: int | None = None,
+    category: str = "simple",
+    track: int = 1,
+    track_type: str = "video",
+) -> dict:
+    """Add a transition at the start or end of an item (Resolve 21.1+). type is the name as in Resolve's
+    Effects library (Cross Dissolve, Dip To Color Dissolve, Smooth Cut, Push, Slide, Wipe...); category is
+    simple, fusion, ofx or audio. Needs unused source media (handles) past the cut. Transitions become items
+    of their own, so indexes after it shift by one."""
+    if position not in ("start", "end"):
+        raise ToolError("position must be start or end")
+    if alignment not in ("left", "center", "right"):
+        raise ToolError("alignment must be left, center or right")
+    if category not in TRANSITION_CATEGORIES:
+        raise ToolError(f"category must be one of: {', '.join(TRANSITION_CATEGORIES)}")
+    if duration is not None and duration < 1:
+        raise ToolError("duration must be a positive number of frames")
+    _, tl = _timeline()
+    items = tl.GetItemListInTrack(track_type, track) or []
+    if not 1 <= item <= len(items):
+        raise ToolError(f"item {item} not found on {track_type} track {track}")
+    it = items[item - 1]
+    options = {"type": type, "category": category, "position": position, "alignment": alignment}
+    if duration is not None:
+        options["duration"] = duration
+    tr = _method(it, "AddTransition", "21.1")(options)
+    if not tr:
+        raise ToolError(
+            f"no transition created — check the name matches an installed {category} transition and that "
+            "both clips have handles (unused media) past the cut"
+        )
+    return {"name": tr.GetName(), "start": tr.GetStart(), "end": tr.GetEnd(), "duration": tr.GetDuration()}
+
+
+@_tool
+def delete_items(items: list[int], ripple: bool = False, track: int = 1, track_type: str = "video") -> str:
+    """Delete items (1-based indexes, clips or transitions) from a track. ripple=True closes the gaps."""
+    _, tl = _timeline()
+    all_items = tl.GetItemListInTrack(track_type, track) or []
+    bad = [i for i in items if not 1 <= i <= len(all_items)]
+    if bad or not items:
+        raise ToolError(f"items not found on {track_type} track {track}: {bad or 'none given'}")
+    if not tl.DeleteClips([all_items[i - 1] for i in items], ripple):
+        raise ToolError("DeleteClips failed")
+    return f"deleted {len(items)} item(s)" + (" (ripple)" if ripple else "")
+
+
+@_tool
+def set_clip_enabled(item: int, enabled: bool, track: int = 1, track_type: str = "video") -> str:
+    """Enable or disable an item (a disabled clip is skipped in playback and render)."""
+    _, tl = _timeline()
+    items = tl.GetItemListInTrack(track_type, track) or []
+    if not 1 <= item <= len(items):
+        raise ToolError(f"item {item} not found on {track_type} track {track}")
+    if not items[item - 1].SetClipEnabled(enabled):
+        raise ToolError("SetClipEnabled failed")
+    return f"{'enabled' if enabled else 'disabled'} '{items[item - 1].GetName()}'"
+
+
+@_tool
+def stabilize(item: int, track: int = 1) -> str:
+    """Run Resolve's stabilizer on a video item with its current stabilization settings. Analysis can continue
+    in the background; check the result with view_frame."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    if not _method(it, "Stabilize", "18")():
+        raise ToolError(f"Stabilize failed for '{it.GetName()}' (unsupported clip, or a limitation of this edition)")
+    return f"stabilized '{it.GetName()}'"
+
+
+@_tool
+def smart_reframe(item: int, track: int = 1) -> str:
+    """Reframe a video item for the timeline's aspect ratio (e.g. 16:9 to 9:16) by tracking its subject.
+    Studio only: on the free edition Resolve shows an upgrade dialog that blocks later calls until dismissed."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    if not _method(it, "SmartReframe", "18")():
+        raise ToolError(f"SmartReframe failed for '{it.GetName()}' (Studio only; set the timeline aspect first)")
+    return f"reframed '{it.GetName()}'"
+
+
+@_tool
+def detect_scene_cuts() -> str:
+    """Split the current timeline's clips at detected scene cuts (Studio). Item indexes change afterwards."""
+    _, tl = _timeline()
+    if not _method(tl, "DetectSceneCuts", "18.5")():
+        raise ToolError("DetectSceneCuts failed (Studio only)")
+    return "scene cuts detected; re-read the timeline with timeline_overview"
+
+
+@_tool
+def dynamic_zoom(
+    item: int,
+    start_zoom: float = 1.0,
+    end_zoom: float = 1.2,
+    start_center: list[float] = [0.5, 0.5],
+    end_center: list[float] = [0.5, 0.5],
+    track: int = 1,
+) -> dict:
+    """Ken Burns move over the whole clip: animate zoom (1.0 = full frame) and center ([x, y], 0-1, image
+    center 0.5, 0.5) from start to end. Built as a keyframed Fusion Transform named DynamicZoom in the clip's
+    comp, so it renders everywhere and can be refined with set_fusion_input."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    if start_zoom <= 0 or end_zoom <= 0:
+        raise ToolError("zoom must be positive")
+    c = _clip_comp(it)
+    if c.FindTool("DynamicZoom"):
+        raise ToolError("clip already has a DynamicZoom node; delete_fusion_node it first")
+    tool = _insert_before_output(c, "Transform", "DynamicZoom")
+    attrs = c.GetAttrs() or {}
+    first = int(attrs.get("COMPN_RenderStart", 0))
+    last = int(attrs.get("COMPN_RenderEnd", first + int(it.GetDuration()) - 1))
+    _set_input(c, tool, "DynamicZoom", "Size", keyframes={first: start_zoom, last: end_zoom})
+    if list(start_center) != list(end_center) or list(start_center) != [0.5, 0.5]:
+        _set_input(c, tool, "DynamicZoom", "Center", keyframes={first: start_center, last: end_center})
+    return {"item": it.GetName(), "node": "DynamicZoom", "frames": [first, last], "zoom": [start_zoom, end_zoom],
+            "center": [list(start_center), list(end_center)]}
+
+
+@_tool
+def insert_fusion_effect(item: int, tool_type: str, settings: dict | None = None, name: str | None = None, track: int = 1) -> dict:
+    """Apply a filter to a video item: insert a Fusion node right before MediaOut1 of the clip's comp (created
+    if missing) and set its inputs. Fusion tools (Blur, SoftGlow, Glow, FilmGrain, Sharpen, ColorCorrector,
+    DirectionalBlur, Defocus, ...) or ResolveFX by their Fusion id (see fusion_inputs to find input names)."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    c = _clip_comp(it)
+    tool = _insert_before_output(c, tool_type, name)
+    node = _tool_attrs(tool)[0]
+    try:
+        applied = {k: _set_input(c, tool, node, k, value=v)["value"] for k, v in (settings or {}).items()}
+    except ToolError as e:
+        raise ToolError(f"{node} was added to the chain but a setting failed: {e}") from e
+    return {"item": it.GetName(), "node": node, "type": tool_type, "settings": applied}
 
 
 if __name__ == "__main__":
