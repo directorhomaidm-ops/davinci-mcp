@@ -154,9 +154,10 @@ def test_add_marker(project):
 def test_render(project, tmp_path):
     assert d.list_render_presets() == ["H.264 Master", "YouTube 1080p"]
     out = d.render(str(tmp_path), preset="YouTube 1080p", file_name="final")
-    assert out == {"job": "job-1", "target_dir": str(tmp_path)}
+    assert out == {"job": "job-1", "target_dir": str(tmp_path), "started": True}
     assert project.loaded_preset == "YouTube 1080p"
-    assert project.render_settings == {"TargetDir": str(tmp_path), "CustomName": "final"}
+    assert project.render_settings == {"TargetDir": str(tmp_path), "CustomName": "final", "SelectAllFrames": True}
+    assert project.render_mode == 1  # single clip
     assert d.render_status("job-1")["JobStatus"] == "Rendering"
     with pytest.raises(ToolError, match="unknown render preset"):
         d.render(str(tmp_path), preset="Nope")
@@ -177,6 +178,10 @@ def test_all_tools_registered():
         "insert_fusion_effect", "fairlight_info", "apply_fairlight_preset", "add_track", "set_track",
         "delete_track", "voice_isolation", "normalize_audio", "set_fades", "set_speed", "convert_to_stereo",
         "insert_audio", "sync_audio", "transcribe_audio", "create_subtitles", "magic_mask", "link_mask_to_tracker",
+        "render_queue", "start_render", "delete_render_jobs", "save_render_preset", "browse_storage", "create_bin",
+        "move_clips", "delete_clips", "import_image_sequence", "clip_info", "tag_clips", "relink_clips", "link_proxy",
+        "replace_clip", "export_metadata", "export_timeline", "import_timeline", "save_project", "export_project",
+        "import_project",
     }
 
 
@@ -391,21 +396,27 @@ def test_grab_still(project):
 # --- render formats ---
 
 
-def test_list_render_formats(project):
+def test_list_render_formats_keyed_by_id(project):
+    # Resolve returns {name: id} and {description: id}; only ids are accepted, so the listing is keyed by id.
     assert d.list_render_formats() == {
-        "QuickTime": {"extension": "mov", "codecs": {"ProRes422HQ": "Apple ProRes 422 HQ", "H264": "H.264"}},
-        "MP4": {"extension": "mp4", "codecs": {"H264": "H.264"}},
+        "mov": {"name": "QuickTime", "codecs": {"ProRes422HQ": "Apple ProRes 422 HQ", "H264": "H.264"}},
+        "mp4": {"name": "MP4", "codecs": {"H264": "H.264"}},
+        "wav": {"name": "Wave", "codecs": {}},
     }
 
 
 def test_render_with_format_and_codec(project, tmp_path):
-    d.render(str(tmp_path), format="QuickTime", codec="ProRes422HQ")
-    assert project.format_codec == ("QuickTime", "ProRes422HQ")
+    d.render(str(tmp_path), format="mov", codec="ProRes422HQ")
+    assert project.format_codec == ("mov", "ProRes422HQ")
     with pytest.raises(ToolError, match="must be given together"):
-        d.render(str(tmp_path), preset="YouTube 1080p", format="QuickTime")
+        d.render(str(tmp_path), preset="YouTube 1080p", format="mov")
     assert project.loaded_preset is None  # rejected before touching the project
     with pytest.raises(ToolError, match="unsupported format/codec"):
-        d.render(str(tmp_path), format="MP4", codec="ProRes422HQ")
+        d.render(str(tmp_path), format="mp4", codec="ProRes422HQ")
+    with pytest.raises(ToolError, match="unknown render format id or one without selectable codecs: QuickTime"):
+        d.render(str(tmp_path), format="QuickTime", codec="ProRes422HQ")
+    with pytest.raises(ToolError, match="without selectable codecs: wav"):
+        d.render(str(tmp_path), format="wav", codec="")
 
 
 def test_stop_render(project, tmp_path):
@@ -1049,3 +1060,236 @@ def test_link_mask_errors(fusion):
     _tracked(fusion)
     with pytest.raises(ToolError, match=r"offset needs \[dx, dy\]"):
         d.link_mask_to_tracker(1, "EllipseMask1", "Tracker1", offset=[0.1])
+
+
+# --- page-gated calls ---
+
+
+def test_export_lut_switches_to_color_and_back(project, tmp_path, resolve):
+    _two_items(project)
+    resolve.OpenPage("edit")
+    d.export_lut(1, str(tmp_path / "g.cube"))
+    assert resolve.pages_visited[-2:] == ["color", "edit"]
+    assert resolve.page == "edit"
+
+
+def test_delete_items_from_fairlight_page(project, resolve):
+    _two_items(project)
+    resolve.OpenPage("fairlight")
+    assert d.delete_items([1]) == "deleted 1 item(s)"
+    assert resolve.page == "fairlight"  # put back where the user was
+
+
+# --- advanced render ---
+
+
+def test_render_range_and_settings(project, tmp_path):
+    d.append_clips(["a.mov", "b.mov"])
+    d.render(str(tmp_path), mark_in=86424, mark_out=86471, width=3840, height=2160, frame_rate=25, quality="Best",
+             audio=False, individual_clips=True, settings={"ExportAlpha": True, "AudioSampleRate": 48000}, start=False)
+    assert project.render_settings == {
+        "ExportAlpha": True, "AudioSampleRate": 48000, "TargetDir": str(tmp_path), "FormatWidth": 3840,
+        "FormatHeight": 2160, "FrameRate": 25, "VideoQuality": "Best", "ExportAudio": False,
+        "SelectAllFrames": False, "MarkIn": 86424, "MarkOut": 86471,
+    }
+    assert project.render_mode == 0
+    assert project.rendering is False  # start=False only queues
+
+
+def test_render_range_must_be_absolute(project, tmp_path):
+    d.append_clips(["a.mov"])
+    # Relative frames (as GetMarkInOut reports them) would be clamped silently by Resolve.
+    with pytest.raises(ToolError, match="absolute frames with 86400 <= in <= out <= 86500"):
+        d.render(str(tmp_path), mark_in=0, mark_out=24)
+    with pytest.raises(ToolError, match="given together"):
+        d.render(str(tmp_path), mark_in=86400)
+
+
+def test_render_status_done_checks_file(project, tmp_path):
+    d.render(str(tmp_path), file_name="final")
+    project.jobs["job-1"] = {"JobStatus": "Concluso", "CompletionPercentage": 100}  # localized status string
+    st = d.render_status("job-1")
+    assert (st["done"], st["output"], st["output_exists"]) == (True, str(tmp_path / "final.mov"), False)
+    (tmp_path / "final.mov").write_bytes(b"x")
+    assert d.render_status("job-1")["output_exists"] is True
+    project.jobs["job-1"] = {"JobStatus": "Failed", "CompletionPercentage": 100, "Error": "disk full"}
+    assert d.render_status("job-1")["done"] is False
+    with pytest.raises(ToolError, match="render job not found"):
+        d.render_status("job-9")
+
+
+def test_render_queue_start_delete(project, tmp_path):
+    d.render(str(tmp_path), start=False)
+    d.render(str(tmp_path), start=False)
+    assert [j["JobId"] for j in d.render_queue()] == ["job-1", "job-2"]
+    assert d.start_render(["job-2"]) == "rendering 1 job(s)"
+    with pytest.raises(ToolError, match="stop_render first"):
+        d.delete_render_jobs(["job-1"])
+    d.stop_render()
+    assert d.delete_render_jobs(["job-1"]) == "deleted 1 render job(s)"
+    with pytest.raises(ToolError, match="unknown render job"):
+        d.delete_render_jobs(["job-1"])
+    assert d.delete_render_jobs() == "render queue cleared"
+    with pytest.raises(ToolError, match="rendering did not start"):
+        d.start_render()
+
+
+def test_save_render_preset(project):
+    assert d.save_render_preset("Client 4K") == "saved render preset 'Client 4K'"
+    with pytest.raises(ToolError, match="name taken"):
+        d.save_render_preset("Client 4K")
+
+
+# --- media management ---
+
+
+def test_browse_storage(resolve, tmp_path):
+    (tmp_path / "Day1").mkdir()
+    (tmp_path / "a.mov").write_bytes(b"")
+    assert d.browse_storage() == {"volumes": ["/Volumes/RAID", "/Volumes/SSD"]}
+    assert d.browse_storage(str(tmp_path)) == {"path": str(tmp_path), "folders": [str(tmp_path / "Day1")],
+                                               "files": [str(tmp_path / "a.mov")]}
+    with pytest.raises(ToolError, match="folder not found"):
+        d.browse_storage(str(tmp_path / "nope"))
+
+
+def test_bins_move_and_import(project, tmp_path):
+    assert d.create_bin("Footage") == "created bin /Footage"
+    assert d.create_bin("Day 1", parent="Footage") == "created bin Footage/Day 1"
+    with pytest.raises(ToolError, match="bin already exists"):
+        d.create_bin("Footage")
+    with pytest.raises(ToolError, match="bin not found: Nope"):
+        d.create_bin("x", parent="Nope")
+    assert d.move_clips(["a.mov"], "Footage/Day 1") == "moved 1 clip(s) to Footage/Day 1"
+    assert {c["folder"]: c["name"] for c in d.list_clips()}["Footage/Day 1/"] == "a.mov"
+    f = tmp_path / "c.mov"
+    f.write_bytes(b"")
+    d.import_media([str(f)], bin="Footage")
+    assert project.pool.imported_into == "Footage"
+    assert project.pool.GetCurrentFolder() is project.pool.root  # restored
+
+
+def test_delete_clips(project):
+    assert d.delete_clips(["a.mov"]) == "deleted 1 clip(s) from the media pool"
+    assert "a.mov" not in [c["name"] for c in d.list_clips()]
+    with pytest.raises(ToolError, match="clips not in media pool"):
+        d.delete_clips(["a.mov"])
+
+
+def test_import_image_sequence(project, tmp_path):
+    (tmp_path / "shot_0001.exr").write_bytes(b"")
+    assert d.import_image_sequence(str(tmp_path / "shot_%04d.exr"), 1, 120) == "imported shot_[1-120]"
+    with pytest.raises(ToolError, match="first frame not found"):
+        d.import_image_sequence(str(tmp_path / "shot_%04d.exr"), 5, 120)
+    with pytest.raises(ToolError, match="end must be"):
+        d.import_image_sequence(str(tmp_path / "shot_%04d.exr"), 10, 1)
+
+
+def test_clip_info_and_tagging(project):
+    out = d.tag_clips(["a.mov"], color="Teal", flag="Green", metadata={"Scene": "12", "Take": 3})
+    assert out == [{"clip": "a.mov", "color": "Teal", "flags": ["Green"]}]
+    info = d.clip_info("a.mov")
+    assert info["metadata"] == {"Scene": "12", "Take": "3"}
+    assert (info["color"], info["flags"]) == ("Teal", ["Green"])
+    assert info["properties"]["File Path"] == "/media/a.mov"
+    assert "Reel Name" not in info["properties"]  # empty values are dropped
+    d.tag_clips(["a.mov"], color="", clear_flags=True)
+    assert (d.clip_info("a.mov")["color"], d.clip_info("a.mov")["flags"]) == (None, [])
+
+
+def test_tag_clips_errors(project):
+    with pytest.raises(ToolError, match="unknown clip color: Red"):
+        d.tag_clips(["a.mov"], color="Red")
+    with pytest.raises(ToolError, match="unknown flag color"):
+        d.tag_clips(["a.mov"], flag="Beige")
+    with pytest.raises(ToolError, match="nothing to change"):
+        d.tag_clips(["a.mov"])
+    # Resolve returns True for Reel Name but does not keep it under automatic reel naming.
+    with pytest.raises(ToolError, match="did not keep Reel Name on a.mov"):
+        d.tag_clips(["a.mov"], metadata={"Reel Name": "A001"})
+
+
+def test_relink_proxy_replace(project, tmp_path):
+    (tmp_path / "proxy.mov").write_bytes(b"")
+    (tmp_path / "v2.mov").write_bytes(b"")
+    assert d.relink_clips(["a.mov"], str(tmp_path)) == f"relinked 1 clip(s) to {tmp_path}"
+    assert d.clip_info("a.mov")["properties"]["File Path"] == str(tmp_path / "a.mov")
+    assert d.link_proxy("a.mov", str(tmp_path / "proxy.mov")) == "linked proxy proxy.mov to a.mov"
+    assert d.clip_info("a.mov")["properties"]["Proxy Media Path"] == str(tmp_path / "proxy.mov")
+    assert d.link_proxy("a.mov") == "unlinked proxy of a.mov"
+    with pytest.raises(ToolError, match="no proxy to unlink"):
+        d.link_proxy("a.mov")
+    assert d.replace_clip("a.mov", str(tmp_path / "v2.mov")) == "a.mov now uses v2.mov"
+    with pytest.raises(ToolError, match="file not found"):
+        d.replace_clip("a.mov", str(tmp_path / "v3.mov"))
+    with pytest.raises(ToolError, match="folder not found"):
+        d.relink_clips(["a.mov"], str(tmp_path / "missing"))
+
+
+def test_export_metadata(project, tmp_path):
+    out = tmp_path / "meta.csv"
+    assert d.export_metadata(str(out)) == f"metadata of all clip(s) written to {out}"
+    assert out.read_text().split("\n") == ["a.mov", "b.mov"]
+    d.export_metadata(str(out), ["b.mov"])
+    assert out.read_text() == "b.mov"
+
+
+# --- interchange and project ---
+
+
+def test_export_timeline_formats(project, tmp_path, resolve):
+    out = d.export_timeline(str(tmp_path / "cut.xml"), "fcpxml")
+    assert (out["format"], out["timeline"]) == ("fcpxml_1_10", "Main")  # newest this build exposes
+    assert project.current.exported[1:] == (resolve.EXPORT_FCPXML_1_10, resolve.EXPORT_NONE)
+    d.export_timeline(str(tmp_path / "cut.aaf"), "aaf")
+    assert project.current.exported[1:] == (resolve.EXPORT_AAF, resolve.EXPORT_AAF_NEW)
+    d.export_timeline(str(tmp_path / "cut.edl"), "edl_cdl")
+    assert project.current.exported[1:] == (resolve.EXPORT_EDL, resolve.EXPORT_CDL)
+    assert d.export_timeline(str(tmp_path / "cut.otio"), "otio")["bytes"] > 0
+
+
+def test_export_timeline_errors(project, tmp_path):
+    with pytest.raises(ToolError, match="unknown format: premiere"):
+        d.export_timeline(str(tmp_path / "x"), "premiere")
+    with pytest.raises(ToolError, match="this Resolve version has no EXPORT_HDR_10_PROFILE_A"):
+        d.export_timeline(str(tmp_path / "x"), "hdr10_a")
+    with pytest.raises(ToolError, match="folder not found"):
+        d.export_timeline(str(tmp_path / "no" / "x.aaf"), "aaf")
+
+
+def test_export_timeline_detects_missing_file(project, tmp_path, monkeypatch):
+    monkeypatch.setattr(project.current, "Export", lambda path, kind, sub: True)
+    with pytest.raises(ToolError, match="reported success but wrote no file"):
+        d.export_timeline(str(tmp_path / "cut.aaf"), "aaf")
+
+
+def test_import_timeline(project, tmp_path):
+    aaf = tmp_path / "from_avid.aaf"
+    aaf.write_text("")
+    out = d.import_timeline(str(aaf), name="Avid Cut", source_clips_path=str(tmp_path))
+    assert out == {"timeline": "Avid Cut", "renamed_by_file": False}
+    assert project.current.name == "Avid Cut"
+    assert project.pool.imported_options == {"importSourceClips": True, "timelineName": "Avid Cut",
+                                             "sourceClipsPath": str(tmp_path)}
+    with pytest.raises(ToolError, match="already exists"):
+        d.import_timeline(str(aaf), name="Avid Cut")
+
+
+def test_import_timeline_fcp7_name_from_file(project, tmp_path):
+    xml = tmp_path / "premiere.xml"
+    xml.write_text("")
+    assert d.import_timeline(str(xml), name="From Premiere") == {"timeline": "Sequence 1", "renamed_by_file": True}
+    # Importing again: FCP7 XML hands back the EXISTING timeline instead of failing.
+    with pytest.raises(ToolError, match="matches the existing timeline 'Sequence 1'"):
+        d.import_timeline(str(xml))
+
+
+def test_project_save_export_import(project, resolve, tmp_path):
+    assert d.save_project() == "project saved"
+    out = d.export_project(str(tmp_path / "backup"))
+    assert out == {"project": "Demo", "path": str(tmp_path / "backup.drp"), "bytes": 3}
+    assert resolve.pm.exported_project == ("Demo", str(tmp_path / "backup.drp"), True)
+    assert d.import_project(out["path"], name="Demo copy") == "imported project Demo copy"
+    assert "Demo copy" in d.list_projects()
+    with pytest.raises(ToolError, match="name already in use"):
+        d.import_project(out["path"], name="Demo")
