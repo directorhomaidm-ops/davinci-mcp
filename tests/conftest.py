@@ -117,6 +117,15 @@ class Item:
             self.end = self.start + round((self.end - self.start) * 100 / pct)
         return True
 
+    def CreateMagicMask(self, mode):
+        if mode not in ("F", "B", "BI"):
+            return False  # long spellings are rejected on live Resolve
+        self.magic_mask = mode if getattr(self, "mask_clicked", False) else None
+        return self.magic_mask is not None
+
+    def RegenerateMagicMask(self):
+        return getattr(self, "magic_mask", None) is not None
+
     def SmartReframe(self):
         self.reframed = True
         return True
@@ -225,6 +234,7 @@ TOOL_INPUTS = {
     "TextPlus": {"StyledText": "Text", "Size": "Number", "Center": "Point"},
     "EllipseMask": {"Width": "Number", "Center": "Point"},
     "SoftGlow": {"Input": "Image", "Gain": "Number", "Threshold": "Number"},
+    "Tracker": {"Input": "Image", "PatternCenter1": "Point", "TrackedCenter1": "Point", "TrackedCenter2": "Point"},
     "BezierSpline": {},
     "PolyPath": {},
 }
@@ -268,6 +278,10 @@ class FuInput:
 
     def GetKeyFrames(self):
         return {i: float(f) for i, f in enumerate(sorted(self.keys), 1)}
+
+    def SetExpression(self, expr, time=None):
+        self.tool.comp.value_write()
+        self.expression = expr
 
 
 class FuTool:

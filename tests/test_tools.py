@@ -176,7 +176,7 @@ def test_all_tools_registered():
         "set_clip_enabled", "stabilize", "smart_reframe", "detect_scene_cuts", "dynamic_zoom",
         "insert_fusion_effect", "fairlight_info", "apply_fairlight_preset", "add_track", "set_track",
         "delete_track", "voice_isolation", "normalize_audio", "set_fades", "set_speed", "convert_to_stereo",
-        "insert_audio", "sync_audio", "transcribe_audio", "create_subtitles",
+        "insert_audio", "sync_audio", "transcribe_audio", "create_subtitles", "magic_mask", "link_mask_to_tracker",
     }
 
 
@@ -972,3 +972,80 @@ def test_create_subtitles_errors(project):
                         ({"lines": 3}, "1 or 2"), ({"chars_per_line": 80}, "1-60"), ({"gap": 11}, "0-10")]:
         with pytest.raises(ToolError, match=msg):
             d.create_subtitles(**kwargs)
+
+
+# --- mask tracking ---
+
+
+def test_magic_mask_needs_a_click(project):
+    a, _ = _two_items(project)
+    with pytest.raises(ToolError, match="the API cannot click the subject"):
+        d.magic_mask(1)
+    with pytest.raises(ToolError, match="no Magic Mask to regenerate"):
+        d.magic_mask(1, regenerate=True)
+
+
+def test_magic_mask_tracks_seeded_mask(project):
+    a, _ = _two_items(project)
+    a.mask_clicked = True
+    assert d.magic_mask(1, "forward") == "tracked Magic Mask forward on 'a.mov'"
+    assert a.magic_mask == "F"
+    d.magic_mask(1)
+    assert a.magic_mask == "BI"
+    assert d.magic_mask(1, regenerate=True) == "regenerated Magic Mask on 'a.mov'"
+    with pytest.raises(ToolError, match="direction must be"):
+        d.magic_mask(1, "sideways")
+
+
+def test_magic_mask_needs_newer_resolve(project, monkeypatch):
+    a, _ = _two_items(project)
+    monkeypatch.delattr(type(a), "CreateMagicMask")
+    with pytest.raises(ToolError, match="CreateMagicMask needs DaVinci Resolve 18.5"):
+        d.magic_mask(1)
+
+
+def _tracked(fusion, name="Tracker1", n=1):
+    trk = fusion.FindTool(name)
+    path = fusion.AddTool("PolyPath", -1, -1, locked_ok=True)
+    trk.inputs[f"TrackedCenter{n}"].source = path.output
+    return trk
+
+
+def test_link_mask_to_tracker(fusion):
+    d.add_fusion_node(1, "Blur", connect_from="MediaIn1")
+    d.add_fusion_node(1, "EllipseMask", name="Face")
+    d.connect_fusion_nodes(1, "Blur1", "Face", input="EffectMask")
+    d.add_fusion_node(1, "Tracker", connect_from="MediaIn1")
+    _tracked(fusion)
+    assert d.link_mask_to_tracker(1, "Face", "Tracker1") == {"node": "Face", "expression": "Tracker1.TrackedCenter1"}
+    center = fusion.FindTool("Face").inputs["Center"]
+    assert center.expression == "Tracker1.TrackedCenter1"
+    out = d.link_mask_to_tracker(1, "Face", "Tracker1", offset=[0.05, -0.1])
+    assert out["expression"] == "Point(Tracker1.TrackedCenter1.X + 0.05, Tracker1.TrackedCenter1.Y + -0.1)"
+    assert d.link_mask_to_tracker(1, "Face", "Tracker1", unlink=True) == {"node": "Face", "expression": None}
+    assert center.expression is None
+    _assert_lock_rules(fusion)
+
+
+def test_link_mask_second_tracker(fusion):
+    d.add_fusion_node(1, "EllipseMask")
+    d.add_fusion_node(1, "Tracker")
+    _tracked(fusion, n=2)
+    assert d.link_mask_to_tracker(1, "EllipseMask1", "Tracker1", tracker_index=2)["expression"] == "Tracker1.TrackedCenter2"
+
+
+def test_link_mask_errors(fusion):
+    d.add_fusion_node(1, "EllipseMask")
+    d.add_fusion_node(1, "Tracker")
+    d.add_fusion_node(1, "Blur")
+    with pytest.raises(ToolError, match="run Track Forward on it in the Fusion page first"):
+        d.link_mask_to_tracker(1, "EllipseMask1", "Tracker1")
+    with pytest.raises(ToolError, match="Tracker1 has no TrackedCenter3; its point inputs are: PatternCenter1, TrackedCenter1, TrackedCenter2"):
+        d.link_mask_to_tracker(1, "EllipseMask1", "Tracker1", tracker_index=3)
+    with pytest.raises(ToolError, match="Blur1 is a Blur, not a Tracker"):
+        d.link_mask_to_tracker(1, "EllipseMask1", "Blur1")
+    with pytest.raises(ToolError, match="Blur1 has no Center point input"):
+        d.link_mask_to_tracker(1, "Blur1", "Tracker1")
+    _tracked(fusion)
+    with pytest.raises(ToolError, match=r"offset needs \[dx, dy\]"):
+        d.link_mask_to_tracker(1, "EllipseMask1", "Tracker1", offset=[0.1])

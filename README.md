@@ -157,6 +157,7 @@ Notes:
 | `add_color_version` | `item: int`, `name: str`, `remote: bool = False`, `track: int = 1` | Confirmation string; the new version becomes current | Name taken |
 | `load_color_version` | `item: int`, `name: str`, `remote: bool = False`, `track: int = 1` | Confirmation string | Version not found |
 | `export_lut` | `item: int`, `path: str`, `size: 17 \| 33 \| 65 = 33`, `track: int = 1` | Confirmation string | Unsupported size; export rejected |
+| `magic_mask` | `item: int`, `direction: "forward" \| "backward" \| "both" = "both"`, `regenerate: bool = False`, `track: int = 1` | Confirmation string | No subject clicked in the UI yet; Resolve older than 18.5 |
 | `grab_still` | — | Confirmation string | Color page not open |
 
 Notes:
@@ -164,6 +165,7 @@ Notes:
 - `set_cdl` defaults are the identity grade (slope 1, offset 0, power 1, saturation 1), so pass only what you change.
 - `apply_lut` only accepts LUTs Resolve has already indexed. After copying a new `.cube` into a LUT folder, run *Project Settings → Color Management → Update Lists* first.
 - `grab_still` needs the Color page open (`open_page("color")`) and stores the still in the current gallery album as a grade reference. To get the image itself use `view_frame`: Resolve's gallery export only works while the Gallery panel is visible, while the frame export `view_frame` uses works on any page with a viewer.
+- `magic_mask` only tracks: Magic Mask needs clicks on the subject and the API cannot place them. Seed it once in the Color page (select the clip, open the Magic Mask palette, click the subject), then call `magic_mask`. Power Windows and their tracker have no API at all. Studio only.
 - `export_lut` needs Resolve 18 or later. Node reads/writes use Resolve 19's node graph when present and fall back to the older per-item calls on earlier versions.
 
 ### Fusion (VFX and motion graphics)
@@ -182,6 +184,7 @@ Notes:
 | `add_fusion_node` | `item: int`, `tool_type: str`, `name: str \| None`, `connect_from: str \| None`, `input: str = "Input"`, `comp`, `track` | `{name, type, connected}` | Unknown type; name taken; source not found or not connectable |
 | `connect_fusion_nodes` | `item: int`, `target: str`, `source: str \| None`, `input: str = "Input"`, `comp`, `track` | Confirmation string; `source: null` disconnects | Node not found; input not connectable |
 | `delete_fusion_node` | `item: int`, `node: str`, `comp`, `track` | Confirmation string | Node not found |
+| `link_mask_to_tracker` | `item: int`, `mask: str`, `tracker: str`, `tracker_index: int = 1`, `offset: [dx, dy] = [0, 0]`, `unlink: bool = False`, `comp`, `track` | `{node, expression}` | Not a Tracker; no Center input; track not run yet; unknown tracker index |
 | `set_fusion_input` | `item: int`, `node: str`, `input: str`, `value` **or** `keyframes: {frame: value}`, `comp`, `track` | `{node, input, value}` or `{node, input, keyframes}` | Neither or both given; unknown input; input cannot be animated |
 
 Notes:
@@ -190,6 +193,8 @@ Notes:
 - Common inputs: `Input` (main image), `Background`/`Foreground` (Merge), `EffectMask` (limits a node's effect to a mask).
 - Frames in `keyframes` are relative to the composition, starting at 0. Numbers get a Bézier spline and points (`Center`, `[x, y]` in 0–1 image space) get a motion path. Adding more keyframes later extends the same curve. Text inputs can only be set statically.
 - Every structural change (add, connect, delete) runs under `comp.Lock()`. Value and keyframe writes deliberately run outside it: Resolve renders ignore values written under the lock. Each write is one undo step in Resolve.
+
+Tracking in Fusion: add a `Tracker` (`add_fusion_node(item=1, tool_type="Tracker", connect_from="MediaIn1")`), place its pattern on the feature and press Track Forward in the Fusion page (the API cannot run the tracker), then `link_mask_to_tracker(item=1, mask="Area", tracker="Tracker1")` makes the mask follow it. The link is the Fusion expression `Tracker1.TrackedCenter1`; it works for any node with a `Center` (masks, Text+, Transform). **Experimental:** not yet confirmed on a live Resolve; if the tracker's input has another name there, the error lists the tracker's actual point inputs.
 
 Example: a blur limited to an elliptical area, then an animated push-in:
 

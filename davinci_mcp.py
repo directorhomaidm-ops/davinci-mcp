@@ -618,6 +618,32 @@ def export_lut(item: int, path: str, size: int = 33, track: int = 1) -> str:
     return f"exported {size}-point LUT of '{it.GetName()}' to {path}"
 
 
+MAGIC_MASK_DIRECTIONS = {"forward": "F", "backward": "B", "both": "BI"}
+
+
+@_tool
+def magic_mask(item: int, direction: str = "both", regenerate: bool = False, track: int = 1) -> str:
+    """Track the Magic Mask of a video item through the shot: forward, backward or both from the current frame;
+    regenerate=True re-tracks an existing mask. Studio only.
+    The API cannot place the subject clicks Magic Mask needs, so it only tracks a mask already seeded in the UI:
+    Color page → select the clip's node → Magic Mask palette → click the subject; then call this.
+    Check the result with view_frame."""
+    if direction not in MAGIC_MASK_DIRECTIONS:
+        raise ToolError(f"direction must be one of: {', '.join(MAGIC_MASK_DIRECTIONS)}")
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    if regenerate:
+        if not _method(it, "RegenerateMagicMask", "18.5")():
+            raise ToolError(f"'{it.GetName()}' has no Magic Mask to regenerate: click the subject in the Color page "
+                            "Magic Mask palette first")
+        return f"regenerated Magic Mask on '{it.GetName()}'"
+    if not _method(it, "CreateMagicMask", "18.5")(MAGIC_MASK_DIRECTIONS[direction]):
+        raise ToolError(f"no Magic Mask tracked on '{it.GetName()}': the API cannot click the subject. In the Color "
+                        "page select the clip, open the Magic Mask palette, click the subject, then call magic_mask "
+                        "again (Studio only)")
+    return f"tracked Magic Mask {direction} on '{it.GetName()}'"
+
+
 @_tool
 def grab_still() -> str:
     """Grab a still of the frame under the playhead into the current gallery album, as a grade reference
@@ -1553,6 +1579,55 @@ def create_subtitles(
         raise ToolError("no subtitle track was created (Studio only; the timeline needs audible dialogue)")
     return {"resolve_reported": returned, "subtitle_track": after,
             "captions": len(tl.GetItemListInTrack("subtitle", after) or [])}
+
+
+
+@_tool
+def link_mask_to_tracker(
+    item: int,
+    mask: str,
+    tracker: str,
+    tracker_index: int = 1,
+    offset: list[float] = [0.0, 0.0],
+    unlink: bool = False,
+    comp: int = 1,
+    track: int = 1,
+) -> dict:
+    """Make a Fusion node's Center (a mask, Text+, Transform...) follow a Tracker node's tracked point, through a
+    Fusion expression. offset ([dx, dy], 0-1 image space) shifts it from the tracked point; unlink=True removes
+    the link. The track itself must be run in the Fusion page (Track Forward); the API cannot start it.
+    EXPERIMENTAL: not yet confirmed on a live Resolve."""
+    _, c = _comp(item, comp, track)
+    target, trk = _node(c, mask), _node(c, tracker)
+    if _tool_attrs(trk)[1] != "Tracker":
+        raise ToolError(f"{tracker} is a {_tool_attrs(trk)[1]}, not a Tracker")
+    center = target["Center"]
+    if not center or (center.GetAttrs() or {}).get("INPS_DataType") != "Point":
+        raise ToolError(f"{mask} has no Center point input")
+    with _undo(c, f"{mask}.Center"):
+        if unlink:
+            center.SetExpression(None)
+            return {"node": mask, "expression": None}
+        path_id = f"TrackedCenter{tracker_index}"
+        path = trk[path_id]
+        if not path:
+            points = [(i.GetAttrs() or {}).get("INPS_ID") for i in (trk.GetInputList() or {}).values()
+                      if (i.GetAttrs() or {}).get("INPS_DataType") == "Point"]
+            raise ToolError(f"{tracker} has no {path_id}; its point inputs are: {', '.join(points) or 'none'}")
+        if _source(path)[1] not in ANIMATION_MODIFIERS:
+            raise ToolError(f"{tracker} has no tracked data for tracker {tracker_index}: run Track Forward on it in the "
+                            "Fusion page first")
+        dx, dy = (float(v) for v in _xy(offset))
+        ref = f"{tracker}.{path_id}"
+        expr = ref if dx == dy == 0 else f"Point({ref}.X + {dx}, {ref}.Y + {dy})"
+        center.SetExpression(expr)
+    return {"node": mask, "expression": expr}
+
+
+def _xy(v):
+    if len(v) != 2:
+        raise ToolError(f"offset needs [dx, dy], got {v!r}")
+    return v
 
 
 if __name__ == "__main__":
