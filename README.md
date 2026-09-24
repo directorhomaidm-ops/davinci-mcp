@@ -209,7 +209,7 @@ Notes:
 |---|---|---|---|
 | `export_timeline` | `path: str`, `format: str` | `{timeline, format, path, bytes}` | Unknown format; format not in this Resolve; folder missing; no file written |
 | `import_timeline` | `path: str`, `name: str \| None`, `import_source_clips: bool = True`, `source_clips_path: str \| None` | `{timeline, renamed_by_file}`; the new timeline becomes current | File missing; name taken; no new timeline created |
-| `save_project` | — | Confirmation string | |
+| `save_project` | — | Confirmation string | Untitled Project (cannot be saved from a script); save failed |
 | `export_project` | `path: str` (.drp added if missing), `with_stills_and_luts: bool = True` | `{project, path, bytes}` | Export failed |
 | `import_project` | `path: str`, `name: str \| None` | Confirmation string | File missing; name in use |
 
