@@ -33,10 +33,82 @@ class Folder:
         return self.subfolders
 
 
+class Graph:
+    """Resolve 19+ node graph."""
+
+    def __init__(self, labels=("",)):
+        self.labels, self.luts = list(labels), {}
+
+    def GetNumNodes(self):
+        return len(self.labels)
+
+    def GetNodeLabel(self, n):
+        return self.labels[n - 1]
+
+    def GetLUT(self, n):
+        return self.luts.get(n, "")
+
+    def SetLUT(self, n, path):
+        if not path.endswith(".cube"):
+            return False
+        self.luts[n] = path
+        return True
+
+
+class ColorGroup:
+    def __init__(self, name):
+        self.name = name
+
+    def GetName(self):
+        return self.name
+
+
 class Item:
     def __init__(self, name, start, end):
         self.name, self.start, self.end, self.props = name, start, end, {}
         self.comp = None
+        self.graph = Graph(("Primary", "Look"))
+        self.cdl, self.color_group = None, None
+        self.versions = {0: ["Version 1"], 1: []}
+        self.version = {"versionName": "Version 1", "versionType": 0}
+        self.copied_to, self.exported_lut = None, None
+
+    def GetNodeGraph(self, layer=1):
+        return self.graph
+
+    def GetColorGroup(self):
+        return self.color_group
+
+    def SetCDL(self, cdl):
+        self.cdl = cdl
+        return True
+
+    def CopyGrades(self, items):
+        self.copied_to = items
+        return True
+
+    def GetCurrentVersion(self):
+        return self.version
+
+    def GetVersionNameList(self, kind):
+        return self.versions[kind]
+
+    def AddVersion(self, name, kind):
+        if name in self.versions[kind]:
+            return False
+        self.versions[kind].append(name)
+        self.version = {"versionName": name, "versionType": kind}
+        return True
+
+    def LoadVersionByName(self, name, kind):
+        if name not in self.versions[kind]:
+            return False
+        self.version = {"versionName": name, "versionType": kind}
+        return True
+
+    def ExportLUT(self, kind, path):
+        self.exported_lut = (kind, path)
+        return True
 
     def GetName(self):
         return self.name
@@ -76,11 +148,43 @@ class Comp:
         return self.template if name == "Template" else None
 
 
+class Still:
+    pass
+
+
+class Album:
+    def __init__(self):
+        self.stills, self.exported = [], []
+
+    def ExportStills(self, stills, folder, prefix, fmt):
+        self.exported.append((stills, folder, prefix, fmt))
+        return True
+
+
+class Gallery:
+    def __init__(self):
+        self.album = Album()
+
+    def GetCurrentStillAlbum(self):
+        return self.album
+
+
 class Timeline:
     def __init__(self, name, start=86400):
         self.name, self.start = name, start
         self.tracks = {("video", 1): [], ("audio", 1): []}
         self.markers = {}
+        self.playhead_item, self.page_is_color, self.drx = None, True, None
+
+    def GetCurrentVideoItem(self):
+        return self.playhead_item
+
+    def GrabStill(self):
+        return Still() if self.page_is_color else None
+
+    def ApplyGradeFromDRX(self, path, mode, items):
+        self.drx = (path, mode, items)
+        return True
 
     def GetName(self):
         return self.name
@@ -160,6 +264,29 @@ class Project:
         self.pool = MediaPool(self)
         self.presets = ["H.264 Master", "YouTube 1080p"]
         self.loaded_preset, self.render_settings, self.jobs = None, {}, {}
+        self.format_codec, self.rendering = None, False
+        self.gallery = Gallery()
+
+    def GetGallery(self):
+        return self.gallery
+
+    def GetRenderFormats(self):
+        return {"QuickTime": "mov", "MP4": "mp4"}
+
+    def GetRenderCodecs(self, fmt):
+        return {"QuickTime": {"Apple ProRes 422 HQ": "ProRes422HQ", "H.264": "H264"}, "MP4": {"H.264": "H264"}}[fmt]
+
+    def SetCurrentRenderFormatAndCodec(self, fmt, codec):
+        if codec not in self.GetRenderCodecs(fmt).values():
+            return False
+        self.format_codec = (fmt, codec)
+        return True
+
+    def IsRenderingInProgress(self):
+        return self.rendering
+
+    def StopRendering(self):
+        self.rendering = False
 
     def GetName(self):
         return self.name
@@ -199,6 +326,7 @@ class Project:
         return job
 
     def StartRendering(self, jobs, isInteractiveMode=False):
+        self.rendering = True
         for j in jobs:
             self.jobs[j] = {"JobStatus": "Rendering", "CompletionPercentage": 0}
         return True
@@ -230,8 +358,15 @@ class ProjectManager:
 
 
 class Resolve:
+    EXPORT_LUT_17PTCUBE, EXPORT_LUT_33PTCUBE, EXPORT_LUT_65PTCUBE = 0, 1, 2
+
     def __init__(self):
         self.pm = ProjectManager()
+        self.page = "edit"
+
+    def OpenPage(self, page):
+        self.page = page
+        return True
 
     def GetProjectManager(self):
         return self.pm
@@ -243,7 +378,7 @@ class Resolve:
         return "19.0.0"
 
     def GetCurrentPage(self):
-        return "edit"
+        return self.page
 
 
 @pytest.fixture

@@ -44,7 +44,7 @@ DEFAULTS = {
 mcp = MCPServer(
     "davinci",
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
-    "clip properties, titles, markers and rendering. Frames are absolute timeline frames.",
+    "clip properties, titles, markers, color grading and rendering. Frames are absolute timeline frames.",
 )
 
 log = logging.getLogger("davinci_mcp")
@@ -108,7 +108,13 @@ def _resolve():
     mods = os.path.join(os.environ["RESOLVE_SCRIPT_API"], "Modules")
     if mods not in sys.path:
         sys.path.insert(0, mods)
-    import DaVinciResolveScript as dvr
+    try:
+        import DaVinciResolveScript as dvr
+    except ImportError as e:
+        raise ToolError(
+            f"cannot load Resolve scripting module from {mods} ({e}) — is DaVinci Resolve installed? "
+            "Set RESOLVE_SCRIPT_API / RESOLVE_SCRIPT_LIB if it is installed elsewhere."
+        ) from e
 
     resolve = dvr.scriptapp("Resolve")
     if not resolve:
@@ -142,6 +148,28 @@ def _walk(folder, prefix=""):
 
 def _clips_by_name(proj):
     return {c.GetName(): c for _, c in _walk(proj.GetMediaPool().GetRootFolder())}
+
+
+def _item(tl, item, track):
+    items = tl.GetItemListInTrack("video", track) or []
+    if not 1 <= item <= len(items):
+        raise ToolError(f"item {item} not found on video track {track}")
+    return items[item - 1]
+
+
+def _graph(it):
+    """Node graph of a timeline item. Resolve 19+ exposes it via GetNodeGraph(); older versions on the item itself."""
+    try:
+        graph = it.GetNodeGraph()
+    except AttributeError:
+        graph = None
+    return graph or it
+
+
+def _check_node(it, node):
+    count = int(_graph(it).GetNumNodes() or 0)
+    if not 1 <= node <= count:
+        raise ToolError(f"node {node} out of range (item has {count} node(s))")
 
 
 @_tool
@@ -247,7 +275,7 @@ def append_clips(
     names: list[str], start_frame: int | None = None, end_frame: int | None = None, track: int = 1
 ) -> str:
     """Append media-pool clips (by name, in order) to the end of the current timeline.
-    start_frame/end_frame (clip-relative, end exclusive) make a subclip of each clip."""
+    start_frame/end_frame (clip-relative, both inclusive) make a subclip of each clip."""
     proj, tl = _timeline()
     pool = proj.GetMediaPool()
     by_name = _clips_by_name(proj)
@@ -287,10 +315,7 @@ def set_item_properties(item: int, properties: dict, track: int = 1) -> dict:
     """Set effect properties on a video timeline item (1-based index from list_items).
     Keys: ZoomX ZoomY Pan Tilt RotationAngle Opacity CropLeft CropRight CropTop CropBottom FlipX FlipY CompositeMode ..."""
     _, tl = _timeline()
-    items = tl.GetItemListInTrack("video", track) or []
-    if not 1 <= item <= len(items):
-        raise ToolError(f"item {item} not found on video track {track}")
-    it = items[item - 1]
+    it = _item(tl, item, track)
     failed = [k for k, v in properties.items() if not it.SetProperty(k, v)]
     if failed:
         raise ToolError(f"SetProperty failed for: {', '.join(failed)} (bad key or out-of-range value?)")
@@ -333,11 +358,22 @@ def list_render_presets() -> list[str]:
 
 
 @_tool
-def render(target_dir: str, preset: str | None = None, file_name: str | None = None) -> dict:
-    """Queue and start rendering the current timeline. Returns the job id; progress is visible in Resolve."""
+def render(
+    target_dir: str,
+    preset: str | None = None,
+    file_name: str | None = None,
+    format: str | None = None,
+    codec: str | None = None,
+) -> dict:
+    """Queue and start rendering the current timeline. Returns the job id; progress is visible in Resolve.
+    format/codec (see list_render_formats) override the preset's; both must be given together."""
+    if (format is None) != (codec is None):
+        raise ToolError("format and codec must be given together")
     _, proj = _project()
     if preset and not proj.LoadRenderPreset(preset):
         raise ToolError(f"unknown render preset: {preset}")
+    if format and not proj.SetCurrentRenderFormatAndCodec(format, codec):
+        raise ToolError(f"unsupported format/codec: {format}/{codec} (see list_render_formats)")
     settings = {"TargetDir": os.path.abspath(target_dir)}
     if file_name:
         settings["CustomName"] = file_name
@@ -354,6 +390,201 @@ def render_status(job: str) -> dict:
     """Progress of a render job started with `render`."""
     _, proj = _project()
     return proj.GetRenderJobStatus(job)
+
+
+@_tool
+def list_render_formats() -> dict:
+    """Render formats with their file extension and codecs ({codec name: description}), for `render`."""
+    _, proj = _project()
+    return {
+        fmt: {"extension": ext, "codecs": {name: desc for desc, name in (proj.GetRenderCodecs(fmt) or {}).items()}}
+        for fmt, ext in (proj.GetRenderFormats() or {}).items()
+    }
+
+
+@_tool
+def stop_render() -> str:
+    """Stop any render in progress."""
+    _, proj = _project()
+    if not proj.IsRenderingInProgress():
+        return "nothing rendering"
+    proj.StopRendering()
+    return "stopped"
+
+
+PAGES = ("media", "cut", "edit", "fusion", "color", "fairlight", "deliver")
+
+
+@_tool
+def open_page(page: str) -> str:
+    """Switch Resolve to a page: media, cut, edit, fusion, color, fairlight or deliver."""
+    if page not in PAGES:
+        raise ToolError(f"unknown page: {page} (one of {', '.join(PAGES)})")
+    if not _resolve().OpenPage(page):
+        raise ToolError(f"cannot open page: {page}")
+    return f"page: {page}"
+
+
+@_tool
+def color_info(item: int | None = None, track: int = 1) -> dict:
+    """Grade state of a video item (1-based index from list_items; default: the item under the playhead):
+    nodes with label and LUT, current and available color versions, and color group."""
+    _, tl = _timeline()
+    it = _item(tl, item, track) if item is not None else tl.GetCurrentVideoItem()
+    if not it:
+        raise ToolError("no video item under the playhead")
+    graph = _graph(it)
+    try:
+        group = it.GetColorGroup()  # Resolve 18+
+    except AttributeError:
+        group = None
+    return {
+        "item": it.GetName(),
+        "nodes": [
+            {"index": n, "label": graph.GetNodeLabel(n) or "", "lut": graph.GetLUT(n) or None}
+            for n in range(1, int(graph.GetNumNodes() or 0) + 1)
+        ],
+        "version": it.GetCurrentVersion(),
+        "local_versions": list(it.GetVersionNameList(0) or []),
+        "remote_versions": list(it.GetVersionNameList(1) or []),
+        "color_group": group.GetName() if group else None,
+    }
+
+
+@_tool
+def apply_lut(item: int, lut_path: str, node: int = 1, track: int = 1) -> str:
+    """Set a LUT on a node (1-based) of a video item. lut_path is absolute, or relative to Resolve's LUT folders;
+    Resolve only accepts LUTs it has already discovered (Project Settings → Color Management → Update Lists)."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    _check_node(it, node)
+    if not _graph(it).SetLUT(node, lut_path):
+        raise ToolError(f"SetLUT failed for {lut_path} (unknown to Resolve?)")
+    return f"LUT on node {node} of '{it.GetName()}': {lut_path}"
+
+
+def _rgb(name, v):
+    if len(v) != 3:
+        raise ToolError(f"{name} needs 3 values (R G B), got {len(v)}")
+    return " ".join(str(float(x)) for x in v)
+
+
+@_tool
+def set_cdl(
+    item: int,
+    slope: list[float] = [1.0, 1.0, 1.0],
+    offset: list[float] = [0.0, 0.0, 0.0],
+    power: list[float] = [1.0, 1.0, 1.0],
+    saturation: float = 1.0,
+    node: int = 1,
+    track: int = 1,
+) -> dict:
+    """Apply an ASC CDL (slope/offset/power per R G B, plus saturation) to a node (1-based) of a video item."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    _check_node(it, node)
+    cdl = {
+        "NodeIndex": str(node),
+        "Slope": _rgb("slope", slope),
+        "Offset": _rgb("offset", offset),
+        "Power": _rgb("power", power),
+        "Saturation": str(float(saturation)),
+    }
+    if not it.SetCDL(cdl):
+        raise ToolError("SetCDL failed")
+    return {"item": it.GetName(), "cdl": cdl}
+
+
+@_tool
+def copy_grade(source: int, targets: list[int], track: int = 1) -> str:
+    """Copy the grade of one video item to others (1-based indexes on the same track)."""
+    _, tl = _timeline()
+    src = _item(tl, source, track)
+    dst = [_item(tl, t, track) for t in targets]
+    if not dst:
+        raise ToolError("no targets given")
+    if not src.CopyGrades(dst):
+        raise ToolError("CopyGrades failed")
+    return f"copied grade of '{src.GetName()}' to {len(dst)} item(s)"
+
+
+DRX_MODES = {"none": 0, "source_timecode": 1, "start_frames": 2}
+
+
+@_tool
+def apply_drx(path: str, items: list[int], keyframes: str = "none", track: int = 1) -> str:
+    """Apply a grade from a .drx still file to video items (1-based indexes).
+    keyframes: none | source_timecode | start_frames (how keyframes in the still are aligned)."""
+    _, tl = _timeline()
+    if keyframes not in DRX_MODES:
+        raise ToolError(f"unknown keyframes mode: {keyframes} (one of {', '.join(DRX_MODES)})")
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        raise ToolError(f"file not found: {path}")
+    targets = [_item(tl, i, track) for i in items]
+    if not targets:
+        raise ToolError("no items given")
+    if not tl.ApplyGradeFromDRX(path, DRX_MODES[keyframes], targets):
+        raise ToolError("ApplyGradeFromDRX failed")
+    return f"applied {os.path.basename(path)} to {len(targets)} item(s)"
+
+
+@_tool
+def add_color_version(item: int, name: str, remote: bool = False, track: int = 1) -> str:
+    """Add a named color version to a video item (local by default) and make it current."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    if not it.AddVersion(name, int(remote)):
+        raise ToolError(f"cannot add version (name taken?): {name}")
+    return f"added {'remote' if remote else 'local'} version '{name}' to '{it.GetName()}'"
+
+
+@_tool
+def load_color_version(item: int, name: str, remote: bool = False, track: int = 1) -> str:
+    """Make a named color version of a video item current."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    if not it.LoadVersionByName(name, int(remote)):
+        raise ToolError(f"version not found: {name} (see color_info)")
+    return f"loaded version '{name}' on '{it.GetName()}'"
+
+
+@_tool
+def export_lut(item: int, path: str, size: int = 33, track: int = 1) -> str:
+    """Export a video item's grade as a .cube LUT (size 17, 33 or 65 points). Needs Resolve 18 or later."""
+    resolve = _resolve()
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    kind = {17: "EXPORT_LUT_17PTCUBE", 33: "EXPORT_LUT_33PTCUBE", 65: "EXPORT_LUT_65PTCUBE"}.get(size)
+    if not kind:
+        raise ToolError(f"unsupported LUT size: {size} (17, 33 or 65)")
+    path = os.path.abspath(path)
+    if not it.ExportLUT(getattr(resolve, kind), path):
+        raise ToolError(f"ExportLUT failed: {path}")
+    return f"exported {size}-point LUT of '{it.GetName()}' to {path}"
+
+
+STILL_FORMATS = ("dpx", "cin", "tif", "jpg", "png", "ppm", "bmp", "xpm")
+
+
+@_tool
+def grab_still(export_dir: str | None = None, prefix: str = "still", format: str = "png") -> dict:
+    """Grab a still of the frame under the playhead into the current gallery album (Color page must be open;
+    see open_page). With export_dir, also write it as an image (dpx cin tif jpg png ppm bmp xpm)."""
+    proj, tl = _timeline()
+    if export_dir and format not in STILL_FORMATS:
+        raise ToolError(f"unsupported still format: {format} (one of {', '.join(STILL_FORMATS)})")
+    still = tl.GrabStill()
+    if not still:
+        raise ToolError("GrabStill failed (is the Color page open?)")
+    out = {"grabbed": True, "exported_to": None}
+    if export_dir:
+        export_dir = os.path.abspath(export_dir)
+        album = proj.GetGallery().GetCurrentStillAlbum()
+        if not album or not album.ExportStills([still], export_dir, prefix, format):
+            raise ToolError(f"still grabbed but export to {export_dir} failed")
+        out["exported_to"] = export_dir
+    return out
 
 
 if __name__ == "__main__":

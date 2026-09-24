@@ -31,6 +31,14 @@ def test_not_running(monkeypatch, resolve):
         d.status()
 
 
+def test_not_installed(monkeypatch):
+    # No fake module: the real import fails the way it does on a machine without Resolve.
+    monkeypatch.delitem(d.sys.modules, "DaVinciResolveScript", raising=False)
+    monkeypatch.setenv("RESOLVE_SCRIPT_API", "/nonexistent/Scripting")
+    with pytest.raises(ToolError, match="is DaVinci Resolve installed"):
+        d.status()
+
+
 def test_no_project_open(resolve):
     with pytest.raises(ToolError, match="no project open"):
         d.list_clips()
@@ -159,6 +167,8 @@ def test_all_tools_registered():
         "status", "list_projects", "open_project", "create_project", "import_media", "list_clips",
         "list_timelines", "create_timeline", "switch_timeline", "append_clips", "list_items",
         "set_item_properties", "insert_title", "add_marker", "list_render_presets", "render", "render_status",
+        "list_render_formats", "stop_render", "open_page", "color_info", "apply_lut", "set_cdl", "copy_grade",
+        "apply_drx", "add_color_version", "load_color_version", "export_lut", "grab_still",
     }
 
 
@@ -228,3 +238,176 @@ def test_setup_logging_ignores_bad_level(monkeypatch):
     monkeypatch.setattr(d.log, "level", logging.NOTSET)
     d._setup_logging()
     assert d.log.level == logging.INFO
+
+
+# --- color grading ---
+
+
+def _two_items(project):
+    d.append_clips(["a.mov", "b.mov"])
+    return project.current.tracks[("video", 1)]
+
+
+def test_open_page(resolve):
+    assert d.open_page("color") == "page: color"
+    assert resolve.page == "color"
+    with pytest.raises(ToolError, match="unknown page"):
+        d.open_page("colour")
+
+
+def test_color_info(project):
+    a, _ = _two_items(project)
+    a.graph.luts[2] = "Film/Kodak.cube"
+    assert d.color_info(1) == {
+        "item": "a.mov",
+        "nodes": [{"index": 1, "label": "Primary", "lut": None}, {"index": 2, "label": "Look", "lut": "Film/Kodak.cube"}],
+        "version": {"versionName": "Version 1", "versionType": 0},
+        "local_versions": ["Version 1"],
+        "remote_versions": [],
+        "color_group": None,
+    }
+
+
+def test_color_info_defaults_to_playhead_item(project):
+    _, b = _two_items(project)
+    from conftest import ColorGroup
+
+    b.color_group = ColorGroup("Interview")
+    project.current.playhead_item = b
+    info = d.color_info()
+    assert (info["item"], info["color_group"]) == ("b.mov", "Interview")
+
+
+def test_color_info_nothing_under_playhead(project):
+    with pytest.raises(ToolError, match="no video item under the playhead"):
+        d.color_info()
+
+
+def test_color_info_pre_19_item_without_graph(project, monkeypatch):
+    a, _ = _two_items(project)
+    # Before Resolve 19 there is no GetNodeGraph/GetColorGroup; node calls live on the item.
+    monkeypatch.delattr(type(a), "GetNodeGraph")
+    monkeypatch.delattr(type(a), "GetColorGroup")
+    a.GetNumNodes = lambda: 1
+    a.GetNodeLabel = lambda n: "Old"
+    a.GetLUT = lambda n: ""
+    info = d.color_info(1)
+    assert info["nodes"] == [{"index": 1, "label": "Old", "lut": None}]
+    assert info["color_group"] is None
+
+
+def test_apply_lut(project):
+    a, _ = _two_items(project)
+    assert d.apply_lut(1, "Film/Kodak.cube", node=2) == "LUT on node 2 of 'a.mov': Film/Kodak.cube"
+    assert a.graph.luts == {2: "Film/Kodak.cube"}
+    with pytest.raises(ToolError, match=r"node 3 out of range \(item has 2 node"):
+        d.apply_lut(1, "Film/Kodak.cube", node=3)
+    with pytest.raises(ToolError, match="SetLUT failed"):
+        d.apply_lut(1, "nope.txt")
+
+
+def test_set_cdl(project):
+    a, _ = _two_items(project)
+    d.set_cdl(1, slope=[1.1, 1, 0.9], offset=[0, 0, 0.02], power=[1, 1, 1], saturation=0.8, node=2)
+    assert a.cdl == {
+        "NodeIndex": "2",
+        "Slope": "1.1 1.0 0.9",
+        "Offset": "0.0 0.0 0.02",
+        "Power": "1.0 1.0 1.0",
+        "Saturation": "0.8",
+    }
+    with pytest.raises(ToolError, match="slope needs 3 values"):
+        d.set_cdl(1, slope=[1, 1])
+
+
+def test_set_cdl_defaults_are_identity(project):
+    a, _ = _two_items(project)
+    d.set_cdl(1)
+    assert (a.cdl["Slope"], a.cdl["Offset"], a.cdl["Power"], a.cdl["Saturation"]) == (
+        "1.0 1.0 1.0", "0.0 0.0 0.0", "1.0 1.0 1.0", "1.0",
+    )
+
+
+def test_copy_grade(project):
+    a, b = _two_items(project)
+    assert d.copy_grade(1, [2]) == "copied grade of 'a.mov' to 1 item(s)"
+    assert a.copied_to == [b]
+    with pytest.raises(ToolError, match="item 5 not found"):
+        d.copy_grade(1, [5])
+    with pytest.raises(ToolError, match="no targets"):
+        d.copy_grade(1, [])
+
+
+def test_apply_drx(project, tmp_path):
+    a, b = _two_items(project)
+    drx = tmp_path / "look.drx"
+    drx.write_text("")
+    assert d.apply_drx(str(drx), [1, 2], keyframes="source_timecode") == "applied look.drx to 2 item(s)"
+    assert project.current.drx == (str(drx), 1, [a, b])
+    with pytest.raises(ToolError, match="unknown keyframes mode"):
+        d.apply_drx(str(drx), [1], keyframes="tc")
+    with pytest.raises(ToolError, match="file not found"):
+        d.apply_drx(str(tmp_path / "missing.drx"), [1])
+
+
+def test_color_versions(project):
+    a, _ = _two_items(project)
+    assert d.add_color_version(1, "Warm") == "added local version 'Warm' to 'a.mov'"
+    assert a.version == {"versionName": "Warm", "versionType": 0}
+    with pytest.raises(ToolError, match="name taken"):
+        d.add_color_version(1, "Warm")
+    d.add_color_version(1, "Client", remote=True)
+    assert a.versions[1] == ["Client"]
+    assert d.load_color_version(1, "Version 1") == "loaded version 'Version 1' on 'a.mov'"
+    assert a.version["versionName"] == "Version 1"
+    with pytest.raises(ToolError, match="version not found"):
+        d.load_color_version(1, "Client")  # it is remote, not local
+
+
+def test_export_lut(project, tmp_path, resolve):
+    a, _ = _two_items(project)
+    out = tmp_path / "grade.cube"
+    d.export_lut(1, str(out), size=65)
+    assert a.exported_lut == (resolve.EXPORT_LUT_65PTCUBE, str(out))
+    with pytest.raises(ToolError, match="unsupported LUT size"):
+        d.export_lut(1, str(out), size=32)
+
+
+def test_grab_still(project, tmp_path):
+    assert d.grab_still() == {"grabbed": True, "exported_to": None}
+    out = d.grab_still(str(tmp_path), prefix="shot", format="tif")
+    assert out["exported_to"] == str(tmp_path)
+    (stills, folder, prefix, fmt), = project.gallery.album.exported
+    assert (len(stills), folder, prefix, fmt) == (1, str(tmp_path), "shot", "tif")
+    with pytest.raises(ToolError, match="unsupported still format"):
+        d.grab_still(str(tmp_path), format="webp")
+    project.current.page_is_color = False
+    with pytest.raises(ToolError, match="is the Color page open"):
+        d.grab_still()
+
+
+# --- render formats ---
+
+
+def test_list_render_formats(project):
+    assert d.list_render_formats() == {
+        "QuickTime": {"extension": "mov", "codecs": {"ProRes422HQ": "Apple ProRes 422 HQ", "H264": "H.264"}},
+        "MP4": {"extension": "mp4", "codecs": {"H264": "H.264"}},
+    }
+
+
+def test_render_with_format_and_codec(project, tmp_path):
+    d.render(str(tmp_path), format="QuickTime", codec="ProRes422HQ")
+    assert project.format_codec == ("QuickTime", "ProRes422HQ")
+    with pytest.raises(ToolError, match="must be given together"):
+        d.render(str(tmp_path), preset="YouTube 1080p", format="QuickTime")
+    assert project.loaded_preset is None  # rejected before touching the project
+    with pytest.raises(ToolError, match="unsupported format/codec"):
+        d.render(str(tmp_path), format="MP4", codec="ProRes422HQ")
+
+
+def test_stop_render(project, tmp_path):
+    assert d.stop_render() == "nothing rendering"
+    d.render(str(tmp_path))
+    assert d.stop_render() == "stopped"
+    assert project.rendering is False

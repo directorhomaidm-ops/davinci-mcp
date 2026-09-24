@@ -18,7 +18,7 @@ Claude Desktop / any MCP client:
 
 ## Tools
 
-All frames are absolute timeline frames unless noted. Item and track indexes are 1-based. A failed call returns an MCP tool error with the reason. Common ones: `cannot connect — is DaVinci Resolve running?`, `no project open`, `no timeline open`.
+All frames are absolute timeline frames unless noted. Item and track indexes are 1-based. A failed call returns an MCP tool error with the reason. Common ones: `cannot load Resolve scripting module … is DaVinci Resolve installed?`, `cannot connect — is DaVinci Resolve running?`, `no project open`, `no timeline open`.
 
 ### Projects
 
@@ -51,7 +51,7 @@ All frames are absolute timeline frames unless noted. Item and track indexes are
 
 Notes:
 
-- `append_clips` appends to the end of the current timeline in the order given. Without `start_frame`/`end_frame` whole clips are used and `track` is ignored. With either set, each clip is trimmed to `start_frame`–`end_frame` (clip-relative; defaults `0` and the clip's last frame, passed to Resolve as `startFrame`/`endFrame`) and placed on `track`.
+- `append_clips` appends to the end of the current timeline in the order given. Without `start_frame`/`end_frame` whole clips are used and `track` is ignored. With either set, each clip is trimmed to `start_frame`–`end_frame` (clip-relative, both inclusive: `0`–`23` is the first 24 frames; defaults `0` and the clip's last frame) and placed on `track`.
 - `set_item_properties` works on video tracks only. Typical keys: `ZoomX` `ZoomY` `Pan` `Tilt` `RotationAngle` `Opacity` `CropLeft` `CropRight` `CropTop` `CropBottom` `FlipX` `FlipY` `CompositeMode`.
 - `insert_title` inserts at the playhead. `text` is applied only when `fusion=True` and the Fusion title has a `Template` tool; `text_set` says whether it was.
 - `add_marker` takes `frame` relative to the timeline start, not an absolute frame. `note` is used as the marker name too (or `frame <n>` when empty).
@@ -61,8 +61,36 @@ Notes:
 | Tool | Parameters | Returns | Errors |
 |---|---|---|---|
 | `list_render_presets` | — | Preset names | |
-| `render` | `target_dir: str`, `preset: str \| None`, `file_name: str \| None` | `{job, target_dir}`; rendering starts immediately | Unknown preset; job could not be queued |
+| `list_render_formats` | — | `{format: {extension, codecs: {codec: description}}}` | |
+| `render` | `target_dir: str`, `preset: str \| None`, `file_name: str \| None`, `format: str \| None`, `codec: str \| None` | `{job, target_dir}`; rendering starts immediately | Unknown preset; only one of `format`/`codec` given; unsupported format/codec; job could not be queued |
 | `render_status` | `job: str` (from `render`) | Resolve's job status dict, e.g. `{JobStatus, CompletionPercentage}` | |
+| `stop_render` | — | `"stopped"` or `"nothing rendering"` | |
+
+`format`/`codec` take the keys from `list_render_formats` (e.g. `QuickTime` + `ProRes422HQ`) and are applied after `preset`, so they override it.
+
+### Color grading
+
+`item` is the 1-based index from `list_items` on video `track` (default 1). `node` is 1-based.
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `open_page` | `page: str` (`media`, `cut`, `edit`, `fusion`, `color`, `fairlight`, `deliver`) | `"page: <page>"` | Unknown page |
+| `color_info` | `item: int \| None` (default: item under the playhead), `track: int = 1` | `{item, nodes: [{index, label, lut}], version, local_versions, remote_versions, color_group}` | Nothing under the playhead |
+| `apply_lut` | `item: int`, `lut_path: str`, `node: int = 1`, `track: int = 1` | Confirmation string | Node out of range; LUT unknown to Resolve |
+| `set_cdl` | `item: int`, `slope`, `offset`, `power: list[float]` (R G B), `saturation: float`, `node: int = 1`, `track: int = 1` | `{item, cdl}` | Not 3 values; node out of range |
+| `copy_grade` | `source: int`, `targets: list[int]`, `track: int = 1` | Confirmation string | Item not found; empty `targets` |
+| `apply_drx` | `path: str` (.drx still), `items: list[int]`, `keyframes: "none" \| "source_timecode" \| "start_frames" = "none"`, `track: int = 1` | Confirmation string | File missing; item not found |
+| `add_color_version` | `item: int`, `name: str`, `remote: bool = False`, `track: int = 1` | Confirmation string; the new version becomes current | Name taken |
+| `load_color_version` | `item: int`, `name: str`, `remote: bool = False`, `track: int = 1` | Confirmation string | Version not found |
+| `export_lut` | `item: int`, `path: str`, `size: 17 \| 33 \| 65 = 33`, `track: int = 1` | Confirmation string | Unsupported size; export rejected |
+| `grab_still` | `export_dir: str \| None`, `prefix: str = "still"`, `format: str = "png"` | `{grabbed, exported_to}` | Color page not open; unsupported format; export failed |
+
+Notes:
+
+- `set_cdl` defaults are the identity grade (slope 1, offset 0, power 1, saturation 1), so pass only what you change.
+- `apply_lut` only accepts LUTs Resolve has already indexed. After copying a new `.cube` into a LUT folder, run *Project Settings → Color Management → Update Lists* first.
+- `grab_still` needs the Color page open (`open_page("color")`). The still goes into the current gallery album; with `export_dir` it is also written as an image (`dpx` `cin` `tif` `jpg` `png` `ppm` `bmp` `xpm`).
+- `export_lut` needs Resolve 18 or later. Node reads/writes use Resolve 19's node graph when present and fall back to the older per-item calls on earlier versions.
 
 ## Configuration
 
