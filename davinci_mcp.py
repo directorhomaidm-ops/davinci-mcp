@@ -49,7 +49,7 @@ mcp = MCPServer(
     "davinci",
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
     "clip properties, transitions, titles, markers, color grading and management, HDR, Fusion compositing, audio, "
-    "media management, "
+    "media management, projects and review notes, "
     "interchange export and rendering. "
     "Start with timeline_overview to see the edit and view_frame to see the picture. "
     "Frames are absolute timeline frames.",
@@ -128,6 +128,17 @@ def _resolve():
     if not resolve:
         raise ToolError("cannot connect — is DaVinci Resolve running?")
     return resolve
+
+
+UNTITLED = "Untitled Project"
+
+
+def _save_current(pm):
+    """Save the current project before anything that replaces or closes it. The default Untitled Project is
+    skipped: SaveProject cannot succeed on it (False in the GUI, an endless hang headless)."""
+    proj = pm.GetCurrentProject()
+    if proj and proj.GetName() != UNTITLED and not pm.SaveProject():
+        raise ToolError(f"could not save the current project '{proj.GetName()}'; nothing was switched")
 
 
 def _project():
@@ -254,17 +265,22 @@ def list_projects() -> list[str]:
 
 @_tool
 def open_project(name: str) -> str:
-    """Open a project by name."""
-    if not _resolve().GetProjectManager().LoadProject(name):
+    """Open a project by name. The current project is saved first."""
+    pm = _resolve().GetProjectManager()
+    _save_current(pm)
+    if not pm.LoadProject(name):
         raise ToolError(f"cannot open project: {name}")
     return f"opened: {name}"
 
 
 @_tool
 def create_project(name: str) -> str:
-    """Create and open a new project."""
-    if not _resolve().GetProjectManager().CreateProject(name):
-        raise ToolError(f"cannot create project (already exists?): {name}")
+    """Create and open a new project. The current project is saved first: CreateProject replaces it, and an
+    unsaved one would be lost."""
+    pm = _resolve().GetProjectManager()
+    _save_current(pm)
+    if not pm.CreateProject(name):
+        raise ToolError(f"cannot create project: {name} (name taken, or the current project blocks the switch)")
     return f"created: {name}"
 
 
@@ -2047,7 +2063,10 @@ def import_timeline(
 def save_project() -> str:
     """Save the current project."""
     pm = _resolve().GetProjectManager()
-    _project()
+    _, proj = _project()
+    if proj.GetName() == UNTITLED:
+        raise ToolError("the default Untitled Project cannot be saved from a script (Resolve needs a Save As "
+                        "dialog); use create_project to work in a named project")
     if not pm.SaveProject():
         raise ToolError("SaveProject failed")
     return "project saved"
@@ -2290,6 +2309,346 @@ def analyze_dolby_vision(items: list[int] | None = None, blend_shots: bool = Fal
     if not ok:
         raise ToolError("AnalyzeDolbyVision failed (Studio only)")
     return f"Dolby Vision analysis started on {f'{len(items)} item(s)' if items else 'the whole timeline'}"
+
+
+
+# --- Projects, databases and Blackmagic Cloud ---
+
+
+@_tool
+def project_browser(folder: str | None = None) -> dict:
+    """The project manager: current database and project, and the folders and projects in a project-manager folder.
+    `folder` is a path from the root ("Clients/Acme"); "/" is the root; omitted, the current folder. Navigating makes
+    that folder current, which is where list_projects, create_project and import_project act."""
+    pm = _resolve().GetProjectManager()
+    if folder is not None:
+        pm.GotoRootFolder()
+        for part in [p for p in folder.strip("/").split("/") if p]:
+            if not pm.OpenFolder(part):
+                pm.GotoRootFolder()  # never leave the project manager half-way down a wrong path
+                raise ToolError(f"project folder not found: {part} (in {folder}); now at the root folder")
+    cur = pm.GetCurrentProject()
+    return {
+        "database": pm.GetCurrentDatabase(),
+        "folder": pm.GetCurrentFolder(),
+        "folders": list(pm.GetFolderListInCurrentFolder() or []),
+        "projects": list(pm.GetProjectListInCurrentFolder() or []),
+        "current_project": cur.GetName() if cur else None,
+    }
+
+
+@_tool
+def create_project_folder(name: str) -> str:
+    """Create a folder in the current project-manager folder (see project_browser)."""
+    pm = _resolve().GetProjectManager()
+    if not pm.CreateFolder(name):
+        raise ToolError(f"cannot create project folder (already exists?): {name}")
+    return f"created project folder {name}"
+
+
+@_tool
+def rename_project(new_name: str) -> str:
+    """Rename the current project."""
+    _, proj = _project()
+    old = proj.GetName()
+    if not proj.SetName(new_name):
+        raise ToolError(f"cannot rename to {new_name} (name taken?)")
+    return f"renamed project {old} → {new_name}"
+
+
+@_tool
+def delete_project(name: str) -> str:
+    """Delete a project in the current project-manager folder. The open project cannot be deleted: open another
+    first. Irreversible."""
+    pm = _resolve().GetProjectManager()
+    cur = pm.GetCurrentProject()
+    if cur and cur.GetName() == name:
+        raise ToolError(f"{name} is the open project: open another project first")
+    if name not in (pm.GetProjectListInCurrentFolder() or []):
+        raise ToolError(f"project not found in the current folder: {name} (see project_browser)")
+    # The first attempt is flaky on live Resolve; one retry.
+    if not (pm.DeleteProject(name) or pm.DeleteProject(name)):
+        raise ToolError(f"Resolve refused to delete {name} (it may still be held from being open earlier)")
+    return f"deleted project {name}"
+
+
+@_tool
+def list_databases() -> dict:
+    """Project databases known to Resolve (local disk and PostgreSQL servers) and the current one."""
+    pm = _resolve().GetProjectManager()
+    return {"current": pm.GetCurrentDatabase(), "databases": list(pm.GetDatabaseList() or [])}
+
+
+@_tool
+def switch_database(name: str, db_type: str | None = None) -> dict:
+    """Switch to another project database by name (db_type "Disk" or "PostgreSQL" when names repeat). Resolve
+    closes the open project; it is saved first."""
+    pm = _resolve().GetProjectManager()
+    matches = [db for db in (pm.GetDatabaseList() or []) if db.get("DbName") == name
+               and (db_type is None or db.get("DbType") == db_type)]
+    if not matches:
+        raise ToolError(f"database not found: {name} (see list_databases)")
+    if len(matches) > 1:
+        raise ToolError(f"several databases are named {name}: pass db_type")
+    _save_current(pm)
+    if not pm.SetCurrentDatabase(matches[0]) or (pm.GetCurrentDatabase() or {}).get("DbName") != name:
+        raise ToolError(f"could not switch to database {name}")
+    return {"database": pm.GetCurrentDatabase(), "projects": list(pm.GetProjectListInCurrentFolder() or [])}
+
+
+CLOUD_SYNC = {"none": "CLOUD_SYNC_NONE", "proxy_only": "CLOUD_SYNC_PROXY_ONLY", "proxy_and_original": "CLOUD_SYNC_PROXY_AND_ORIG"}
+
+
+def _cloud_settings(resolve, name, media_path, sync, collaboration=None, camera_access=None):
+    if sync not in CLOUD_SYNC:
+        raise ToolError(f"sync must be one of: {', '.join(CLOUD_SYNC)}")
+    media_path = os.path.abspath(media_path)
+    if not os.path.isdir(media_path):
+        raise ToolError(f"media folder not found: {media_path}")
+    # Enum-keyed: plain string keys are silently rejected.
+    settings = {
+        _constant(resolve, "CLOUD_SETTING_PROJECT_NAME"): name,
+        _constant(resolve, "CLOUD_SETTING_PROJECT_MEDIA_PATH"): media_path,
+        _constant(resolve, "CLOUD_SETTING_SYNC_MODE"): _constant(resolve, CLOUD_SYNC[sync]),
+    }
+    if collaboration is not None:
+        settings[_constant(resolve, "CLOUD_SETTING_IS_COLLAB")] = collaboration
+    if camera_access is not None:
+        settings[_constant(resolve, "CLOUD_SETTING_IS_CAMERA_ACCESS")] = camera_access
+    return settings
+
+
+@_tool
+def create_cloud_project(
+    name: str, media_path: str, collaboration: bool = True, sync: str = "proxy_only", camera_access: bool = False
+) -> str:
+    """Create a Blackmagic Cloud project and open it (the current project is saved first). collaboration=True turns
+    on multi-user collaboration; sync: none, proxy_only or proxy_and_original; media_path is this machine's local
+    media folder. Signed-in Blackmagic Cloud account needed. Inviting collaborators is only possible in the UI."""
+    resolve = _resolve()
+    pm = resolve.GetProjectManager()
+    settings = _cloud_settings(resolve, name, media_path, sync, collaboration, camera_access)
+    _save_current(pm)
+    proj = _method(pm, "CreateCloudProject", "18")(settings)
+    if not proj:
+        raise ToolError(f"could not create cloud project {name} (signed in to Blackmagic Cloud? name taken?)")
+    return f"created and opened cloud project {proj.GetName()}"
+
+
+@_tool
+def load_cloud_project(name: str, media_path: str, sync: str = "proxy_only") -> str:
+    """Open an existing Blackmagic Cloud project (the current project is saved first). media_path is where its media
+    lives or syncs to on this machine."""
+    resolve = _resolve()
+    pm = resolve.GetProjectManager()
+    settings = _cloud_settings(resolve, name, media_path, sync)
+    _save_current(pm)
+    proj = _method(pm, "LoadCloudProject", "18")(settings)
+    if not proj:
+        raise ToolError(f"cloud project not found or not shared with this account: {name}")
+    return f"opened cloud project {proj.GetName()}"
+
+
+@_tool
+def refresh_collaboration() -> dict:
+    """In a collaboration project, pull other editors' changes into the media pool and report bins that are still
+    out of date."""
+    _, proj = _project()
+    pool = proj.GetMediaPool()
+    if not pool.RefreshFolders():
+        raise ToolError("RefreshFolders failed (is this a collaboration project?)")
+    stale = []
+
+    def walk(folder, path):
+        if _opt(folder, "GetIsFolderStale"):
+            stale.append(path or "/")
+        for f in folder.GetSubFolderList() or []:
+            walk(f, f"{path}/{f.GetName()}".lstrip("/"))
+
+    walk(pool.GetRootFolder(), "")
+    return {"refreshed": True, "stale_bins": stale}
+
+
+# --- Timelines ---
+
+
+def _find_timeline(proj, name):
+    for i in range(1, int(proj.GetTimelineCount()) + 1):
+        tl = proj.GetTimelineByIndex(i)
+        if tl.GetName() == name:
+            return tl
+    raise ToolError(f"timeline not found: {name} (see list_timelines)")
+
+
+@_tool
+def duplicate_timeline(new_name: str, timeline: str | None = None) -> dict:
+    """Copy a timeline (default: the current one) under a new name, e.g. to keep a version before big changes. The
+    current timeline stays current."""
+    proj, cur = _timeline()
+    source = _find_timeline(proj, timeline) if timeline else cur
+    if any(proj.GetTimelineByIndex(i).GetName() == new_name for i in range(1, int(proj.GetTimelineCount()) + 1)):
+        raise ToolError(f"a timeline named {new_name} already exists")
+    copy = source.DuplicateTimeline(new_name)
+    # DuplicateTimeline silently makes the copy current; put the user's timeline back.
+    if not proj.SetCurrentTimeline(cur):
+        raise ToolError(f"duplicated to {new_name}, but could not make '{cur.GetName()}' current again")
+    if not copy:
+        raise ToolError("DuplicateTimeline failed")
+    return {"copy": copy.GetName(), "of": source.GetName(), "current": cur.GetName()}
+
+
+@_tool
+def rename_timeline(new_name: str, timeline: str | None = None) -> str:
+    """Rename a timeline (default: the current one)."""
+    proj, cur = _timeline()
+    tl = _find_timeline(proj, timeline) if timeline else cur
+    old = tl.GetName()
+    if not tl.SetName(new_name):
+        raise ToolError(f"cannot rename to {new_name} (name taken?)")
+    return f"renamed timeline {old} → {new_name}"
+
+
+@_tool
+def delete_timelines(names: list[str]) -> str:
+    """Delete timelines by name. Irreversible; duplicate_timeline first to keep a copy."""
+    _, proj = _project()
+    targets = [_find_timeline(proj, n) for n in names]
+    if not targets:
+        raise ToolError("no timelines given")
+    if len(targets) == int(proj.GetTimelineCount()):
+        raise ToolError("refusing to delete every timeline in the project")
+    if not proj.GetMediaPool().DeleteTimelines(targets):
+        raise ToolError("DeleteTimelines failed")
+    return f"deleted {len(targets)} timeline(s)"
+
+
+# --- Review notes (timeline markers) ---
+#
+# Review notes are timeline markers whose customData carries {"author", "status"}; they show up in Resolve's
+# marker index for everyone on the project, collaboration projects included.
+
+MARKER_COLORS = ("Blue", "Cyan", "Green", "Yellow", "Red", "Pink", "Purple", "Fuchsia", "Rose", "Lavender", "Sky",
+                 "Mint", "Lemon", "Sand", "Cocoa", "Cream")
+
+
+def _note_rows(tl):
+    start = int(tl.GetStartFrame())
+    rows = []
+    for frame, m in sorted((tl.GetMarkers() or {}).items()):
+        try:
+            data = json.loads(m.get("customData") or "{}")
+        except ValueError:
+            data = {}
+        try:
+            tc = _timecode(tl, start + int(frame))
+        except ToolError:
+            tc = None
+        rows.append({"frame": int(frame), "timecode": tc, "color": m.get("color"), "name": m.get("name"),
+                     "note": m.get("note"), "duration": int(m.get("duration") or 1),
+                     "author": data.get("author"), "status": data.get("status")})
+    return rows
+
+
+def _marker_at(tl, frame):
+    markers = {int(f): m for f, m in (tl.GetMarkers() or {}).items()}
+    if frame not in markers:
+        raise ToolError(f"no marker at frame {frame} (see review_notes)")
+    return markers[frame]
+
+
+@_tool
+def review_notes(status: str | None = None) -> list[dict]:
+    """All markers on the current timeline as review notes: frame (relative to the timeline start), timecode, color,
+    name, note, duration, and author/status for notes made with add_review_note. status filters: open, resolved."""
+    _, tl = _timeline()
+    rows = _note_rows(tl)
+    return [r for r in rows if status is None or r["status"] == status]
+
+
+@_tool
+def add_review_note(frame: int, note: str, author: str | None = None, color: str = "Red", duration: int = 1) -> dict:
+    """Leave a review note at `frame` (relative to the timeline start) as a marker, marked open, with its author."""
+    if color not in MARKER_COLORS:
+        raise ToolError(f"unknown marker color: {color} (one of {', '.join(MARKER_COLORS)})")
+    if duration < 1:
+        raise ToolError("duration must be at least 1 frame")
+    _, tl = _timeline()
+    data = json.dumps({"author": author, "status": "open"})
+    name = f"{author}: {note}" if author else note
+    if not tl.AddMarker(frame, color, name[:60], note, duration, data):
+        raise ToolError(f"cannot add a note at frame {frame} (a marker is already there?)")
+    return next(r for r in _note_rows(tl) if r["frame"] == frame)
+
+
+@_tool
+def resolve_review_note(frame: int, reopen: bool = False) -> dict:
+    """Mark the review note at `frame` resolved (it turns green), or reopen it with its original color."""
+    _, tl = _timeline()
+    m = _marker_at(tl, frame)
+    try:
+        data = json.loads(m.get("customData") or "{}")
+    except ValueError:
+        data = {}
+    if reopen:
+        data["status"], color = "open", data.pop("open_color", m.get("color"))
+    else:
+        data.setdefault("open_color", m.get("color"))
+        data["status"], color = "resolved", "Green"
+    # A marker's color can only change by replacing it.
+    if not tl.DeleteMarkerAtFrame(frame):
+        raise ToolError(f"cannot update the marker at frame {frame}")
+    if not tl.AddMarker(frame, color, m.get("name", ""), m.get("note", ""), int(m.get("duration") or 1), json.dumps(data)):
+        tl.AddMarker(frame, m.get("color"), m.get("name", ""), m.get("note", ""), int(m.get("duration") or 1),
+                     m.get("customData") or "")
+        raise ToolError(f"could not rewrite the marker at frame {frame}; the original was put back")
+    return next(r for r in _note_rows(tl) if r["frame"] == frame)
+
+
+@_tool
+def delete_markers(frame: int | None = None, color: str | None = None) -> str:
+    """Delete the marker at `frame`, or every marker of a `color` ("All" for every marker) on the current timeline."""
+    if (frame is None) == (color is None):
+        raise ToolError("give frame or color")
+    _, tl = _timeline()
+    if frame is not None:
+        _marker_at(tl, frame)
+        if not tl.DeleteMarkerAtFrame(frame):
+            raise ToolError(f"cannot delete the marker at frame {frame}")
+        return f"deleted marker at frame {frame}"
+    if color != "All" and color not in MARKER_COLORS:
+        raise ToolError(f"unknown marker color: {color}")
+    before = len(tl.GetMarkers() or {})
+    if not tl.DeleteMarkersByColor(color):
+        raise ToolError("DeleteMarkersByColor failed")
+    return f"deleted {before - len(tl.GetMarkers() or {})} marker(s)"
+
+
+@_tool
+def export_review_notes(path: str, status: str | None = None) -> dict:
+    """Write the current timeline's review notes to a .csv (spreadsheets, other editors) or .md (sharing with a
+    client) file, in timeline order. status filters: open, resolved."""
+    import csv
+
+    _, tl = _timeline()
+    rows = [r for r in _note_rows(tl) if status is None or r["status"] == status]
+    path = os.path.abspath(path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".csv", ".md"):
+        raise ToolError("path must end in .csv or .md")
+    if not os.path.isdir(os.path.dirname(path)):
+        raise ToolError(f"folder not found: {os.path.dirname(path)}")
+    cols = ["timecode", "frame", "status", "author", "color", "note"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        if ext == ".csv":
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        else:
+            f.write(f"# Review notes: {tl.GetName()}\n\n| Timecode | Status | Author | Note |\n|---|---|---|---|\n")
+            for r in rows:
+                note = (r["note"] or "").replace("|", "\\|").replace("\n", " ")
+                f.write(f"| {r['timecode'] or r['frame']} | {r['status'] or ''} | {r['author'] or ''} | {note} |\n")
+    return {"timeline": tl.GetName(), "path": path, "notes": len(rows)}
 
 
 if __name__ == "__main__":
