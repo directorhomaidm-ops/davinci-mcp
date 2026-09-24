@@ -8,16 +8,70 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
+UI = {"page": "edit"}
+
+
 class Clip:
-    def __init__(self, name, frames=100):
+    def __init__(self, name, frames=100, path=None):
         self.name, self.frames = name, frames
         self.props, self.transcribed_with = {}, None
+        self.path = path or f"/media/{name}"
+        self.metadata, self.color, self.flags, self.markers, self.proxy = {}, "", [], {}, None
+
+    def GetMetadata(self, key=None):
+        return self.metadata if key is None else self.metadata.get(key, "")
+
+    def SetMetadata(self, values):
+        # Like live Resolve with automatic reel naming: True, but Reel Name is not kept.
+        self.metadata.update({k: v for k, v in values.items() if k != "Reel Name"})
+        return True
+
+    def GetClipColor(self):
+        return self.color
+
+    def SetClipColor(self, color):
+        self.color = color
+        return True
+
+    def ClearClipColor(self):
+        self.color = ""
+        return True
+
+    def AddFlag(self, color):
+        if color not in ("Blue", "Cyan", "Green", "Yellow", "Red", "Pink", "Purple"):
+            return False
+        self.flags.append(color)
+        return True
+
+    def GetFlagList(self):
+        return self.flags
+
+    def ClearFlags(self, color):
+        self.flags = [] if color == "All" else [f for f in self.flags if f != color]
+        return True
+
+    def GetMarkers(self):
+        return self.markers
+
+    def LinkProxyMedia(self, path):
+        self.proxy = path
+        return True
+
+    def UnlinkProxyMedia(self):
+        had, self.proxy = self.proxy, None
+        return had is not None
+
+    def ReplaceClip(self, path):
+        self.path = path
+        return True
 
     def GetName(self):
         return self.name
 
-    def GetClipProperty(self, key):
-        return str(self.frames) if key == "Frames" else self.props.get(key)
+    def GetClipProperty(self, key=None):
+        allp = {"Frames": str(self.frames), "File Path": self.path, "FPS": "24", "Resolution": "1920x1080",
+                "Proxy Media Path": self.proxy or "", "Reel Name": "", **self.props}
+        return allp if key is None else allp.get(key)
 
     def TranscribeAudio(self, speaker_detection=None):
         if self.name.endswith(".wav") or self.name.endswith(".mov"):
@@ -176,6 +230,8 @@ class Item:
         return True
 
     def ExportLUT(self, kind, path):
+        if UI["page"] != "color":
+            return False  # measured: True only from the Color page
         self.exported_lut = (kind, path)
         return True
 
@@ -501,7 +557,16 @@ class Timeline:
     def GetMarkers(self):
         return {float(f): m for f, m in self.markers.items()}
 
+    def Export(self, path, kind, sub):
+        if kind is None or isinstance(kind, str):
+            return False  # plain strings are rejected on live Resolve
+        Path(path).write_text(f"{kind}/{sub}")
+        self.exported = (path, kind, sub)
+        return True
+
     def DeleteClips(self, items, ripple):
+        if UI["page"] == "fairlight":
+            return False  # measured: False on the Fairlight page, every time
         self.deleted = (items, ripple)
         for it in items:
             for track in self.tracks.values():
@@ -587,10 +652,72 @@ class MediaPool:
 
     can_sync = True
 
-    def ImportMedia(self, paths):
-        clips = [Clip(Path(p).name) for p in paths]
-        self.root.clips.extend(clips)
+    def GetCurrentFolder(self):
+        return getattr(self, "current", self.root)
+
+    def SetCurrentFolder(self, folder):
+        self.current = folder
+        return True
+
+    def _folders(self, folder=None):
+        folder = folder or self.root
+        yield folder
+        for f in folder.subfolders:
+            yield from self._folders(f)
+
+    def ImportMedia(self, items):
+        clips = []
+        for it in items:
+            if isinstance(it, dict):
+                stem = Path(it["FilePath"]).name.split("%")[0]
+                clips.append(Clip(f"{stem}[{it['StartIndex']}-{it['EndIndex']}]", it["EndIndex"] - it["StartIndex"] + 1))
+            else:
+                clips.append(Clip(Path(it).name, path=it))
+        self.GetCurrentFolder().clips.extend(clips)
+        self.imported_into = self.GetCurrentFolder().name
         return clips
+
+    def AddSubFolder(self, parent, name):
+        f = Folder(name)
+        parent.subfolders.append(f)
+        return f
+
+    def MoveClips(self, clips, target):
+        for c in clips:
+            for f in self._folders():
+                if c in f.clips:
+                    f.clips.remove(c)
+        target.clips.extend(clips)
+        return True
+
+    def DeleteClips(self, clips):
+        for c in clips:
+            for f in self._folders():
+                if c in f.clips:
+                    f.clips.remove(c)
+        return True
+
+    def RelinkClips(self, clips, folder):
+        for c in clips:
+            c.path = str(Path(folder) / c.name)
+        return True
+
+    def ExportMetadata(self, path, clips):
+        rows = clips or [c for f in self._folders() for c in f.clips]
+        Path(path).write_text("\n".join(c.name for c in rows))
+        return True
+
+    def ImportTimelineFromFile(self, path, options):
+        name = options.get("timelineName") or Path(path).stem
+        if path.endswith(".xml"):
+            name = "Sequence 1"  # FCP7 XML: the file's own sequence name wins
+        existing = next((t for t in self.project.timelines if t.name == name), None)
+        if existing:
+            return existing if path.endswith(".xml") else None
+        tl = Timeline(name)
+        self.project.timelines.append(tl)
+        self.imported_options = options
+        return tl
 
     def CreateEmptyTimeline(self, name):
         if any(t.name == name for t in self.project.timelines):
@@ -643,15 +770,37 @@ class Project:
         return True
 
     def GetRenderFormats(self):
-        return {"QuickTime": "mov", "MP4": "mp4"}
+        return {"QuickTime": "mov", "MP4": "mp4", "Wave": "wav"}
 
     def GetRenderCodecs(self, fmt):
-        return {"QuickTime": {"Apple ProRes 422 HQ": "ProRes422HQ", "H.264": "H264"}, "MP4": {"H.264": "H264"}}[fmt]
+        # Only ids are accepted; "wav" has no codecs, as measured.
+        return {"mov": {"Apple ProRes 422 HQ": "ProRes422HQ", "H.264": "H264"}, "mp4": {"H.264": "H264"}}.get(fmt, {})
 
     def SetCurrentRenderFormatAndCodec(self, fmt, codec):
         if codec not in self.GetRenderCodecs(fmt).values():
             return False
         self.format_codec = (fmt, codec)
+        return True
+
+    def SetCurrentRenderMode(self, mode):
+        self.render_mode = mode
+        return True
+
+    def GetRenderJobList(self):
+        return [{"JobId": j, "TargetDir": self.render_settings.get("TargetDir", ""),
+                 "OutputFilename": f"{self.render_settings.get('CustomName', 'Main')}.mov"} for j in self.jobs]
+
+    def DeleteRenderJob(self, job):
+        return self.jobs.pop(job, None) is not None
+
+    def DeleteAllRenderJobs(self):
+        self.jobs.clear()
+        return True
+
+    def SaveAsNewRenderPreset(self, name):
+        if name in self.presets:
+            return False
+        self.presets.append(name)
         return True
 
     def IsRenderingInProgress(self):
@@ -697,7 +846,10 @@ class Project:
         self.jobs[job] = {"JobStatus": "Ready", "CompletionPercentage": 0}
         return job
 
-    def StartRendering(self, jobs, isInteractiveMode=False):
+    def StartRendering(self, jobs=None, isInteractiveMode=False):
+        jobs = list(self.jobs) if jobs is None else jobs
+        if not jobs or any(j not in self.jobs for j in jobs):
+            return False
         self.rendering = True
         for j in jobs:
             self.jobs[j] = {"JobStatus": "Rendering", "CompletionPercentage": 0}
@@ -722,6 +874,22 @@ class ProjectManager:
         self.current = self.projects.get(name)
         return self.current
 
+    def SaveProject(self):
+        self.saved = True
+        return True
+
+    def ExportProject(self, name, path, with_stills):
+        Path(path).write_bytes(b"drp")
+        self.exported_project = (name, path, with_stills)
+        return name in self.projects
+
+    def ImportProject(self, path, name=None):
+        name = name or Path(path).stem
+        if name in self.projects:
+            return False
+        self.projects[name] = Project(name)
+        return True
+
     def CreateProject(self, name):
         if name in self.projects:
             return None
@@ -729,8 +897,23 @@ class ProjectManager:
         return self.current
 
 
+class MediaStorage:
+    def GetMountedVolumeList(self):
+        return ["/Volumes/RAID", "/Volumes/SSD"]
+
+    def GetSubFolderList(self, path):
+        return sorted(str(p) for p in Path(path).iterdir() if p.is_dir())
+
+    def GetFileList(self, path):
+        return sorted(str(p) for p in Path(path).iterdir() if p.is_file())
+
+
 class Resolve:
     EXPORT_LUT_17PTCUBE, EXPORT_LUT_33PTCUBE, EXPORT_LUT_65PTCUBE = 0, 1, 2
+    EXPORT_NONE, EXPORT_AAF_NEW, EXPORT_AAF_EXISTING, EXPORT_CDL, EXPORT_SDL, EXPORT_MISSING_CLIPS = 0, 1, 2, 3, 4, 5
+    EXPORT_AAF, EXPORT_DRT, EXPORT_EDL, EXPORT_FCP_7_XML, EXPORT_OTIO = 10, 11, 12, 13, 14
+    EXPORT_FCPXML_1_8, EXPORT_FCPXML_1_9, EXPORT_FCPXML_1_10 = 18, 19, 20
+    EXPORT_TEXT_CSV, EXPORT_TEXT_TAB = 30, 31
     NORMALIZE_AUDIO_SET_LEVEL_RELATIVE, NORMALIZE_AUDIO_SET_LEVEL_INDEPENDENT = 0, 1
     AUDIO_SYNC_MODE, AUDIO_SYNC_CHANNEL_NUMBER = "mode", "channel"
     AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO, AUDIO_SYNC_RETAIN_VIDEO_METADATA = "embedded", "metadata"
@@ -747,11 +930,20 @@ class Resolve:
 
     def __init__(self):
         self.pm = ProjectManager()
-        self.page = "edit"
+        UI["page"] = "edit"
+        self.pages_visited = []
+
+    @property
+    def page(self):
+        return UI["page"]
 
     def OpenPage(self, page):
-        self.page = page
+        UI["page"] = page
+        self.pages_visited.append(page)
         return True
+
+    def GetMediaStorage(self):
+        return MediaStorage()
 
     def GetProjectManager(self):
         return self.pm
@@ -763,7 +955,7 @@ class Resolve:
         return "19.0.0"
 
     def GetCurrentPage(self):
-        return self.page
+        return UI["page"]
 
 
 @pytest.fixture

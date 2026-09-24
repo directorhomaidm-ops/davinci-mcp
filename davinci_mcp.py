@@ -48,7 +48,8 @@ DEFAULTS = {
 mcp = MCPServer(
     "davinci",
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
-    "clip properties, transitions, titles, markers, color grading, Fusion compositing, audio and rendering. "
+    "clip properties, transitions, titles, markers, color grading, Fusion compositing, audio, media management, "
+    "interchange export and rendering. "
     "Start with timeline_overview to see the edit and view_frame to see the picture. "
     "Frames are absolute timeline frames.",
 )
@@ -186,6 +187,41 @@ def _opt(obj, name, *args):
     return fn(*args) if callable(fn) else None
 
 
+@contextlib.contextmanager
+def _on_page(resolve, page):
+    """Run a page-gated call on `page`, then return to where the user was."""
+    prev = resolve.GetCurrentPage()
+    if prev != page:
+        resolve.OpenPage(page)
+    try:
+        yield
+    finally:
+        if prev and prev != page:
+            resolve.OpenPage(prev)
+
+
+def _bin(proj, path):
+    """Media-pool folder by path: "/" (root), "Footage" or "Footage/Day 1"."""
+    folder = proj.GetMediaPool().GetRootFolder()
+    for part in [p for p in (path or "").strip("/").split("/") if p]:
+        folder = next((f for f in folder.GetSubFolderList() or [] if f.GetName() == part), None)
+        if folder is None:
+            raise ToolError(f"bin not found: {path} (see list_clips)")
+    return folder
+
+
+@contextlib.contextmanager
+def _in_bin(pool, folder):
+    """ImportMedia only targets the current folder, so switch to `folder` and back."""
+    prev = pool.GetCurrentFolder()
+    pool.SetCurrentFolder(folder)
+    try:
+        yield
+    finally:
+        if prev:
+            pool.SetCurrentFolder(prev)
+
+
 def _check_node(it, node):
     count = int(_graph(it).GetNumNodes() or 0)
     if not 1 <= node <= count:
@@ -232,14 +268,17 @@ def create_project(name: str) -> str:
 
 
 @_tool
-def import_media(paths: list[str]) -> list[str]:
-    """Import media files into the media pool. Returns imported clip names."""
+def import_media(paths: list[str], bin: str | None = None) -> list[str]:
+    """Import media files or folders into the media pool, into `bin` (e.g. "Footage/Day 1"; default: the current
+    bin). Returns imported clip names."""
     _, proj = _project()
     paths = [os.path.abspath(p) for p in paths]
     missing = [p for p in paths if not os.path.exists(p)]
     if missing:
         raise ToolError("file(s) not found: " + ", ".join(missing))
-    items = proj.GetMediaPool().ImportMedia(paths)
+    pool = proj.GetMediaPool()
+    with _in_bin(pool, _bin(proj, bin) if bin else pool.GetCurrentFolder()):
+        items = pool.ImportMedia(paths)
     if not items:
         raise ToolError("import failed")
     return [it.GetName() for it in items]
@@ -418,41 +457,140 @@ def render(
     file_name: str | None = None,
     format: str | None = None,
     codec: str | None = None,
+    mark_in: int | None = None,
+    mark_out: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    frame_rate: float | None = None,
+    quality: int | str | None = None,
+    video: bool | None = None,
+    audio: bool | None = None,
+    individual_clips: bool = False,
+    settings: dict | None = None,
+    start: bool = True,
 ) -> dict:
-    """Queue and start rendering the current timeline. Returns the job id; progress is visible in Resolve.
-    format/codec (see list_render_formats) override the preset's; both must be given together."""
+    """Queue a render of the current timeline and start it (start=False only queues it).
+    format/codec are ids from list_render_formats (e.g. "mov" + "ProRes422HQ"), both or neither.
+    mark_in/mark_out: absolute timeline frames (as in list_items), both inclusive; default whole timeline.
+    quality: 0 auto, a bitrate, or Least/Low/Medium/High/Best. individual_clips=True renders one file per clip.
+    settings: any other SetRenderSettings key (AudioCodec, AudioBitDepth, AudioSampleRate, ColorSpaceTag, GammaTag,
+    ExportAlpha, AlphaMode, EncodingProfile, MultiPassEncode, NetworkOptimization, PixelAspectRatio...).
+    Unset values inherit the Deliver page's current state, so pass a `preset` to start from a known base."""
     if (format is None) != (codec is None):
         raise ToolError("format and codec must be given together")
-    _, proj = _project()
+    if (mark_in is None) != (mark_out is None):
+        raise ToolError("mark_in and mark_out must be given together")
+    proj, tl = _timeline()
+    if mark_in is not None:
+        first, last = int(tl.GetStartFrame()), int(tl.GetEndFrame())
+        # Resolve silently clamps frames below the start instead of refusing them.
+        if not first <= mark_in <= mark_out <= last:
+            raise ToolError(f"mark_in/mark_out must be absolute frames with {first} <= in <= out <= {last}")
     if preset and not proj.LoadRenderPreset(preset):
         raise ToolError(f"unknown render preset: {preset}")
-    if format and not proj.SetCurrentRenderFormatAndCodec(format, codec):
-        raise ToolError(f"unsupported format/codec: {format}/{codec} (see list_render_formats)")
-    settings = {"TargetDir": os.path.abspath(target_dir)}
-    if file_name:
-        settings["CustomName"] = file_name
-    proj.SetRenderSettings(settings)
+    if format:
+        if not (proj.GetRenderCodecs(format) or {}):
+            raise ToolError(f"unknown render format id or one without selectable codecs: {format} "
+                            "(see list_render_formats)")
+        if not proj.SetCurrentRenderFormatAndCodec(format, codec):
+            raise ToolError(f"unsupported format/codec: {format}/{codec} (see list_render_formats)")
+    if not proj.SetCurrentRenderMode(0 if individual_clips else 1):
+        raise ToolError("could not set render mode")
+    values = dict(settings or {})
+    values["TargetDir"] = os.path.abspath(target_dir)
+    for key, value in (("CustomName", file_name), ("FormatWidth", width), ("FormatHeight", height),
+                       ("FrameRate", frame_rate), ("VideoQuality", quality), ("ExportVideo", video),
+                       ("ExportAudio", audio)):
+        if value is not None:
+            values[key] = value
+    if mark_in is not None:
+        values.update(SelectAllFrames=False, MarkIn=mark_in, MarkOut=mark_out)
+    elif "MarkIn" not in values:
+        values["SelectAllFrames"] = True
+    if not proj.SetRenderSettings(values):
+        raise ToolError(f"Resolve rejected the render settings: {sorted(values)}")
     job = proj.AddRenderJob()
     if not job:
         raise ToolError("could not add render job")
-    proj.StartRendering([job], isInteractiveMode=False)
-    return {"job": job, "target_dir": settings["TargetDir"]}
+    if start and not proj.StartRendering([job], isInteractiveMode=False):
+        raise ToolError(f"job {job} queued but rendering did not start")
+    return {"job": job, "target_dir": values["TargetDir"], "started": start}
 
 
 @_tool
 def render_status(job: str) -> dict:
-    """Progress of a render job started with `render`."""
+    """Progress of a render job. `done` is judged from CompletionPercentage and Error (JobStatus is a translated
+    display string), and a finished job also reports whether its output file exists."""
     _, proj = _project()
-    return proj.GetRenderJobStatus(job)
+    status = dict(proj.GetRenderJobStatus(job) or {})
+    if not status:
+        raise ToolError(f"render job not found: {job} (see render_queue)")
+    done = float(status.get("CompletionPercentage") or 0) >= 100 and not status.get("Error")
+    status["done"] = done
+    info = next((j for j in (proj.GetRenderJobList() or []) if j.get("JobId") == job), None)
+    if info and info.get("TargetDir") and info.get("OutputFilename"):
+        status["output"] = os.path.join(info["TargetDir"], info["OutputFilename"])
+        if done:
+            status["output_exists"] = os.path.exists(status["output"])
+    return status
+
+
+@_tool
+def render_queue() -> list[dict]:
+    """All jobs in the render queue with their settings and progress."""
+    _, proj = _project()
+    out = []
+    for j in proj.GetRenderJobList() or []:
+        row = {k: _plain(v) for k, v in j.items()}
+        row["status"] = _plain(proj.GetRenderJobStatus(j.get("JobId")))
+        out.append(row)
+    return out
+
+
+@_tool
+def start_render(jobs: list[str] | None = None) -> str:
+    """Start rendering the given queued jobs, or the whole queue."""
+    _, proj = _project()
+    ok = proj.StartRendering(jobs, isInteractiveMode=False) if jobs else proj.StartRendering(isInteractiveMode=False)
+    if not ok:
+        raise ToolError("rendering did not start (empty queue, unknown job id, or a render already running)")
+    return f"rendering {len(jobs)} job(s)" if jobs else "rendering the whole queue"
+
+
+@_tool
+def delete_render_jobs(jobs: list[str] | None = None) -> str:
+    """Remove the given jobs from the render queue, or all of them. Refused while a render is running."""
+    _, proj = _project()
+    if proj.IsRenderingInProgress():
+        raise ToolError("a render is running: stop_render first")
+    if jobs is None:
+        if not proj.DeleteAllRenderJobs():
+            raise ToolError("DeleteAllRenderJobs failed")
+        return "render queue cleared"
+    failed = [j for j in jobs if not proj.DeleteRenderJob(j)]
+    if failed:
+        raise ToolError(f"unknown render job(s): {', '.join(failed)}")
+    return f"deleted {len(jobs)} render job(s)"
+
+
+@_tool
+def save_render_preset(name: str) -> str:
+    """Save the Deliver page's current render settings as a new render preset."""
+    _, proj = _project()
+    if not proj.SaveAsNewRenderPreset(name):
+        raise ToolError(f"cannot save render preset (name taken?): {name}")
+    return f"saved render preset '{name}'"
 
 
 @_tool
 def list_render_formats() -> dict:
-    """Render formats with their file extension and codecs ({codec name: description}), for `render`."""
+    """Render formats by id (the value `render` takes, e.g. mov, mp4, mxf_op1a) with their display name and codecs
+    ({codec id: description}). A format with no codecs cannot be selected through the API (e.g. wav)."""
     _, proj = _project()
+    # GetRenderFormats is {display name: id} and GetRenderCodecs {description: id}; Resolve only accepts the ids.
     return {
-        fmt: {"extension": ext, "codecs": {name: desc for desc, name in (proj.GetRenderCodecs(fmt) or {}).items()}}
-        for fmt, ext in (proj.GetRenderFormats() or {}).items()
+        fmt_id: {"name": name, "codecs": {cid: desc for desc, cid in (proj.GetRenderCodecs(fmt_id) or {}).items()}}
+        for name, fmt_id in (proj.GetRenderFormats() or {}).items()
     }
 
 
@@ -605,7 +743,8 @@ def load_color_version(item: int, name: str, remote: bool = False, track: int = 
 
 @_tool
 def export_lut(item: int, path: str, size: int = 33, track: int = 1) -> str:
-    """Export a video item's grade as a .cube LUT (size 17, 33 or 65 points). Needs Resolve 18 or later."""
+    """Export a video item's grade as a .cube LUT (size 17, 33 or 65 points). Needs Resolve 18 or later.
+    Switches to the Color page for the export (Resolve refuses it elsewhere) and back."""
     resolve = _resolve()
     _, tl = _timeline()
     it = _item(tl, item, track)
@@ -613,7 +752,9 @@ def export_lut(item: int, path: str, size: int = 33, track: int = 1) -> str:
     if not kind:
         raise ToolError(f"unsupported LUT size: {size} (17, 33 or 65)")
     path = os.path.abspath(path)
-    if not it.ExportLUT(getattr(resolve, kind), path):
+    with _on_page(resolve, "color"):  # ExportLUT returns False on every other page
+        ok = it.ExportLUT(getattr(resolve, kind), path)
+    if not ok:
         raise ToolError(f"ExportLUT failed: {path}")
     return f"exported {size}-point LUT of '{it.GetName()}' to {path}"
 
@@ -1118,13 +1259,17 @@ def add_transition(
 
 @_tool
 def delete_items(items: list[int], ripple: bool = False, track: int = 1, track_type: str = "video") -> str:
-    """Delete items (1-based indexes, clips or transitions) from a track. ripple=True closes the gaps."""
+    """Delete items (1-based indexes, clips or transitions) from a track. ripple=True closes the gaps.
+    Linked audio is not deleted with its video: pass the audio items too (track_type="audio")."""
+    resolve = _resolve()
     _, tl = _timeline()
     all_items = tl.GetItemListInTrack(track_type, track) or []
     bad = [i for i in items if not 1 <= i <= len(all_items)]
     if bad or not items:
         raise ToolError(f"items not found on {track_type} track {track}: {bad or 'none given'}")
-    if not tl.DeleteClips([all_items[i - 1] for i in items], ripple):
+    with _on_page(resolve, "edit"):  # DeleteClips returns False on the Fairlight page, every time
+        ok = tl.DeleteClips([all_items[i - 1] for i in items], ripple)
+    if not ok:
         raise ToolError("DeleteClips failed")
     return f"deleted {len(items)} item(s)" + (" (ripple)" if ripple else "")
 
@@ -1628,6 +1773,310 @@ def _xy(v):
     if len(v) != 2:
         raise ToolError(f"offset needs [dx, dy], got {v!r}")
     return v
+
+
+
+# --- Media management ---
+#
+# Clips are addressed by name, as everywhere else in this server; bins by path ("Footage/Day 1").
+# There is no API to generate proxies or optimized media, only to link existing proxy files.
+
+CLIP_COLORS = (
+    "Orange", "Apricot", "Yellow", "Lime", "Olive", "Green", "Teal", "Navy",
+    "Blue", "Purple", "Violet", "Pink", "Tan", "Beige", "Brown", "Chocolate",
+)
+
+
+@_tool
+def browse_storage(path: str | None = None) -> dict:
+    """Browse disks as Resolve sees them (Media Storage): without `path`, the mounted volumes; with a folder path,
+    its subfolders and files (image sequences are listed as one entry)."""
+    storage = _resolve().GetMediaStorage()
+    if not path:
+        return {"volumes": list(storage.GetMountedVolumeList() or [])}
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        raise ToolError(f"folder not found: {path}")
+    return {"path": path, "folders": list(storage.GetSubFolderList(path) or []),
+            "files": list(storage.GetFileList(path) or [])}
+
+
+@_tool
+def create_bin(name: str, parent: str = "/") -> str:
+    """Create a media-pool bin under `parent` ("/" is the root, or a path like "Footage")."""
+    _, proj = _project()
+    folder = _bin(proj, parent)
+    if any(f.GetName() == name for f in folder.GetSubFolderList() or []):
+        raise ToolError(f"bin already exists: {name}")
+    if not proj.GetMediaPool().AddSubFolder(folder, name):
+        raise ToolError(f"could not create bin: {name}")
+    return f"created bin {parent.rstrip('/')}/{name}"
+
+
+@_tool
+def move_clips(clips: list[str], bin: str) -> str:
+    """Move media-pool clips (by name) into a bin (path, e.g. "Footage/Day 1")."""
+    _, proj = _project()
+    targets, folder = _pool_clips(proj, clips), _bin(proj, bin)
+    if not proj.GetMediaPool().MoveClips(targets, folder):
+        raise ToolError("MoveClips failed")
+    return f"moved {len(targets)} clip(s) to {bin}"
+
+
+@_tool
+def delete_clips(clips: list[str]) -> str:
+    """Delete clips from the media pool (by name). Their uses on timelines go offline; files on disk are kept."""
+    _, proj = _project()
+    targets = _pool_clips(proj, clips)
+    if not proj.GetMediaPool().DeleteClips(targets):
+        raise ToolError("DeleteClips failed")
+    return f"deleted {len(targets)} clip(s) from the media pool"
+
+
+@_tool
+def import_image_sequence(pattern: str, start: int, end: int, bin: str | None = None) -> str:
+    """Import an image sequence as one clip. pattern is printf-style, e.g. /renders/shot_%04d.exr, with the first and
+    last frame numbers."""
+    if end < start:
+        raise ToolError("end must be >= start")
+    pattern = os.path.abspath(pattern)
+    first = pattern % start if "%" in pattern else None
+    if not first or not os.path.exists(first):
+        raise ToolError(f"first frame not found: {first or pattern} (pattern needs a %0Nd placeholder)")
+    _, proj = _project()
+    pool = proj.GetMediaPool()
+    with _in_bin(pool, _bin(proj, bin) if bin else pool.GetCurrentFolder()):
+        items = pool.ImportMedia([{"FilePath": pattern, "StartIndex": start, "EndIndex": end}])
+    if not items:
+        raise ToolError("import failed")
+    return f"imported {items[0].GetName()}"
+
+
+@_tool
+def clip_info(clip: str) -> dict:
+    """Everything Resolve knows about a media-pool clip: clip properties (resolution, fps, codec, duration, file
+    path, reel, timecode, proxy...), metadata, clip color, flags and markers."""
+    _, proj = _project()
+    (c,) = _pool_clips(proj, [clip])
+    props = {k: v for k, v in (c.GetClipProperty() or {}).items() if v not in ("", None)}
+    return {
+        "name": c.GetName(),
+        "properties": props,
+        "metadata": {k: v for k, v in (c.GetMetadata() or {}).items() if v not in ("", None)},
+        "color": c.GetClipColor() or None,
+        "flags": list(c.GetFlagList() or []),
+        "markers": {str(k): v for k, v in (c.GetMarkers() or {}).items()},
+    }
+
+
+@_tool
+def tag_clips(
+    clips: list[str],
+    color: str | None = None,
+    flag: str | None = None,
+    clear_flags: bool = False,
+    metadata: dict | None = None,
+) -> list[dict]:
+    """Organize media-pool clips: set a clip color (Orange, Apricot, Yellow, Lime, Olive, Green, Teal, Navy, Blue,
+    Purple, Violet, Pink, Tan, Beige, Brown, Chocolate; "" clears it), add a flag, clear flags, and write metadata
+    (e.g. {"Scene": "12", "Take": "3", "Keywords": "interview", "Comments": "..."}). Metadata is read back and a
+    value Resolve did not keep is an error."""
+    if color and color not in CLIP_COLORS:
+        raise ToolError(f"unknown clip color: {color} (one of {', '.join(CLIP_COLORS)})")
+    if color is None and flag is None and not clear_flags and not metadata:
+        raise ToolError("nothing to change")
+    _, proj = _project()
+    out = []
+    for c in _pool_clips(proj, clips):
+        if color == "":
+            c.ClearClipColor()
+        elif color and not c.SetClipColor(color):
+            raise ToolError(f"SetClipColor failed on {c.GetName()}")
+        if clear_flags:
+            c.ClearFlags("All")
+        if flag and not c.AddFlag(flag):
+            raise ToolError(f"unknown flag color: {flag}")
+        if metadata:
+            c.SetMetadata({k: str(v) for k, v in metadata.items()})
+            # Some fields (e.g. Reel Name under automatic reel naming) return True but are not kept.
+            lost = [k for k, v in metadata.items() if str(c.GetMetadata(k) or "") != str(v)]
+            if lost:
+                raise ToolError(f"Resolve did not keep {', '.join(lost)} on {c.GetName()} (check project settings)")
+        out.append({"clip": c.GetName(), "color": c.GetClipColor() or None, "flags": list(c.GetFlagList() or [])})
+    return out
+
+
+@_tool
+def relink_clips(clips: list[str], folder: str) -> str:
+    """Relink offline media-pool clips to files in `folder` (searched by file name)."""
+    folder = os.path.abspath(folder)
+    if not os.path.isdir(folder):
+        raise ToolError(f"folder not found: {folder}")
+    _, proj = _project()
+    if not proj.GetMediaPool().RelinkClips(_pool_clips(proj, clips), folder):
+        raise ToolError(f"RelinkClips failed (no matching files in {folder}?)")
+    return f"relinked {len(clips)} clip(s) to {folder}"
+
+
+@_tool
+def link_proxy(clip: str, proxy_path: str | None = None) -> str:
+    """Attach an existing proxy file to a media-pool clip, or detach it (proxy_path omitted). Resolve cannot generate
+    proxies through the API; render them in the UI or externally."""
+    _, proj = _project()
+    (c,) = _pool_clips(proj, [clip])
+    if proxy_path is None:
+        if not c.UnlinkProxyMedia():
+            raise ToolError(f"{clip} has no proxy to unlink")
+        return f"unlinked proxy of {clip}"
+    proxy_path = os.path.abspath(proxy_path)
+    if not os.path.exists(proxy_path):
+        raise ToolError(f"file not found: {proxy_path}")
+    if not c.LinkProxyMedia(proxy_path):
+        raise ToolError("LinkProxyMedia failed (proxy must match the clip's duration and frame rate)")
+    return f"linked proxy {os.path.basename(proxy_path)} to {clip}"
+
+
+@_tool
+def replace_clip(clip: str, path: str) -> str:
+    """Swap a media-pool clip's underlying file for another (e.g. a VFX shot's new version); every use on timelines
+    follows."""
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        raise ToolError(f"file not found: {path}")
+    _, proj = _project()
+    (c,) = _pool_clips(proj, [clip])
+    if not c.ReplaceClip(path):
+        raise ToolError("ReplaceClip failed")
+    return f"{clip} now uses {os.path.basename(path)}"
+
+
+@_tool
+def export_metadata(path: str, clips: list[str] | None = None) -> str:
+    """Write clip metadata to a CSV file: the given clips, or the whole media pool."""
+    _, proj = _project()
+    path = os.path.abspath(path)
+    targets = _pool_clips(proj, clips) if clips else []
+    if not proj.GetMediaPool().ExportMetadata(path, targets) or not os.path.exists(path):
+        raise ToolError(f"ExportMetadata failed: {path}")
+    return f"metadata of {len(targets) or 'all'} clip(s) written to {path}"
+
+
+# --- Interchange and project ---
+
+# name -> (exportType, exportSubtype). Constants are resolved on the live handle: plain strings are silently rejected.
+TIMELINE_EXPORTS = {
+    "aaf": ("EXPORT_AAF", "EXPORT_AAF_NEW"),
+    "aaf_existing": ("EXPORT_AAF", "EXPORT_AAF_EXISTING"),
+    "drt": ("EXPORT_DRT", "EXPORT_NONE"),
+    "edl": ("EXPORT_EDL", "EXPORT_NONE"),
+    "edl_cdl": ("EXPORT_EDL", "EXPORT_CDL"),
+    "edl_sdl": ("EXPORT_EDL", "EXPORT_SDL"),
+    "edl_missing_clips": ("EXPORT_EDL", "EXPORT_MISSING_CLIPS"),
+    "fcp7_xml": ("EXPORT_FCP_7_XML", "EXPORT_NONE"),
+    "otio": ("EXPORT_OTIO", "EXPORT_NONE"),
+    "csv": ("EXPORT_TEXT_CSV", "EXPORT_NONE"),
+    "tab": ("EXPORT_TEXT_TAB", "EXPORT_NONE"),
+    "hdr10_a": ("EXPORT_HDR_10_PROFILE_A", "EXPORT_NONE"),
+    "hdr10_b": ("EXPORT_HDR_10_PROFILE_B", "EXPORT_NONE"),
+    "dolby_vision_2_9": ("EXPORT_DOLBY_VISION_VER_2_9", "EXPORT_NONE"),
+    "dolby_vision_4_0": ("EXPORT_DOLBY_VISION_VER_4_0", "EXPORT_NONE"),
+    "dolby_vision_5_1": ("EXPORT_DOLBY_VISION_VER_5_1", "EXPORT_NONE"),
+}
+FCPXML_VERSIONS = [f"1_{n}" for n in range(3, 12)]
+TIMELINE_EXPORTS.update({f"fcpxml_{v}": (f"EXPORT_FCPXML_{v}", "EXPORT_NONE") for v in FCPXML_VERSIONS})
+
+
+@_tool
+def export_timeline(path: str, format: str) -> dict:
+    """Export the current timeline for another app or a conform: aaf / aaf_existing (Avid, Pro Tools), fcpxml
+    (newest version this Resolve writes) or fcpxml_1_3..fcpxml_1_11, fcp7_xml (Premiere), otio (OpenTimelineIO),
+    edl / edl_cdl / edl_sdl / edl_missing_clips, drt (Resolve timeline), csv / tab (edit list), hdr10_a / hdr10_b,
+    dolby_vision_2_9 / 4_0 / 5_1. Checks the file was written."""
+    resolve = _resolve()
+    _, tl = _timeline()
+    if format == "fcpxml":
+        newest = next((v for v in reversed(FCPXML_VERSIONS) if getattr(resolve, f"EXPORT_FCPXML_{v}", None) is not None),
+                      None)
+        if not newest:
+            raise ToolError("this Resolve version exports no FCPXML")
+        format = f"fcpxml_{newest}"
+    if format not in TIMELINE_EXPORTS:
+        raise ToolError(f"unknown format: {format} (one of fcpxml, {', '.join(TIMELINE_EXPORTS)})")
+    kind, sub = (_constant(resolve, name) for name in TIMELINE_EXPORTS[format])
+    path = os.path.abspath(path)
+    if not os.path.isdir(os.path.dirname(path)):
+        raise ToolError(f"folder not found: {os.path.dirname(path)}")
+    if not tl.Export(path, kind, sub):
+        raise ToolError(f"Timeline.Export failed for {format}")
+    if not os.path.exists(path):
+        raise ToolError(f"Resolve reported success but wrote no file at {path}")
+    return {"timeline": tl.GetName(), "format": format, "path": path, "bytes": os.path.getsize(path)}
+
+
+@_tool
+def import_timeline(
+    path: str, name: str | None = None, import_source_clips: bool = True, source_clips_path: str | None = None
+) -> dict:
+    """Import a timeline from AAF, EDL, FCP7 XML, FCPXML, OTIO or DRT and make it current. source_clips_path is where
+    to look for media missing from its original location. The file's own sequence name wins for FCP7 XML and
+    DRT, so the returned name can differ from `name`."""
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        raise ToolError(f"file not found: {path}")
+    _, proj = _project()
+    options = {"importSourceClips": import_source_clips}
+    if name:
+        if any(proj.GetTimelineByIndex(i).GetName() == name for i in range(1, int(proj.GetTimelineCount()) + 1)):
+            raise ToolError(f"a timeline named {name} already exists")
+        options["timelineName"] = name
+    if source_clips_path:
+        options["sourceClipsPath"] = os.path.abspath(source_clips_path)
+    before = int(proj.GetTimelineCount())
+    tl = proj.GetMediaPool().ImportTimelineFromFile(path, options)
+    if not tl:
+        raise ToolError("ImportTimelineFromFile failed (unsupported file, or its timeline name already exists)")
+    # FCP7 XML returns the EXISTING timeline when its internal sequence name is already taken.
+    if int(proj.GetTimelineCount()) == before:
+        raise ToolError(f"no new timeline: the file's sequence name matches the existing timeline '{tl.GetName()}'")
+    proj.SetCurrentTimeline(tl)
+    return {"timeline": tl.GetName(), "renamed_by_file": bool(name) and tl.GetName() != name}
+
+
+@_tool
+def save_project() -> str:
+    """Save the current project."""
+    pm = _resolve().GetProjectManager()
+    _project()
+    if not pm.SaveProject():
+        raise ToolError("SaveProject failed")
+    return "project saved"
+
+
+@_tool
+def export_project(path: str, with_stills_and_luts: bool = True) -> dict:
+    """Export the current project as a .drp file (for backup or moving to another database). Media is not included.
+    Save first with save_project to include recent changes."""
+    pm = _resolve().GetProjectManager()
+    _, proj = _project()
+    path = os.path.abspath(path)
+    if not path.lower().endswith(".drp"):
+        path += ".drp"
+    if not pm.ExportProject(proj.GetName(), path, with_stills_and_luts) or not os.path.exists(path):
+        raise ToolError(f"ExportProject failed: {path}")
+    return {"project": proj.GetName(), "path": path, "bytes": os.path.getsize(path)}
+
+
+@_tool
+def import_project(path: str, name: str | None = None) -> str:
+    """Import a .drp project file into the current project-manager folder (it is not opened; use open_project)."""
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        raise ToolError(f"file not found: {path}")
+    pm = _resolve().GetProjectManager()
+    ok = pm.ImportProject(path, name) if name else pm.ImportProject(path)
+    if not ok:
+        raise ToolError("ImportProject failed (name already in use?)")
+    return f"imported project {name or os.path.splitext(os.path.basename(path))[0]}"
 
 
 if __name__ == "__main__":

@@ -33,8 +33,25 @@ All frames are absolute timeline frames unless noted. Item and track indexes are
 
 | Tool | Parameters | Returns | Errors |
 |---|---|---|---|
-| `import_media` | `paths: list[str]` (relative paths resolve against the server's working directory) | Imported clip names | Any path missing; import rejected |
+| `browse_storage` | `path: str \| None` | Without `path`: `{volumes}`; with it: `{path, folders, files}` | Folder not found |
+| `import_media` | `paths: list[str]` (relative paths resolve against the server's working directory), `bin: str \| None` | Imported clip names | Any path missing; bin not found; import rejected |
+| `import_image_sequence` | `pattern: str` (e.g. `/renders/shot_%04d.exr`), `start: int`, `end: int`, `bin: str \| None` | Confirmation string with the clip name | First frame missing; `end < start` |
 | `list_clips` | — | `[{folder, name, frames}]` for every clip, recursing into subfolders; `folder` is `/` for the root | |
+| `clip_info` | `clip: str` | `{name, properties, metadata, color, flags, markers}` (empty values dropped) | Clip not found |
+| `create_bin` | `name: str`, `parent: str = "/"` | Confirmation string | Parent not found; name taken |
+| `move_clips` | `clips: list[str]`, `bin: str` | Confirmation string | Clip or bin not found |
+| `delete_clips` | `clips: list[str]` | Confirmation string | Clip not found |
+| `tag_clips` | `clips: list[str]`, `color: str \| None` (`""` clears), `flag: str \| None`, `clear_flags: bool`, `metadata: dict \| None` | `[{clip, color, flags}]` | Unknown color or flag; nothing to change; metadata not kept |
+| `relink_clips` | `clips: list[str]`, `folder: str` | Confirmation string | Folder missing; no matching files |
+| `link_proxy` | `clip: str`, `proxy_path: str \| None` (omit to unlink) | Confirmation string | File missing; proxy does not match the clip |
+| `replace_clip` | `clip: str`, `path: str` | Confirmation string | File missing |
+| `export_metadata` | `path: str` (.csv), `clips: list[str] \| None` (all when omitted) | Confirmation string | Export failed |
+
+Notes:
+
+- Clips are addressed by name, bins by path (`"Footage/Day 1"`). Resolve only imports into the current bin, so `bin` switches to it and back.
+- `tag_clips` colors are Resolve's 16 clip colors: `Orange` `Apricot` `Yellow` `Lime` `Olive` `Green` `Teal` `Navy` `Blue` `Purple` `Violet` `Pink` `Tan` `Beige` `Brown` `Chocolate`. Metadata is read back after writing: some fields (e.g. `Reel Name` when the project derives reel names automatically) are accepted by Resolve and then dropped, and that is reported as an error.
+- Proxies and optimized media cannot be generated through the API, only linked once they exist.
 
 ### Timelines
 
@@ -85,7 +102,7 @@ Start with `timeline_overview` to see the edit and `view_frame` to see the pictu
 | `timeline_overview` | — | `{timeline, fps, resolution, start_frame, end_frame, playhead, tracks: {video, audio, subtitle: [{index, name, enabled, items: [{index, kind, name, source, start, end, duration, enabled, fusion_comps}]}]}, markers}` | |
 | `view_frame` | `timecode: str \| None` (absolute) **or** `frame: int \| None` (absolute), `save_to: str \| None` | The frame as an image, plus its timecode | Both given; playhead cannot move; drop-frame timeline with `frame`; export failed |
 | `add_transition` | `item: int`, `type: str = "Cross Dissolve"`, `position: "start" \| "end" = "end"`, `alignment: "left" \| "center" \| "right" = "center"`, `duration: int \| None`, `category: "simple" \| "fusion" \| "ofx" \| "audio" = "simple"`, `track`, `track_type` | `{name, start, end, duration}` | Bad option; Resolve older than 21.1; no transition created |
-| `delete_items` | `items: list[int]`, `ripple: bool = False`, `track`, `track_type` | Confirmation string | Index out of range |
+| `delete_items` | `items: list[int]`, `ripple: bool = False`, `track`, `track_type` | Confirmation string; switches to the Edit page for the delete and back | Index out of range |
 | `set_clip_enabled` | `item: int`, `enabled: bool`, `track`, `track_type` | Confirmation string | Index out of range |
 | `stabilize` | `item: int`, `track: int = 1` | Confirmation string | Unsupported clip; Resolve older than 18 |
 | `smart_reframe` | `item: int`, `track: int = 1` | Confirmation string | Studio only; Resolve older than 18 |
@@ -135,12 +152,38 @@ Notes:
 | Tool | Parameters | Returns | Errors |
 |---|---|---|---|
 | `list_render_presets` | — | Preset names | |
-| `list_render_formats` | — | `{format: {extension, codecs: {codec: description}}}` | |
-| `render` | `target_dir: str`, `preset: str \| None`, `file_name: str \| None`, `format: str \| None`, `codec: str \| None` | `{job, target_dir}`; rendering starts immediately | Unknown preset; only one of `format`/`codec` given; unsupported format/codec; job could not be queued |
-| `render_status` | `job: str` (from `render`) | Resolve's job status dict, e.g. `{JobStatus, CompletionPercentage}` | |
+| `list_render_formats` | — | `{format id: {name, codecs: {codec id: description}}}` | |
+| `render` | `target_dir: str`, `preset`, `file_name`, `format`, `codec`, `mark_in`, `mark_out`, `width`, `height`, `frame_rate`, `quality`, `video`, `audio`, `individual_clips: bool = False`, `settings: dict \| None`, `start: bool = True` | `{job, target_dir, started}` | Unknown preset; format without codecs; unsupported format/codec; range outside the timeline; settings rejected |
+| `render_status` | `job: str` | Resolve's status plus `done`, `output` and (when done) `output_exists` | Job not found |
+| `render_queue` | — | Every queued job with its settings and status | |
+| `start_render` | `jobs: list[str] \| None` (whole queue when omitted) | Confirmation string | Nothing started |
 | `stop_render` | — | `"stopped"` or `"nothing rendering"` | |
+| `delete_render_jobs` | `jobs: list[str] \| None` (all when omitted) | Confirmation string | A render is running; unknown job |
+| `save_render_preset` | `name: str` | Confirmation string | Name taken |
 
-`format`/`codec` take the keys from `list_render_formats` (e.g. `QuickTime` + `ProRes422HQ`) and are applied after `preset`, so they override it.
+Notes:
+
+- `format`/`codec` take the **ids** from `list_render_formats` (e.g. `mov` + `ProRes422HQ`, `mp4` + `H264`), not the names shown in the Deliver page: Resolve rejects the names. A format with no codecs (e.g. `wav`) cannot be selected through the API; render audio-only with `video=False` on a format that has codecs, or from a saved preset.
+- `mark_in`/`mark_out` are absolute timeline frames, both inclusive. Resolve silently clamps values below the timeline start instead of refusing them, so the tool rejects them.
+- Settings not passed are inherited from the Deliver page's current state (even from an audio-only preset used earlier). Pass a `preset` to start from a known base; `settings` takes any other documented key (`AudioCodec`, `AudioBitDepth`, `AudioSampleRate`, `ColorSpaceTag`, `GammaTag`, `ExportAlpha`, `AlphaMode`, `EncodingProfile`, `MultiPassEncode`, `NetworkOptimization`, `PixelAspectRatio`, `UniqueFilenameStyle`).
+- `render_status` decides `done` from `CompletionPercentage` and `Error`, because `JobStatus` is a translated display string ("Complete", "Concluso", …), and then checks the output file exists.
+- Do not close or delete a project while it is rendering: Resolve's render pipeline wedges until restart.
+
+### Interchange and project
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `export_timeline` | `path: str`, `format: str` | `{timeline, format, path, bytes}` | Unknown format; format not in this Resolve; folder missing; no file written |
+| `import_timeline` | `path: str`, `name: str \| None`, `import_source_clips: bool = True`, `source_clips_path: str \| None` | `{timeline, renamed_by_file}`; the new timeline becomes current | File missing; name taken; no new timeline created |
+| `save_project` | — | Confirmation string | |
+| `export_project` | `path: str` (.drp added if missing), `with_stills_and_luts: bool = True` | `{project, path, bytes}` | Export failed |
+| `import_project` | `path: str`, `name: str \| None` | Confirmation string | File missing; name in use |
+
+Notes:
+
+- `export_timeline` formats: `aaf`, `aaf_existing` (Avid, Pro Tools), `fcpxml` (newest this Resolve writes) or `fcpxml_1_3` … `fcpxml_1_11`, `fcp7_xml` (Premiere), `otio`, `edl`, `edl_cdl`, `edl_sdl`, `edl_missing_clips`, `drt`, `csv`, `tab`, `hdr10_a`, `hdr10_b`, `dolby_vision_2_9`, `dolby_vision_4_0`, `dolby_vision_5_1`. Measured limits: Resolve's EDL carries video events only (no audio) with every source as reel `AX`; OTIO and DRT exports drop markers. For round trips with audio prefer `otio`, `aaf` or `fcp7_xml`.
+- `import_timeline`: FCP7 XML and DRT name the timeline from the file, so `name` may be ignored; when an FCP7 XML's sequence name matches an existing timeline Resolve returns that timeline instead of a new one, which is reported as an error.
+- Project archiving (`.dra` with media) is deliberately not offered: `ProjectManager.ArchiveProject` crashed Resolve in every measured call that included media and did nothing without it. Use `export_project` plus your own media copy.
 
 ### Color grading
 
@@ -166,7 +209,7 @@ Notes:
 - `apply_lut` only accepts LUTs Resolve has already indexed. After copying a new `.cube` into a LUT folder, run *Project Settings → Color Management → Update Lists* first.
 - `grab_still` needs the Color page open (`open_page("color")`) and stores the still in the current gallery album as a grade reference. To get the image itself use `view_frame`: Resolve's gallery export only works while the Gallery panel is visible, while the frame export `view_frame` uses works on any page with a viewer.
 - `magic_mask` only tracks: Magic Mask needs clicks on the subject and the API cannot place them. Seed it once in the Color page (select the clip, open the Magic Mask palette, click the subject), then call `magic_mask`. Power Windows and their tracker have no API at all. Studio only.
-- `export_lut` needs Resolve 18 or later. Node reads/writes use Resolve 19's node graph when present and fall back to the older per-item calls on earlier versions.
+- `export_lut` needs Resolve 18 or later and switches to the Color page for the export (Resolve refuses it on other pages), then back. Node reads/writes use Resolve 19's node graph when present and fall back to the older per-item calls on earlier versions.
 
 ### Fusion (VFX and motion graphics)
 
