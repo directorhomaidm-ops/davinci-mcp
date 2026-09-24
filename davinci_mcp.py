@@ -48,7 +48,7 @@ DEFAULTS = {
 mcp = MCPServer(
     "davinci",
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
-    "clip properties, transitions, titles, markers, color grading, Fusion compositing and rendering. "
+    "clip properties, transitions, titles, markers, color grading, Fusion compositing, audio and rendering. "
     "Start with timeline_overview to see the edit and view_frame to see the picture. "
     "Frames are absolute timeline frames.",
 )
@@ -1191,6 +1191,368 @@ def insert_fusion_effect(item: int, tool_type: str, settings: dict | None = None
     except ToolError as e:
         raise ToolError(f"{node} was added to the chain but a setting failed: {e}") from e
     return {"item": it.GetName(), "node": node, "type": tool_type, "settings": applied}
+
+
+
+# --- Audio / Fairlight ---
+#
+# The API has no per-parameter mixer: clip/track volume, pan, EQ, automation and FairlightFX cannot be read or
+# set (SetProperty('Volume'|'Level'|'Gain') returns False on live 21.0). What it does offer is below: whole-mix
+# Fairlight presets (20.2.2+), loudness normalization, fades and speed (21.1+), track management, voice
+# isolation, audio sync, transcription and auto captions. AutoSyncAudio and CreateSubtitlesFromAudio take
+# enum constants and report success unreliably, so both are verified by reading the result back.
+
+
+def _track_items(tl, track_type, track):
+    if track_type not in ("video", "audio", "subtitle"):
+        raise ToolError(f"unknown track type: {track_type} (video, audio or subtitle)")
+    return list(tl.GetItemListInTrack(track_type, track) or [])
+
+
+def _pick(tl, item, track, track_type):
+    items = _track_items(tl, track_type, track)
+    if not 1 <= item <= len(items):
+        raise ToolError(f"item {item} not found on {track_type} track {track}")
+    return items[item - 1]
+
+
+def _check_track(tl, track_type, index):
+    count = int(tl.GetTrackCount(track_type) or 0) if track_type in ("video", "audio", "subtitle") else 0
+    if not 1 <= index <= count:
+        raise ToolError(f"{track_type} track {index} not found ({count} {track_type} track(s))")
+
+
+def _constant(resolve, name):
+    value = getattr(resolve, name, None)
+    if value is None:
+        raise ToolError(f"this Resolve version has no {name}")
+    return value
+
+
+def _pool_clips(proj, names):
+    by_name = _clips_by_name(proj)
+    missing = [n for n in names if n not in by_name]
+    if missing:
+        raise ToolError(f"clips not in media pool: {', '.join(missing)} (see list_clips)")
+    return [by_name[n] for n in names]
+
+
+@_tool
+def fairlight_info() -> dict:
+    """Audio state of the current timeline: each audio track's name, format (mono, stereo, 5.1...), enabled,
+    locked and voice isolation, plus the Fairlight presets and loudness-normalization modes this Resolve offers."""
+    resolve = _resolve()
+    _, tl = _timeline()
+    tracks = []
+    for n in range(1, int(tl.GetTrackCount("audio") or 0) + 1):
+        tracks.append({
+            "index": n,
+            "name": _opt(tl, "GetTrackName", "audio", n),
+            "format": _opt(tl, "GetTrackSubType", "audio", n),
+            "enabled": _opt(tl, "GetIsTrackEnabled", "audio", n),
+            "locked": _opt(tl, "GetIsTrackLocked", "audio", n),
+            "voice_isolation": _opt(tl, "GetVoiceIsolationState", n),
+            "items": len(tl.GetItemListInTrack("audio", n) or []),
+        })
+    return {
+        "tracks": tracks,
+        "fairlight_presets": _opt(resolve, "GetFairlightPresets"),
+        "normalize_modes": _opt(tl, "GetNormalizeAudioModes"),
+    }
+
+
+@_tool
+def apply_fairlight_preset(name: str) -> str:
+    """Apply a saved Fairlight preset (a whole mix: levels, EQ, dynamics, bussing) to the current timeline
+    (Resolve 20.2.2+). Save the preset once in the Fairlight page; names are listed by fairlight_info."""
+    _, proj = _project()
+    _timeline()
+    if not _method(proj, "ApplyFairlightPresetToCurrentTimeline", "20.2.2")(name):
+        raise ToolError(f"cannot apply Fairlight preset: {name} (see fairlight_info)")
+    return f"applied Fairlight preset '{name}'"
+
+
+AUDIO_FORMATS = ("mono", "stereo", "5.1", "7.1") + tuple(f"adaptive{n}" for n in range(1, 37))
+
+
+@_tool
+def add_track(track_type: str = "audio", format: str = "stereo", name: str | None = None) -> dict:
+    """Add a track at the end. Audio tracks take a format: mono, stereo, 5.1, 7.1 or adaptive1..adaptive36."""
+    _, tl = _timeline()
+    if track_type not in ("video", "audio", "subtitle"):
+        raise ToolError(f"unknown track type: {track_type} (video, audio or subtitle)")
+    if track_type == "audio" and format not in AUDIO_FORMATS:
+        raise ToolError(f"unknown audio format: {format} (mono, stereo, 5.1, 7.1, adaptive1..adaptive36)")
+    before = int(tl.GetTrackCount(track_type) or 0)
+    if track_type != "audio":
+        tl.AddTrack(track_type)
+    else:
+        # Newer builds take {audioType}; older ones a plain sub-type string.
+        try:
+            tl.AddTrack("audio", {"audioType": format})
+        except TypeError:
+            pass
+        if int(tl.GetTrackCount("audio") or 0) == before:
+            tl.AddTrack("audio", format)
+    index = int(tl.GetTrackCount(track_type) or 0)
+    if index != before + 1:
+        raise ToolError(f"could not add {track_type} track")
+    if name and not tl.SetTrackName(track_type, index, name):
+        raise ToolError(f"added {track_type} track {index} but could not name it")
+    return {"track_type": track_type, "index": index, "name": _opt(tl, "GetTrackName", track_type, index),
+            "format": _opt(tl, "GetTrackSubType", track_type, index) if track_type == "audio" else None}
+
+
+@_tool
+def set_track(
+    track_type: str, index: int, name: str | None = None, enabled: bool | None = None, locked: bool | None = None
+) -> dict:
+    """Rename, enable/disable (a disabled audio track is muted in playback and render) or lock/unlock a track."""
+    _, tl = _timeline()
+    _check_track(tl, track_type, index)
+    if name is None and enabled is None and locked is None:
+        raise ToolError("nothing to change: give name, enabled or locked")
+    if name is not None and not tl.SetTrackName(track_type, index, name):
+        raise ToolError("SetTrackName failed")
+    if enabled is not None and not tl.SetTrackEnable(track_type, index, enabled):
+        raise ToolError("SetTrackEnable failed")
+    if locked is not None and not tl.SetTrackLock(track_type, index, locked):
+        raise ToolError("SetTrackLock failed")
+    return {
+        "track_type": track_type,
+        "index": index,
+        "name": _opt(tl, "GetTrackName", track_type, index),
+        "enabled": _opt(tl, "GetIsTrackEnabled", track_type, index),
+        "locked": _opt(tl, "GetIsTrackLocked", track_type, index),
+    }
+
+
+@_tool
+def delete_track(track_type: str, index: int) -> str:
+    """Delete a track and everything on it. Tracks after it move up one index."""
+    _, tl = _timeline()
+    _check_track(tl, track_type, index)
+    count = len(tl.GetItemListInTrack(track_type, index) or [])
+    if not tl.DeleteTrack(track_type, index):
+        raise ToolError("DeleteTrack failed")
+    return f"deleted {track_type} track {index} ({count} item(s))"
+
+
+@_tool
+def voice_isolation(track: int, enabled: bool = True, amount: int = 50) -> dict:
+    """Turn Voice Isolation on an audio track on or off, with strength 0-100 (removes background noise, music
+    and room sound behind dialogue). Studio feature."""
+    if not 0 <= amount <= 100:
+        raise ToolError("amount must be 0-100")
+    _, tl = _timeline()
+    _check_track(tl, "audio", track)
+    if not _method(tl, "SetVoiceIsolationState", "18.5")(track, {"isEnabled": enabled, "amount": amount}):
+        raise ToolError("SetVoiceIsolationState failed (Studio only)")
+    return {"track": track, "state": _opt(tl, "GetVoiceIsolationState", track)}
+
+
+@_tool
+def normalize_audio(
+    items: list[int],
+    loudness: float | None = None,
+    level: float | None = None,
+    mode: str | None = None,
+    independent: bool = False,
+    track: int = 1,
+) -> str:
+    """Normalize audio items (1-based indexes on an audio track) to a target (Resolve 21.1+): `loudness` in
+    LKFS/LUFS (e.g. -14 web/YouTube, -16 podcasts, -23 EBU R128 broadcast, -24 ATSC) or peak `level` in dBFS.
+    mode is one of fairlight_info's normalize_modes (Resolve's default when omitted). independent=True
+    normalizes each item on its own instead of keeping their relative levels."""
+    if loudness is None and level is None:
+        raise ToolError("give a target: loudness (LKFS) or level (dBFS)")
+    resolve = _resolve()
+    _, tl = _timeline()
+    normalize = _method(tl, "NormalizeAudioLevel", "21.1")
+    targets = [_pick(tl, i, track, "audio") for i in items]
+    if not targets:
+        raise ToolError("no items given")
+    modes = _opt(tl, "GetNormalizeAudioModes")
+    if mode is not None and modes and mode not in modes:
+        raise ToolError(f"unknown mode: {mode} (one of {', '.join(map(str, modes))})")
+    options = {"setLevelMode": _constant(resolve, "NORMALIZE_AUDIO_SET_LEVEL_" + ("INDEPENDENT" if independent else "RELATIVE"))}
+    if mode is not None:
+        options["normalizationMode"] = mode
+    if loudness is not None:
+        options["targetLoudness"] = float(loudness)
+    if level is not None:
+        options["targetLevel"] = float(level)
+    if not normalize(targets, options):
+        raise ToolError("NormalizeAudioLevel failed")
+    return f"normalized {len(targets)} item(s)" + (f" to {loudness} LKFS" if loudness is not None else f" to {level} dBFS")
+
+
+@_tool
+def set_fades(
+    item: int, fade_in: int | None = None, fade_out: int | None = None, track: int = 1, track_type: str = "audio"
+) -> dict:
+    """Set an item's fade-in/fade-out length in frames (0 removes the fade). Works on audio and video items
+    (Resolve 21.1+)."""
+    if fade_in is None and fade_out is None:
+        raise ToolError("give fade_in and/or fade_out")
+    if any(v is not None and v < 0 for v in (fade_in, fade_out)):
+        raise ToolError("fades must be 0 or more frames")
+    _, tl = _timeline()
+    it = _pick(tl, item, track, track_type)
+    fades = {k: v for k, v in (("FadeIn", fade_in), ("FadeOut", fade_out)) if v is not None}
+    if not _method(it, "SetFades", "21.1")(fades):
+        raise ToolError("SetFades failed (fade longer than the clip?)")
+    return {"item": it.GetName(), "fades": _opt(it, "GetFades")}
+
+
+@_tool
+def set_speed(
+    item: int,
+    percent: float,
+    pitch_correction: bool | None = None,
+    stretch_keyframes: bool | None = None,
+    ripple: bool = False,
+    track: int = 1,
+    track_type: str = "video",
+) -> dict:
+    """Change an item's speed (Resolve 21.1+): 50 = half speed, 200 = double, 0 = freeze frame. ripple=True
+    moves later items to fit; pitch_correction keeps voices natural. Set RetimeProcess (e.g. optical_flow)
+    with set_item_properties for smooth slow motion."""
+    if percent < 0:
+        raise ToolError("percent must be 0 or more")
+    _, tl = _timeline()
+    it = _pick(tl, item, track, track_type)
+    options = {"Percentage": percent, "RippleTimeline": ripple}
+    if pitch_correction is not None:
+        options["PitchCorrection"] = pitch_correction
+    if stretch_keyframes is not None:
+        options["StretchKeyframesToFit"] = stretch_keyframes
+    if not _method(it, "SetSpeed", "21.1")(options):
+        raise ToolError("SetSpeed failed")
+    return {"item": it.GetName(), "speed": _opt(it, "GetSpeed"), "duration": it.GetDuration()}
+
+
+@_tool
+def convert_to_stereo() -> str:
+    """Convert the whole current timeline's audio to stereo."""
+    _, tl = _timeline()
+    if not tl.ConvertTimelineToStereo():
+        raise ToolError("ConvertTimelineToStereo failed")
+    return "timeline converted to stereo"
+
+
+@_tool
+def insert_audio(path: str, start_offset: int = 0, duration: int = 0) -> str:
+    """Insert an audio file at the playhead on the selected track of the Fairlight page (open_page("fairlight")
+    first). start_offset/duration are in samples into the file; duration 0 inserts to the end."""
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        raise ToolError(f"file not found: {path}")
+    _, proj = _project()
+    _timeline()
+    if not proj.InsertAudioToCurrentTrackAtPlayhead(path, start_offset, duration):
+        raise ToolError("insert failed (is the Fairlight page open with a track selected?)")
+    return f"inserted {os.path.basename(path)} at the playhead"
+
+
+SYNC_CHANNELS = {"auto": "AUDIO_SYNC_CHANNEL_AUTOMATIC", "mix": "AUDIO_SYNC_CHANNEL_MIX"}
+
+
+@_tool
+def sync_audio(
+    clips: list[str],
+    method: str = "waveform",
+    channel: str | int = "auto",
+    retain_embedded_audio: bool = False,
+    retain_video_metadata: bool = False,
+) -> dict:
+    """Sync separately recorded audio to video in the media pool (at least one video and one audio clip, by
+    name). method: waveform or timecode; channel: auto, mix or a channel number. Checks each clip afterwards,
+    since Resolve's own success flag is unreliable."""
+    if method not in ("waveform", "timecode"):
+        raise ToolError("method must be waveform or timecode")
+    if len(clips) < 2:
+        raise ToolError("need at least one video and one audio clip")
+    resolve = _resolve()
+    _, proj = _project()
+    targets = _pool_clips(proj, clips)
+    if isinstance(channel, str):
+        if channel not in SYNC_CHANNELS:
+            raise ToolError("channel must be auto, mix or a channel number")
+        channel = _constant(resolve, SYNC_CHANNELS[channel])
+    settings = {
+        _constant(resolve, "AUDIO_SYNC_MODE"): _constant(resolve, "AUDIO_SYNC_" + method.upper()),
+        _constant(resolve, "AUDIO_SYNC_CHANNEL_NUMBER"): channel,
+        _constant(resolve, "AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO"): retain_embedded_audio,
+        _constant(resolve, "AUDIO_SYNC_RETAIN_VIDEO_METADATA"): retain_video_metadata,
+    }
+    returned = bool(proj.GetMediaPool().AutoSyncAudio(targets, settings))
+    synced = {c.GetName(): c.GetClipProperty("Synced Audio") or None for c in targets}
+    if not any(synced.values()):
+        raise ToolError("no clip was synced (check the clips overlap in timecode or share audible sound)")
+    return {"resolve_reported": returned, "synced_audio": synced}
+
+
+@_tool
+def transcribe_audio(clips: list[str], speaker_detection: bool = False) -> list[dict]:
+    """Transcribe media-pool clips (by name) so text-based editing and captions can use them (Studio).
+    speaker_detection labels who is speaking."""
+    _, proj = _project()
+    out = []
+    for c in _pool_clips(proj, clips):
+        ok = bool(c.TranscribeAudio(speaker_detection))
+        out.append({"clip": c.GetName(), "transcribed": ok, "preview": c.GetClipProperty("Transcription") or None})
+    if not any(r["transcribed"] for r in out):
+        raise ToolError("transcription failed (Studio only)")
+    return out
+
+
+CAPTION_LANGUAGES = (
+    "auto", "danish", "dutch", "english", "french", "german", "italian", "japanese", "korean",
+    "mandarin_simplified", "mandarin_traditional", "norwegian", "portuguese", "russian", "spanish", "swedish",
+)
+CAPTION_PRESETS = {"default": "AUTO_CAPTION_SUBTITLE_DEFAULT", "teletext": "AUTO_CAPTION_TELETEXT", "netflix": "AUTO_CAPTION_NETFLIX"}
+
+
+@_tool
+def create_subtitles(
+    language: str = "auto",
+    preset: str = "default",
+    lines: int = 1,
+    chars_per_line: int | None = None,
+    gap: int | None = None,
+) -> dict:
+    """Generate a subtitle track from the timeline's dialogue (Studio). language: auto or one of Resolve's
+    caption languages; preset: default, teletext or netflix; lines: 1 or 2 per caption; chars_per_line 1-60;
+    gap 0-10 frames between captions. Verified by the subtitle track count."""
+    if language not in CAPTION_LANGUAGES:
+        raise ToolError(f"unsupported caption language: {language} (one of {', '.join(CAPTION_LANGUAGES)})")
+    if preset not in CAPTION_PRESETS:
+        raise ToolError(f"unknown preset: {preset} (default, teletext or netflix)")
+    if lines not in (1, 2):
+        raise ToolError("lines must be 1 or 2")
+    if chars_per_line is not None and not 1 <= chars_per_line <= 60:
+        raise ToolError("chars_per_line must be 1-60")
+    if gap is not None and not 0 <= gap <= 10:
+        raise ToolError("gap must be 0-10 frames")
+    resolve = _resolve()
+    _, tl = _timeline()
+    settings = {
+        _constant(resolve, "SUBTITLE_LANGUAGE"): _constant(resolve, "AUTO_CAPTION_" + language.upper()),
+        _constant(resolve, "SUBTITLE_CAPTION_PRESET"): _constant(resolve, CAPTION_PRESETS[preset]),
+        _constant(resolve, "SUBTITLE_LINE_BREAK"): _constant(resolve, "AUTO_CAPTION_LINE_" + ("SINGLE" if lines == 1 else "DOUBLE")),
+    }
+    if chars_per_line is not None:
+        settings[_constant(resolve, "SUBTITLE_CHARS_PER_LINE")] = chars_per_line
+    if gap is not None:
+        settings[_constant(resolve, "SUBTITLE_GAP")] = gap
+    before = int(tl.GetTrackCount("subtitle") or 0)
+    returned = bool(tl.CreateSubtitlesFromAudio(settings))
+    after = int(tl.GetTrackCount("subtitle") or 0)
+    if after <= before:
+        raise ToolError("no subtitle track was created (Studio only; the timeline needs audible dialogue)")
+    return {"resolve_reported": returned, "subtitle_track": after,
+            "captions": len(tl.GetItemListInTrack("subtitle", after) or [])}
 
 
 if __name__ == "__main__":

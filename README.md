@@ -72,7 +72,7 @@ Notes:
   | `Scaling` | `project` `crop` `fit` `fill` `stretch` |
   | `ResizeFilter` | `project` `sharper` `smoother` `bicubic` `bilinear` `bessel` `box` `catmull_rom` `cubic` `gaussian` `lanczos` `mitchell` `nearest_neighbor` `quadratic` `sinc` `linear` |
 
-  Enum keys take the name (case, spaces and hyphens are ignored) or Resolve's number. Clip speed cannot be set through the API; `RetimeProcess`/`MotionEstimation` only choose how an existing speed change is rendered.
+  Enum keys take the name (case, spaces and hyphens are ignored) or Resolve's number. `RetimeProcess`/`MotionEstimation` choose how a speed change is rendered; the speed itself is set with `set_speed` (Resolve 21.1+).
 - `insert_title` inserts at the playhead. `text` is applied only when `fusion=True` and the Fusion title has a `Template` tool; `text_set` says whether it was.
 - `add_marker` takes `frame` relative to the timeline start, not an absolute frame. `note` is used as the marker name too (or `frame <n>` when empty).
 
@@ -101,6 +101,34 @@ Notes:
 - `stabilize` and `smart_reframe` can keep analysing after they return. `smart_reframe` and `detect_scene_cuts` are Studio features: on the free edition Resolve opens an upgrade dialog that blocks further API calls until it is closed.
 - `dynamic_zoom` is a Ken Burns move built from a keyframed Fusion `Transform` over the clip's comp range, not Resolve's Dynamic Zoom checkbox (the API cannot switch that on). Refine it with `set_fusion_input(node="DynamicZoom", ...)`.
 - `insert_fusion_effect` adds each effect before `MediaOut1`, so repeated calls build a chain in the order given. `tool_type` is a Fusion registry id (`SoftGlow`, `Glow`, `Blur`, `Sharpen`, `FilmGrain`, `ColorCorrector`, `DirectionalBlur`, `Defocus`, …). ResolveFX plugins are available in Fusion under their OFX id; check the id in Resolve's Fusion page.
+
+### Audio / Fairlight
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `fairlight_info` | — | `{tracks: [{index, name, format, enabled, locked, voice_isolation, items}], fairlight_presets, normalize_modes}` | |
+| `apply_fairlight_preset` | `name: str` | Confirmation string | Unknown preset; Resolve older than 20.2.2 |
+| `add_track` | `track_type: str = "audio"`, `format: str = "stereo"` (`mono` `stereo` `5.1` `7.1` `adaptive1`…`adaptive36`), `name: str \| None` | `{track_type, index, name, format}` | Unknown type or format |
+| `set_track` | `track_type: str`, `index: int`, `name`, `enabled`, `locked` (any of them) | `{track_type, index, name, enabled, locked}` | Track not found; nothing to change |
+| `delete_track` | `track_type: str`, `index: int` | Confirmation string with the number of items removed | Track not found |
+| `voice_isolation` | `track: int`, `enabled: bool = True`, `amount: int = 50` (0–100) | `{track, state}` | Track not found; Studio only |
+| `normalize_audio` | `items: list[int]`, `loudness: float` (LKFS) **or** `level: float` (dBFS), `mode: str \| None`, `independent: bool = False`, `track: int = 1` | Confirmation string | No target; unknown mode; Resolve older than 21.1 |
+| `set_fades` | `item: int`, `fade_in`, `fade_out: int` (frames), `track: int = 1`, `track_type: str = "audio"` | `{item, fades}` | Negative or longer than the clip; Resolve older than 21.1 |
+| `set_speed` | `item: int`, `percent: float`, `pitch_correction`, `stretch_keyframes: bool \| None`, `ripple: bool = False`, `track`, `track_type: str = "video"` | `{item, speed, duration}` | Negative; Resolve older than 21.1 |
+| `convert_to_stereo` | — | Confirmation string | |
+| `insert_audio` | `path: str`, `start_offset: int = 0`, `duration: int = 0` (samples) | Confirmation string | File missing; Fairlight page not open |
+| `sync_audio` | `clips: list[str]` (media-pool names), `method: "waveform" \| "timecode"`, `channel: "auto" \| "mix" \| int`, `retain_embedded_audio`, `retain_video_metadata` | `{resolve_reported, synced_audio: {clip: synced file}}` | Fewer than 2 clips; nothing synced |
+| `transcribe_audio` | `clips: list[str]`, `speaker_detection: bool = False` | `[{clip, transcribed, preview}]` | Studio only |
+| `create_subtitles` | `language: str = "auto"`, `preset: "default" \| "teletext" \| "netflix"`, `lines: 1 \| 2`, `chars_per_line` (1–60), `gap` (0–10 frames) | `{resolve_reported, subtitle_track, captions}` | Unsupported language; nothing created |
+
+Notes:
+
+- **The API has no per-parameter mixer.** Clip and track volume, pan, EQ, dynamics, automation and FairlightFX cannot be read or set by any script (verified on live Resolve 21.0: `SetProperty("Volume")` returns False). The scriptable route to a finished mix is: build it once in the Fairlight page, save it as a Fairlight preset, then `apply_fairlight_preset` on each timeline. Levels between clips are handled with `normalize_audio`.
+- Loudness targets for `normalize_audio`: −14 LKFS (YouTube, Spotify), −16 (podcasts, Apple), −23 (EBU R128 broadcast), −24 (ATSC A/85). `mode` names come from `fairlight_info`; without it Resolve uses its default.
+- Disabling an audio track with `set_track(enabled=False)` mutes it in playback and render.
+- `sync_audio` and `create_subtitles` check the result themselves: Resolve's own success flag for both calls is unreliable in both directions, so `resolve_reported` is informational only.
+- Caption languages are Resolve's: `auto` `danish` `dutch` `english` `french` `german` `italian` `japanese` `korean` `mandarin_simplified` `mandarin_traditional` `norwegian` `portuguese` `russian` `spanish` `swedish`. Arabic is not among them.
+- `voice_isolation`, `transcribe_audio`, `create_subtitles` are Studio features; on the free edition Resolve opens an upgrade dialog that blocks further API calls until it is closed.
 
 ### Rendering
 

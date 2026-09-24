@@ -11,12 +11,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 class Clip:
     def __init__(self, name, frames=100):
         self.name, self.frames = name, frames
+        self.props, self.transcribed_with = {}, None
 
     def GetName(self):
         return self.name
 
     def GetClipProperty(self, key):
-        return str(self.frames) if key == "Frames" else None
+        return str(self.frames) if key == "Frames" else self.props.get(key)
+
+    def TranscribeAudio(self, speaker_detection=None):
+        if self.name.endswith(".wav") or self.name.endswith(".mov"):
+            self.transcribed_with = speaker_detection
+            self.props["Transcription"] = "hello and welcome..."
+            return True
+        return False
 
 
 class Folder:
@@ -88,6 +96,26 @@ class Item:
     def Stabilize(self):
         self.stabilized = self.media is not None
         return self.stabilized
+
+    def GetFades(self):
+        return getattr(self, "fades", {"FadeIn": 0.0, "FadeOut": 0.0})
+
+    def SetFades(self, fades):
+        if any(v > self.end - self.start for v in fades.values()):
+            return False
+        self.fades = {**self.GetFades(), **{k: float(v) for k, v in fades.items()}}
+        return True
+
+    def GetSpeed(self):
+        return getattr(self, "speed", {"Percentage": 100.0})
+
+    def SetSpeed(self, options):
+        self.speed_options = options
+        pct = options["Percentage"]
+        self.speed = {"Percentage": float(pct)}
+        if pct:
+            self.end = self.start + round((self.end - self.start) * 100 / pct)
+        return True
 
     def SmartReframe(self):
         self.reframed = True
@@ -372,6 +400,68 @@ class Timeline:
         self.playhead, self.settings = "01:00:00:00", {"timelineFrameRate": "24", "timelineResolutionWidth": "1920",
                                                          "timelineResolutionHeight": "1080", "timelineDropFrameTimecode": "0"}
         self.deleted, self.scene_cuts = None, False
+        self.track_names, self.track_formats, self.track_locked, self.track_enabled = {}, {("audio", 1): "stereo"}, {}, {}
+        self.voice, self.normalized, self.captioned_with = {}, None, None
+        self.add_track_takes_dict = True
+
+    def AddTrack(self, kind, sub=None):
+        if kind == "audio" and isinstance(sub, dict) and not self.add_track_takes_dict:
+            raise TypeError("AddTrack() takes a sub-type string on this build")
+        n = self.GetTrackCount(kind) + 1
+        self.tracks[(kind, n)] = []
+        if kind == "audio":
+            self.track_formats[(kind, n)] = sub["audioType"] if isinstance(sub, dict) else (sub or "stereo")
+        return True
+
+    def DeleteTrack(self, kind, n):
+        del self.tracks[(kind, n)]
+        return True
+
+    def SetTrackName(self, kind, n, name):
+        self.track_names[(kind, n)] = name
+        return True
+
+    def SetTrackEnable(self, kind, n, on):
+        self.track_enabled[(kind, n)] = on
+        return True
+
+    def SetTrackLock(self, kind, n, on):
+        self.track_locked[(kind, n)] = on
+        return True
+
+    def GetIsTrackLocked(self, kind, n):
+        return self.track_locked.get((kind, n), False)
+
+    def GetTrackSubType(self, kind, n):
+        return self.track_formats.get((kind, n), "")
+
+    def GetVoiceIsolationState(self, n):
+        return self.voice.get(n, {"isEnabled": False, "amount": 0})
+
+    def SetVoiceIsolationState(self, n, state):
+        self.voice[n] = state
+        return True
+
+    def GetNormalizeAudioModes(self):
+        return ["Sample Peak Program", "True Peak Program", "ITU-R BS.1770-4"]
+
+    def NormalizeAudioLevel(self, items, options):
+        self.normalized = (items, options)
+        return True
+
+    def ConvertTimelineToStereo(self):
+        self.stereo = True
+        return True
+
+    def CreateSubtitlesFromAudio(self, settings):
+        self.captioned_with = settings
+        if not self.has_dialogue:
+            return True  # Resolve's flag is unreliable: reports success, creates nothing
+        n = self.GetTrackCount("subtitle") + 1
+        self.tracks[("subtitle", n)] = [Item("caption", 0, 10), Item("caption", 10, 20)]
+        return False  # ...and can report failure after creating the track
+
+    has_dialogue = True
 
     def GetSetting(self, key):
         return self.settings.get(key)
@@ -380,10 +470,10 @@ class Timeline:
         return len([k for k in self.tracks if k[0] == kind])
 
     def GetTrackName(self, kind, n):
-        return f"{kind[0].upper()}{n}"
+        return self.track_names.get((kind, n), f"{kind[0].upper()}{n}")
 
     def GetIsTrackEnabled(self, kind, n):
-        return True
+        return self.track_enabled.get((kind, n), True)
 
     def GetCurrentTimecode(self):
         return self.playhead
@@ -475,6 +565,14 @@ class MediaPool:
     def GetRootFolder(self):
         return self.root
 
+    def AutoSyncAudio(self, clips, settings):
+        self.synced_with = (clips, settings)
+        for c in clips:
+            c.props["Synced Audio"] = "sound.wav" if self.can_sync else ""
+        return False  # unreliable flag, as measured on live Resolve
+
+    can_sync = True
+
     def ImportMedia(self, paths):
         clips = [Clip(Path(p).name) for p in paths]
         self.root.clips.extend(clips)
@@ -514,6 +612,14 @@ class Project:
 
     def GetGallery(self):
         return self.gallery
+
+    def ApplyFairlightPresetToCurrentTimeline(self, name):
+        self.fairlight_preset = name
+        return name in ("Dialogue Mix", "Podcast")
+
+    def InsertAudioToCurrentTrackAtPlayhead(self, path, offset, duration):
+        self.inserted_audio = (path, offset, duration)
+        return True
 
     def ExportCurrentFrameAsStill(self, path):
         if not Path(path).parent.is_dir():
@@ -611,6 +717,19 @@ class ProjectManager:
 
 class Resolve:
     EXPORT_LUT_17PTCUBE, EXPORT_LUT_33PTCUBE, EXPORT_LUT_65PTCUBE = 0, 1, 2
+    NORMALIZE_AUDIO_SET_LEVEL_RELATIVE, NORMALIZE_AUDIO_SET_LEVEL_INDEPENDENT = 0, 1
+    AUDIO_SYNC_MODE, AUDIO_SYNC_CHANNEL_NUMBER = "mode", "channel"
+    AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO, AUDIO_SYNC_RETAIN_VIDEO_METADATA = "embedded", "metadata"
+    AUDIO_SYNC_WAVEFORM, AUDIO_SYNC_TIMECODE = 10, 11
+    AUDIO_SYNC_CHANNEL_AUTOMATIC, AUDIO_SYNC_CHANNEL_MIX = -1, -2
+    SUBTITLE_LANGUAGE, SUBTITLE_CAPTION_PRESET, SUBTITLE_LINE_BREAK = "lang", "preset", "linebreak"
+    SUBTITLE_CHARS_PER_LINE, SUBTITLE_GAP = "cpl", "gap"
+    AUTO_CAPTION_AUTO, AUTO_CAPTION_ENGLISH, AUTO_CAPTION_FRENCH = 100, 101, 102
+    AUTO_CAPTION_SUBTITLE_DEFAULT, AUTO_CAPTION_TELETEXT, AUTO_CAPTION_NETFLIX = 200, 201, 202
+    AUTO_CAPTION_LINE_SINGLE, AUTO_CAPTION_LINE_DOUBLE = 300, 301
+
+    def GetFairlightPresets(self):
+        return ["Dialogue Mix", "Podcast"]
 
     def __init__(self):
         self.pm = ProjectManager()

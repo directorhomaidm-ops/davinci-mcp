@@ -174,7 +174,9 @@ def test_all_tools_registered():
         "fusion_nodes", "fusion_inputs", "add_fusion_node", "connect_fusion_nodes", "delete_fusion_node",
         "set_fusion_input", "timeline_overview", "view_frame", "add_transition", "delete_items",
         "set_clip_enabled", "stabilize", "smart_reframe", "detect_scene_cuts", "dynamic_zoom",
-        "insert_fusion_effect",
+        "insert_fusion_effect", "fairlight_info", "apply_fairlight_preset", "add_track", "set_track",
+        "delete_track", "voice_isolation", "normalize_audio", "set_fades", "set_speed", "convert_to_stereo",
+        "insert_audio", "sync_audio", "transcribe_audio", "create_subtitles",
     }
 
 
@@ -786,3 +788,187 @@ def test_insert_fusion_effect_chains(project):
         d.insert_fusion_effect(1, "NoSuchFx")
     with pytest.raises(ToolError, match="SoftGlow1 was added to the chain but a setting failed: SoftGlow1 has no input Strength"):
         d.insert_fusion_effect(2, "SoftGlow", settings={"Strength": 1})
+
+
+# --- audio / Fairlight ---
+
+
+@pytest.fixture
+def audio(project):
+    """Two dialogue items on A1."""
+    from conftest import Item
+
+    tl = project.current
+    items = [Item("vo_1.wav", 86400, 86500, media=object(), timeline=tl), Item("vo_2.wav", 86500, 86600, media=object(), timeline=tl)]
+    tl.tracks[("audio", 1)] = items
+    return items
+
+
+def test_fairlight_info(project, audio):
+    project.current.voice[1] = {"isEnabled": True, "amount": 40}
+    info = d.fairlight_info()
+    assert info["tracks"] == [{"index": 1, "name": "A1", "format": "stereo", "enabled": True, "locked": False,
+                               "voice_isolation": {"isEnabled": True, "amount": 40}, "items": 2}]
+    assert info["fairlight_presets"] == ["Dialogue Mix", "Podcast"]
+    assert "ITU-R BS.1770-4" in info["normalize_modes"]
+
+
+def test_fairlight_info_on_older_resolve(project, resolve, monkeypatch):
+    monkeypatch.delattr(type(resolve), "GetFairlightPresets")
+    monkeypatch.delattr(type(project.current), "GetNormalizeAudioModes")
+    info = d.fairlight_info()
+    assert (info["fairlight_presets"], info["normalize_modes"]) == (None, None)
+
+
+def test_apply_fairlight_preset(project, monkeypatch):
+    assert d.apply_fairlight_preset("Podcast") == "applied Fairlight preset 'Podcast'"
+    with pytest.raises(ToolError, match="cannot apply Fairlight preset: Nope"):
+        d.apply_fairlight_preset("Nope")
+    monkeypatch.delattr(type(project), "ApplyFairlightPresetToCurrentTimeline")
+    with pytest.raises(ToolError, match="needs DaVinci Resolve 20.2.2"):
+        d.apply_fairlight_preset("Podcast")
+
+
+def test_add_track(project):
+    assert d.add_track(format="5.1", name="Music") == {"track_type": "audio", "index": 2, "name": "Music", "format": "5.1"}
+    assert d.add_track("video")["index"] == 2
+    with pytest.raises(ToolError, match="unknown audio format: quad"):
+        d.add_track(format="quad")
+    with pytest.raises(ToolError, match="unknown track type"):
+        d.add_track("midi")
+
+
+def test_add_track_older_string_signature(project):
+    project.current.add_track_takes_dict = False
+    assert d.add_track(format="mono")["format"] == "mono"
+    assert project.current.GetTrackCount("audio") == 2  # exactly one track added
+
+
+def test_set_and_delete_track(project, audio):
+    out = d.set_track("audio", 1, name="Dialogue", enabled=False, locked=True)
+    assert out == {"track_type": "audio", "index": 1, "name": "Dialogue", "enabled": False, "locked": True}
+    with pytest.raises(ToolError, match="nothing to change"):
+        d.set_track("audio", 1)
+    with pytest.raises(ToolError, match=r"audio track 3 not found \(1 audio track"):
+        d.set_track("audio", 3, enabled=True)
+    assert d.delete_track("audio", 1) == "deleted audio track 1 (2 item(s))"
+    assert project.current.GetTrackCount("audio") == 0
+
+
+def test_voice_isolation(project, audio):
+    assert d.voice_isolation(1, amount=70) == {"track": 1, "state": {"isEnabled": True, "amount": 70}}
+    with pytest.raises(ToolError, match="0-100"):
+        d.voice_isolation(1, amount=150)
+    with pytest.raises(ToolError, match="audio track 2 not found"):
+        d.voice_isolation(2)
+
+
+def test_normalize_audio(project, audio):
+    assert d.normalize_audio([1, 2], loudness=-14) == "normalized 2 item(s) to -14 LKFS"
+    items, options = project.current.normalized
+    assert items == audio
+    assert options == {"setLevelMode": 0, "targetLoudness": -14.0}
+    d.normalize_audio([1], level=-1, mode="True Peak Program", independent=True)
+    assert project.current.normalized[1] == {"setLevelMode": 1, "normalizationMode": "True Peak Program", "targetLevel": -1.0}
+
+
+def test_normalize_audio_errors(project, audio, monkeypatch):
+    with pytest.raises(ToolError, match="give a target"):
+        d.normalize_audio([1])
+    with pytest.raises(ToolError, match="unknown mode: Loud"):
+        d.normalize_audio([1], loudness=-23, mode="Loud")
+    with pytest.raises(ToolError, match="item 3 not found on audio track 1"):
+        d.normalize_audio([3], loudness=-23)
+    monkeypatch.delattr(type(project.current), "NormalizeAudioLevel")
+    with pytest.raises(ToolError, match="NormalizeAudioLevel needs DaVinci Resolve 21.1"):
+        d.normalize_audio([1], loudness=-23)
+
+
+def test_set_fades(project, audio):
+    assert d.set_fades(1, fade_in=12, fade_out=24) == {"item": "vo_1.wav", "fades": {"FadeIn": 12.0, "FadeOut": 24.0}}
+    d.set_fades(1, fade_out=0)
+    assert audio[0].fades == {"FadeIn": 12.0, "FadeOut": 0.0}
+    with pytest.raises(ToolError, match="give fade_in and/or fade_out"):
+        d.set_fades(1)
+    with pytest.raises(ToolError, match="0 or more"):
+        d.set_fades(1, fade_in=-1)
+    with pytest.raises(ToolError, match="fade longer than the clip"):
+        d.set_fades(1, fade_in=500)
+
+
+def test_set_fades_video(project):
+    _two_items(project)
+    assert d.set_fades(1, fade_in=24, track_type="video")["fades"]["FadeIn"] == 24.0
+
+
+def test_set_speed(project):
+    a, _ = _two_items(project)
+    out = d.set_speed(1, 50, pitch_correction=True, ripple=True)
+    assert out == {"item": "a.mov", "speed": {"Percentage": 50.0}, "duration": 200}
+    assert a.speed_options == {"Percentage": 50, "RippleTimeline": True, "PitchCorrection": True}
+    with pytest.raises(ToolError, match="0 or more"):
+        d.set_speed(1, -10)
+
+
+def test_set_speed_needs_21_1(project, monkeypatch):
+    a, _ = _two_items(project)
+    monkeypatch.delattr(type(a), "SetSpeed")
+    with pytest.raises(ToolError, match="SetSpeed needs DaVinci Resolve 21.1"):
+        d.set_speed(1, 50)
+
+
+def test_convert_to_stereo_and_insert_audio(project, tmp_path):
+    assert d.convert_to_stereo() == "timeline converted to stereo"
+    f = tmp_path / "sfx.wav"
+    f.write_bytes(b"")
+    assert d.insert_audio(str(f), duration=48000) == "inserted sfx.wav at the playhead"
+    assert project.inserted_audio == (str(f), 0, 48000)
+    with pytest.raises(ToolError, match="file not found"):
+        d.insert_audio(str(tmp_path / "missing.wav"))
+
+
+def test_sync_audio_verifies_by_readback(project):
+    from conftest import Clip
+
+    project.pool.root.clips.append(Clip("sound.wav"))
+    out = d.sync_audio(["a.mov", "sound.wav"], channel="mix", retain_embedded_audio=True)
+    # Resolve returned False, but the clips are linked: the readback decides.
+    assert out == {"resolve_reported": False, "synced_audio": {"a.mov": "sound.wav", "sound.wav": "sound.wav"}}
+    clips, settings = project.pool.synced_with
+    assert settings == {"mode": 10, "channel": -2, "embedded": True, "metadata": False}
+    project.pool.can_sync = False
+    with pytest.raises(ToolError, match="no clip was synced"):
+        d.sync_audio(["a.mov", "sound.wav"], method="timecode")
+
+
+def test_sync_audio_errors(project):
+    with pytest.raises(ToolError, match="waveform or timecode"):
+        d.sync_audio(["a.mov", "b.mov"], method="ear")
+    with pytest.raises(ToolError, match="at least one video and one audio"):
+        d.sync_audio(["a.mov"])
+    with pytest.raises(ToolError, match="clips not in media pool: nope.wav"):
+        d.sync_audio(["a.mov", "nope.wav"])
+    with pytest.raises(ToolError, match="channel must be"):
+        d.sync_audio(["a.mov", "b.mov"], channel="left")
+
+
+def test_transcribe_audio(project):
+    out = d.transcribe_audio(["a.mov"], speaker_detection=True)
+    assert out == [{"clip": "a.mov", "transcribed": True, "preview": "hello and welcome..."}]
+
+
+def test_create_subtitles_verifies_by_track_count(project):
+    out = d.create_subtitles(language="english", preset="netflix", lines=2, chars_per_line=42, gap=2)
+    # Resolve reported False, but a subtitle track appeared: that is what counts.
+    assert out == {"resolve_reported": False, "subtitle_track": 1, "captions": 2}
+    assert project.current.captioned_with == {"lang": 101, "preset": 202, "linebreak": 301, "cpl": 42, "gap": 2}
+    project.current.has_dialogue = False
+    with pytest.raises(ToolError, match="no subtitle track was created"):
+        d.create_subtitles()
+
+
+def test_create_subtitles_errors(project):
+    for kwargs, msg in [({"language": "arabic"}, "unsupported caption language: arabic"), ({"preset": "bbc"}, "unknown preset"),
+                        ({"lines": 3}, "1 or 2"), ({"chars_per_line": 80}, "1-60"), ({"gap": 11}, "0-10")]:
+        with pytest.raises(ToolError, match=msg):
+            d.create_subtitles(**kwargs)
