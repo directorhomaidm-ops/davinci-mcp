@@ -815,7 +815,7 @@ class MediaPool:
         for c in clips:
             if isinstance(c, dict):
                 frames = c["endFrame"] - c["startFrame"] + 1
-                tl._append(c["mediaPoolItem"].name, frames, c["trackIndex"], c["mediaPoolItem"])
+                tl._append(c["mediaPoolItem"].name, frames, c.get("trackIndex", 1), c["mediaPoolItem"])
             else:
                 tl._append(c.name, c.frames, media=c)
         self.appended.append(clips)
