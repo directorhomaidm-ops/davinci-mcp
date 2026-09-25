@@ -411,6 +411,25 @@ set_fusion_input(item=1, node="Blur1", input="XBlurSize", value=8)
 set_fusion_input(item=1, node="Push", input="Size", keyframes={"0": 1.0, "120": 1.15})
 ```
 
+### Animated titles and templates
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `animated_title` | `text: str`, `animation = "fade"`, `exit = "fade"`, `frame: int \| None` (default playhead), `speed = 12` (frames), `font`, `style`, `size`, `color: [r, g, b]`, `position: [x, y]` | `{track, item, title, node, set, animation, exit, animation_frames, duration}` | Unknown animation; insert moved existing clips |
+| `lower_third` | `name: str`, `role: str \| None`, `frame`, `side: "left" \| "right" = "left"`, `animation`, `exit = "fade"`, `speed = 10`, `font`, `size = 0.045`, `color` | as `animated_title` + `side` | Bad side |
+| `save_template` | `item: int`, `name: str`, `track = 1`, `overwrite = False` | `{template, path, source, duration, title, texts}` | Name exists; no Fusion comp |
+| `list_templates` | — | `{folder, saved, installed_titles}` | — |
+| `apply_template` | `name: str`, `item: int \| None` (None: new title), `frame`, `text`, `track = 1` | `{template, track, item, name, text?}` | Template not found; import failed |
+| `batch_titles` | `entries: [{frame, text}]`, `template: str \| None`, `animation`, `exit`, `speed`, `font`, `size`, `color`, `position` | list of `animated_title` / `apply_template` results | Bad entry; missing template; stops at the first failure |
+
+Animations: `none`, `fade`, `pop`, `zoom`, `slide_up`, `slide_down`, `slide_left`, `slide_right`, `typewriter`. An exit slide continues in the same direction as the entrance.
+
+Notes:
+
+- Motion is keyframed on a Transform named `TitleMotion` between the Text+ (`Template`) and `MediaOut1`; typing uses the Text+ write-on range; fades are the item's own fades (Resolve 21.1+). Refine with `set_fusion_input(node="TitleMotion")`, `set_title_text` and `list_keyframes`.
+- Resolve inserts a title into the targeted track at the playhead. If that would move or cut existing clips, the tool reports it and asks you to undo in Resolve (Cmd/Ctrl+Z): put the playhead where the track is free, or target an empty track above the edit.
+- Templates are Fusion comps saved in `DAVINCI_MCP_TEMPLATES` (default `~/Documents/DaVinci MCP Templates`) with a `.json` sidecar. `apply_template` on a clip (`item=`) adds the comp as the clip's active Fusion composition, e.g. a saved effect look. `installed_titles` lists the `.setting` titles in Resolve's Fusion Titles folder; insert those with `insert_title(name, fusion=True)`.
+
 ### Social media delivery
 
 | Tool | Parameters | Returns | Errors |
@@ -453,6 +472,7 @@ Notes:
 |---|---|---|
 | `RESOLVE_SCRIPT_API` | platform default | Resolve `Developer/Scripting` directory |
 | `RESOLVE_SCRIPT_LIB` | platform default | Path to `fusionscript.so` / `fusionscript.dll` |
+| `DAVINCI_MCP_TEMPLATES` | `~/Documents/DaVinci MCP Templates` | Where `save_template` keeps templates |
 | `RESOLVE_LUT_DIR` | platform master LUT folder | Where outside LUTs are installed for `apply_lut` / `set_node_lut` |
 | `DAVINCI_MCP_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 

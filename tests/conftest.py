@@ -427,15 +427,35 @@ class Item:
         return comp
 
     def ImportFusionComp(self, path):
-        if not path.endswith(".comp"):
+        if not path.endswith(".comp") or not Path(path).exists():
             return None
-        comp = FuComp(Path(path).stem)
+        name = Path(path).stem
+        taken = [c.name for c in self.comps]
+        name = name if name not in taken else f"{name} {len(taken) + 1}"  # assumed: Resolve keeps names unique
+        comp = FuComp(name, template="TextPlus" in Path(path).read_text())
         self.comps.append(comp)
         return comp
 
     def ExportFusionComp(self, path, index):
         self.exported_comp = (path, index)
-        return 1 <= index <= len(self.comps)
+        if not 1 <= index <= len(self.comps):
+            return False
+        Path(path).write_text("{ Tools = { " + ", ".join(t.kind for t in self.comps[index - 1].tools) + " } }")
+        return True
+
+    def LoadFusionCompByName(self, name):
+        comp = next((c for c in self.comps if c.name == name), None)
+        if comp is None:
+            return False
+        self.active_comp = name
+        return True
+
+    def DeleteFusionCompByName(self, name):
+        comp = next((c for c in self.comps if c.name == name), None)
+        if comp is None or len(self.comps) == 1:
+            return False  # assumed: an item keeps at least one composition
+        self.comps.remove(comp)
+        return True
 
 
 PNG = b"\x89PNG\r\n\x1a\n"
@@ -447,7 +467,7 @@ TOOL_INPUTS = {
     "Transform": {"Input": "Image", "Size": "Number", "Center": "Point", "Angle": "Number"},
     "Merge": {"Background": "Image", "Foreground": "Image", "Blend": "Number"},
     "TextPlus": {"StyledText": "Text", "Font": "Text", "Style": "Text", "Size": "Number", "Center": "Point",
-                 "Red1": "Number", "Green1": "Number", "Blue1": "Number"},
+                 "Red1": "Number", "Green1": "Number", "Blue1": "Number", "End": "Number"},
     "EllipseMask": {"Width": "Number", "Height": "Number", "SoftEdge": "Number", "Invert": "Number", "Center": "Point"},
     "BrightnessContrast": {"Input": "Image", "Gain": "Number", "EffectMask": "Mask"},
     "SoftGlow": {"Input": "Image", "Gain": "Number", "Threshold": "Number"},
@@ -569,10 +589,13 @@ class FuComp:
         self.value_writes_under_lock = self.unlocked_structural_edits = 0
         self.undo_open = self.undo_steps = 0
         self.attrs = {"COMPN_RenderStart": 0.0, "COMPN_RenderEnd": 99.0}
-        self.AddTool("MediaIn", -1, -1, locked_ok=True)
-        self.AddTool("MediaOut", -1, -1, locked_ok=True)
-        if template:
-            self.AddTool("TextPlus", -1, -1, locked_ok=True).name = "Template"
+        if not template:
+            self.AddTool("MediaIn", -1, -1, locked_ok=True)
+        out = self.AddTool("MediaOut", -1, -1, locked_ok=True)
+        if template:  # a Fusion title: Template (Text+) feeds MediaOut1, no MediaIn
+            text = self.AddTool("TextPlus", -1, -1, locked_ok=True)
+            text.name = "Template"
+            out.inputs["Input"].source = text.output
 
     def structural(self):
         if not self.locked:
