@@ -22,6 +22,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -93,11 +94,37 @@ def write_wav(path, seconds=4, rate=48000, freq=440.0, level_db=-12.0):
                                for i in range(rate * seconds)))
 
 
+def write_ramp_png(path, w, h, lo, hi, cast):
+    """A gray ramp (lo..hi across) over the top three quarters and a saturated orange ramp below, times `cast`:
+    a picture with neutral areas and a known flaw for the color correction checks."""
+    rows = []
+    for y in range(h):
+        row = bytearray()
+        for x in range(w):
+            v = lo + (hi - lo) * x / (w - 1)
+            base = (v, v, v) if y < h * 3 // 4 else (v, 0.4 * v, 0.2 * v)
+            row += bytes(min(255, round(255 * b * c)) for b, c in zip(base, cast))
+        rows.append(b"\x00" + bytes(row))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    Path(path).write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                           + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+
+
 def make_media(folder, frames=48):
     for name, rgb in (("red", (200, 30, 30)), ("blue", (30, 60, 200))):
         (folder / name).mkdir()
         for i in range(1, frames + 1):
             write_png(folder / name / f"{name}_{i:04d}.png", 640, 360, rgb)
+    # color correction material: a flat warm picture and a dark cool one, 24 frames each
+    for name, lo, hi, cast in (("warmflat", 0.15, 0.65, (1.15, 1.0, 0.8)), ("cooldark", 0.02, 0.45, (0.85, 1.0, 1.2))):
+        (folder / name).mkdir()
+        first = folder / name / f"{name}_0001.png"
+        write_ramp_png(first, 320, 180, lo, hi, cast)
+        for i in range(2, 25):
+            shutil.copyfile(first, folder / name / f"{name}_{i:04d}.png")
     write_wav(folder / "tone.wav")
 
 
@@ -329,6 +356,16 @@ def run_checks(args, work, is_211):
     step("social: social_export tiktok + youtube (queued only)", lambda: d.social_export(
         ["tiktok", "youtube"], str(work), timeline="Check", start=False), needs=have_items)
 
+    print("\nAutomatic color correction")
+    have_ramps = step("color auto: import the warm/flat and cool/dark ramps, timeline 'Color Check'",
+                      lambda: _color_check_timeline(work))
+    need_ramps = True if have_ramps else "ramps not imported"
+    step("color auto: analyze_color sees the warm flat picture", lambda: _expect_verdict(1, "warm cast"),
+         needs=need_ramps)
+    step("color auto: auto_color item 1", lambda: _auto_color(work), needs=need_ramps,
+         note="display_exponent shows the curve color management adds; error under 0.03 is a pass")
+    step("color auto: shot_match item 2 to item 1", lambda: _shot_match(), needs=need_ramps)
+
     print("\nAnimated titles and templates")
     d.TEMPLATES_DIR = str(work / "templates")  # keep the check's templates out of your own folder
     step("titles: animated_title pop + slide_left exit at the end of 'Check'", lambda: _anim_title(),
@@ -408,6 +445,40 @@ def _dctl():
     bad = d.validate_dctl("float x;")
     expect(not bad["valid"], "broken DCTL accepted")
     return {"good": ok, "bad": bad}
+
+
+def _color_check_timeline(work):
+    d.import_image_sequence(str(work / "warmflat" / "warmflat_%04d.png"), 1, 24, bin="Live Check")
+    d.import_image_sequence(str(work / "cooldark" / "cooldark_%04d.png"), 1, 24, bin="Live Check")
+    names = sorted(c["name"] for c in d.list_clips() if c["name"].startswith(("warmflat", "cooldark")))
+    expect(len(names) == 2, f"ramps not in the pool: {names}")
+    d.create_timeline("Color Check")
+    d.switch_timeline("Color Check")
+    d.append_clips([n for n in names if n.startswith("warmflat")] + [n for n in names if n.startswith("cooldark")])
+    return names
+
+
+def _expect_verdict(item, word):
+    d.switch_timeline("Color Check")
+    (row,) = d.analyze_color([item])
+    expect(word in row["verdict"], f"expected {word!r} in {row['verdict']}")
+    return {k: row[k] for k in ("verdict", "black", "white", "neutral", "luma", "neutral_from")}
+
+
+def _auto_color(work):
+    d.switch_timeline("Color Check")
+    (row,) = d.auto_color([1])
+    d.view_frame(frame=row["frame"], save_to=str(work / "frame_auto_color.png"))
+    expect(row["error"] < 0.03, f"did not converge: {row}")
+    return row
+
+
+def _shot_match():
+    d.switch_timeline("Color Check")
+    out = d.shot_match(1, [2])
+    row = out["matched"][0]
+    expect(row["error"] < 0.03, f"did not converge: {row}")
+    return out
 
 
 def _end(name):

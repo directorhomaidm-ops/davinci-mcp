@@ -24,6 +24,7 @@ import random
 import struct
 import subprocess
 import wave
+import zlib
 from array import array
 import os
 import shutil
@@ -1286,6 +1287,15 @@ def _timecode(tl, frame):
     return f"{h:02d}:{m:02d}:{s:02d}:{f:02d}"
 
 
+def _export_still(proj, path):
+    if not proj.ExportCurrentFrameAsStill(path) or not os.path.exists(path):
+        # Refused on some pages (live 21.1: after a render); the Edit page's viewer always works.
+        with _on_page(_resolve(), "edit"):
+            ok = proj.ExportCurrentFrameAsStill(path) and os.path.exists(path)
+        if not ok:
+            raise ToolError("ExportCurrentFrameAsStill failed, also from the Edit page")
+
+
 @_tool
 def view_frame(timecode: str | None = None, frame: int | None = None, save_to: str | None = None) -> list:
     """See the picture: move the playhead (to an absolute `timecode`, or absolute timeline `frame` as in
@@ -1300,12 +1310,7 @@ def view_frame(timecode: str | None = None, frame: int | None = None, save_to: s
     tmp = None if save_to else tempfile.mkdtemp(prefix="davinci_mcp_")
     path = os.path.abspath(save_to) if save_to else os.path.join(tmp, "frame.png")
     try:
-        if not proj.ExportCurrentFrameAsStill(path) or not os.path.exists(path):
-            # Refused on some pages (live 21.1: after a render); the Edit page's viewer always works.
-            with _on_page(_resolve(), "edit"):
-                ok = proj.ExportCurrentFrameAsStill(path) and os.path.exists(path)
-            if not ok:
-                raise ToolError("ExportCurrentFrameAsStill failed, also from the Edit page")
+        _export_still(proj, path)
         ext = os.path.splitext(path)[1].lower()
         note = f"frame at {_opt(tl, 'GetCurrentTimecode') or tc}" + (f", saved to {path}" if save_to else "")
         if ext not in (".png", ".jpg", ".jpeg"):
@@ -4767,6 +4772,378 @@ def batch_titles(entries: list[dict], template: str | None = None, animation: st
         except ToolError as err:
             raise ToolError(f"stopped at frame {e['frame']} after {len(made)} title(s): {err}") from err
     return made
+
+
+# --- Automatic color correction ---
+#
+# Resolve's API has no Auto Color or Shot Match call, so the picture is measured here: the frame Resolve shows is
+# exported as PNG (live 21.1 writes 8-bit RGB, barely compressed), decoded in pure Python and sampled. Corrections
+# are ASC CDLs on one node, found in a closed loop: apply, export again, measure, refine. Measuring the real output
+# keeps the result right under color management and the other nodes, which a one-shot formula would not.
+
+AUTO_TARGETS = {"black": 0.03, "white": 0.94, "mid": 0.42}
+CDL_LIMITS = {"slope": (0.25, 4.0), "offset": (-0.5, 0.5), "power": (0.25, 4.0)}
+
+
+def _png_pixels(path, samples=30000):
+    """(width, height, [(r, g, b) 0-1]) from a non-interlaced 8/16-bit RGB or RGBA PNG, sampled on a grid."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ToolError(f"{os.path.basename(path)} is not a PNG")
+    pos, idat, head = 8, [], None
+    while pos + 8 <= len(data):
+        (length,) = struct.unpack(">I", data[pos:pos + 4])
+        kind, body = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            head = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            idat.append(body)
+        elif kind == b"IEND":
+            break
+        pos += 12 + length
+    if head is None:
+        raise ToolError("PNG without a header")
+    w, h, depth, ctype, _, _, interlace = head
+    if interlace or ctype not in (2, 6) or depth not in (8, 16):
+        raise ToolError(f"unsupported PNG (color type {ctype}, {depth}-bit, interlace {interlace})")
+    chans = 3 if ctype == 2 else 4
+    bpp = chans * depth // 8
+    stride = w * bpp
+    raw = zlib.decompress(b"".join(idat))
+    ystep = max(1, int(math.sqrt(w * h / samples)))
+    xstep = ystep
+    prev, out, top = bytearray(stride), [], (1 << depth) - 1
+    for y in range(h):
+        base = y * (stride + 1)
+        ftype, row = raw[base], bytearray(raw[base + 1:base + 1 + stride])
+        if ftype == 1:
+            for i in range(bpp, stride):
+                row[i] = (row[i] + row[i - bpp]) & 255
+        elif ftype == 2:
+            row = bytearray((a + b) & 255 for a, b in zip(row, prev))
+        elif ftype == 3:
+            for i in range(stride):
+                row[i] = (row[i] + ((row[i - bpp] if i >= bpp else 0) + prev[i]) // 2) & 255
+        elif ftype == 4:
+            for i in range(stride):
+                a = row[i - bpp] if i >= bpp else 0
+                b, c = prev[i], (prev[i - bpp] if i >= bpp else 0)
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                row[i] = (row[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        elif ftype != 0:
+            raise ToolError(f"corrupt PNG row filter {ftype}")
+        prev = row
+        if y % ystep:
+            continue
+        for x in range(0, w, xstep):
+            i = x * bpp
+            if depth == 8:
+                out.append((row[i] / top, row[i + 1] / top, row[i + 2] / top))
+            else:
+                out.append(tuple(((row[i + 2 * k] << 8) | row[i + 2 * k + 1]) / top for k in range(3)))
+    return w, h, out
+
+
+def _pct(values, q):
+    return values[min(len(values) - 1, int(q * len(values)))]
+
+
+def _frame_stats(px):
+    n = len(px)
+    chans = [sorted(p[c] for p in px) for c in range(3)]
+    luma = [0.2126 * r + 0.7152 * g + 0.0722 * b for r, g, b in px]
+    neutral = [p for p, y in zip(px, luma) if max(p) - min(p) < 0.12 and 0.15 < y < 0.85]
+    ref = neutral if len(neutral) >= max(50, n // 50) else px
+    ys = sorted(luma)
+    r4 = lambda v: round(v, 4)  # noqa: E731
+    return {
+        "black": [r4(_pct(c, 0.005)) for c in chans],
+        "white": [r4(_pct(c, 0.995)) for c in chans],
+        "mean": [r4(math.fsum(c) / n) for c in chans],
+        "luma": {"p1": r4(_pct(ys, 0.01)), "median": r4(_pct(ys, 0.5)), "p99": r4(_pct(ys, 0.99)),
+                 "mean": r4(math.fsum(ys) / n)},
+        "neutral": [r4(math.fsum(p[c] for p in ref) / len(ref)) for c in range(3)],
+        "neutral_from": "neutral areas" if ref is neutral else "whole frame",
+        "saturation": r4(math.fsum(max(p) - min(p) for p in px) / n),
+        "clipped_pct": round(100 * sum(max(p) >= 0.995 for p in px) / n, 2),
+        "crushed_pct": round(100 * sum(min(p) <= 0.005 for p in px) / n, 2),
+        "pixels_sampled": n,
+    }
+
+
+def _verdict(st):
+    notes = []
+    m = st["luma"]["mean"]
+    if m < 0.3:
+        notes.append("underexposed")
+    elif m > 0.6:
+        notes.append("overexposed")
+    if st["luma"]["p99"] - st["luma"]["p1"] < 0.6:
+        notes.append("low contrast (flat)")
+    r, g, b = st["neutral"]
+    for d, pos, neg in ((r - b, "warm", "cool"), (g - (r + b) / 2, "green", "magenta")):
+        if abs(d) > 0.02:
+            notes.append(f"{pos if d > 0 else neg} cast")
+    if st["clipped_pct"] > 2:
+        notes.append(f"{st['clipped_pct']}% clipped highlights")
+    if st["crushed_pct"] > 2:
+        notes.append(f"{st['crushed_pct']}% crushed blacks")
+    return notes or ["balanced"]
+
+
+def _measure(proj, tl, frame):
+    if not tl.SetCurrentTimecode(_timecode(tl, frame)):
+        raise ToolError(f"cannot move the playhead to frame {frame}")
+    tmp = tempfile.mkdtemp(prefix="davinci_mcp_")
+    try:
+        path = os.path.join(tmp, "frame.png")
+        _export_still(proj, path)
+        return _frame_stats(_png_pixels(path)[2])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _mid_frame(it):
+    return int(it.GetStart()) + int(it.GetDuration()) // 2
+
+
+def _clampv(kind, v):
+    lo, hi = CDL_LIMITS[kind]
+    return min(hi, max(lo, v))
+
+
+def _neutral_goal(st, goal):
+    """Per-channel display targets for the neutral areas, from the latest measurement: absolute (shot match), or
+    the measured gray moved by the brightness error plus the cast still allowed (auto: `cast`; None keeps the
+    current cast)."""
+    if goal["neutral"] is not None:
+        return list(goal["neutral"])
+    gray = sum(st["neutral"]) / 3
+    level = gray + goal["mid"] - st["luma"]["mean"]
+    cast = goal["cast"] if goal["cast"] is not None else [n - gray for n in st["neutral"]]
+    return [min(0.97, max(0.03, level + d)) for d in cast]
+
+
+def _cdl_apply(v, s, o, p):
+    return min(1.0, max(0.0, v * s + o)) ** p
+
+
+def _solve_channel(lb, lw, ln, tb, tw, tn, g):
+    """Slope, offset, power taking this channel's scene values (black, white, neutral at an identity CDL, in the
+    CDL's own domain) to display targets, for a display that raises the CDL output to 1/g."""
+    lo, hi = CDL_LIMITS["power"]
+
+    def lin_for(p):
+        a, b = max(0.0, tb) ** (g / p), max(0.0, tw) ** (g / p)
+        if lw - lb < 1e-3:
+            return 1.0, 0.0
+        s_ = (b - a) / (lw - lb)
+        return s_, a - lb * s_
+
+    def resid(p):
+        s_, o_ = lin_for(p)
+        return _cdl_apply(ln, s_, o_, 1.0) - max(0.0, tn) ** (g / p)
+
+    grid = [lo + (hi - lo) * i / 60 for i in range(61)]
+    vals = [resid(p) for p in grid]
+    p = min(zip(grid, vals), key=lambda t: abs(t[1]))[0]
+    for (p0, r0), (p1, r1) in zip(zip(grid, vals), zip(grid[1:], vals[1:])):
+        if r0 == 0 or r0 * r1 < 0:
+            for _ in range(40):  # bisection inside the bracket
+                pm = (p0 + p1) / 2
+                rm = resid(pm)
+                if r0 * rm <= 0:
+                    p1 = pm
+                else:
+                    p0, r0 = pm, rm
+            p = (p0 + p1) / 2
+            break
+    s_, o_ = lin_for(p)
+    return _clampv("slope", s_), _clampv("offset", o_), p
+
+
+def _fit_display(base, hist):
+    """The display exponent g (display = CDL output ** (1/g)) that best predicts every measurement so far from the
+    identity measurement, ignoring clipped values. Only the black and white points are used: percentiles follow a
+    per-channel curve exactly, while the neutral-area mean does not (the set of neutral pixels moves)."""
+    if not hist:
+        return 1.0
+
+    def err(g):
+        e = 0.0
+        for cdl, st in hist:
+            for c in range(3):
+                for key in ("black", "white"):
+                    got, was = st[key][c], base[key][c]
+                    if not 0.01 < got < 0.99 or not 0.005 < was < 0.995:
+                        continue
+                    pred = _cdl_apply(was ** g, cdl[0][c], cdl[1][c], cdl[2][c]) ** (1 / g)
+                    e += (pred - got) ** 2
+        return e
+    grid = [0.4 + 0.02 * i for i in range(131)]  # 0.4-3.0
+    best = min(grid, key=err)
+    lo, hi = max(0.4, best - 0.02), min(3.0, best + 0.02)
+    return min((lo + (hi - lo) * i / 20 for i in range(21)), key=err)
+
+
+def _refine(base, tn, goal, g):
+    """The CDL that should take the identity picture `base` to the goal's black and white points and its neutral
+    areas to the model targets tn, for the fitted display exponent g."""
+    out = ([], [], [])
+    for c in range(3):
+        lb, lw, ln = (max(0.0, base[k][c]) ** g for k in ("black", "white", "neutral"))
+        s_, o_, p_ = _solve_channel(lb, lw, ln, goal["black"][c], goal["white"][c], tn[c], g)
+        for lst, v in zip(out, (s_, o_, p_)):
+            lst.append(v)
+    return out
+
+
+def _error(st, goal):
+    errs = [abs(st["black"][c] - goal["black"][c]) for c in range(3)]
+    errs += [abs(st["white"][c] - goal["white"][c]) for c in range(3)]
+    if goal["neutral"] is not None:
+        errs += [abs(st["neutral"][c] - goal["neutral"][c]) for c in range(3)]
+    else:
+        errs.append(abs(st["luma"]["mean"] - goal["mid"]))
+        if goal["cast"] is not None:
+            gray = sum(st["neutral"]) / 3
+            errs += [abs((st["neutral"][c] - gray) - goal["cast"][c]) for c in range(3)]
+    return max(errs)
+
+
+def _correct(proj, tl, index, it, node, goal_of, iterations, track):
+    """Closed loop on one item: reset the node's CDL, measure, then solve, apply and re-measure until the goal is
+    met or iterations run out, refitting the display response from every measurement. goal_of(first_stats) gives
+    the absolute targets. Returns the report row."""
+    identity = ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
+    set_cdl(index, *identity, node=node, track=track)
+    frame = _mid_frame(it)
+    before = _measure(proj, tl, frame)
+    goal = goal_of(before)
+    cdl, st, hist, g, steps = identity, before, [], 1.0, 0
+    tn = _neutral_goal(before, goal)
+    for steps in range(1, iterations + 1):
+        if hist:  # integral feedback: move the model's neutral target by what the measurement still misses
+            want = _neutral_goal(st, goal)
+            tn = [min(0.97, max(0.03, t + w - n)) for t, w, n in zip(tn, want, st["neutral"])]
+        cdl = _refine(before, tn, goal, g)
+        set_cdl(index, *cdl, node=node, track=track)
+        st = _measure(proj, tl, frame)
+        hist.append((cdl, st))
+        if _error(st, goal) < 0.015:  # about 4 code values of 8-bit
+            break
+        g = _fit_display(before, hist)
+    warnings = []
+    if before["neutral_from"] != "neutral areas" and goal["neutral"] is None and goal["cast"] is not None:
+        warnings.append("no neutral areas in the frame: balance assumed the whole frame averages to gray (wrong "
+                        "for a frame dominated by one color; use balance=False or shot_match)")
+    return {"item": index, "name": it.GetName(), "frame": frame, "node": node, "iterations": steps,
+            "error": round(_error(st, goal), 4), "display_exponent": round(g, 3), "warnings": warnings,
+            "cdl": {"slope": [round(v, 4) for v in cdl[0]], "offset": [round(v, 4) for v in cdl[1]],
+                    "power": [round(v, 4) for v in cdl[2]]},
+            "before": {"verdict": _verdict(before), "black": before["black"], "white": before["white"],
+                       "luma_mean": before["luma"]["mean"], "neutral": before["neutral"]},
+            "after": {"verdict": _verdict(st), "black": st["black"], "white": st["white"],
+                      "luma_mean": st["luma"]["mean"], "neutral": st["neutral"]}}
+
+
+def _with_playhead(tl, fn):
+    tc = _opt(tl, "GetCurrentTimecode")
+    try:
+        return fn()
+    finally:
+        if tc:
+            tl.SetCurrentTimecode(tc)
+
+
+@_tool
+def analyze_color(items: list[int] | None = None, track: int = 1) -> list[dict]:
+    """Measure the picture as Resolve shows it (graded, color managed): per-channel black and white points (0.5 and
+    99.5 percentiles, 0-1), channel means, luma percentiles, the color of neutral areas, saturation, clipped and
+    crushed pixel shares, and a verdict (underexposed, flat, warm/cool/green/magenta cast...). items: video items
+    measured at their middle frame; default: the frame under the playhead."""
+    proj, tl = _timeline()
+    if not items:
+        tmp = tempfile.mkdtemp(prefix="davinci_mcp_")
+        try:
+            path = os.path.join(tmp, "frame.png")
+            _export_still(proj, path)
+            st = _frame_stats(_png_pixels(path)[2])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return [{"frame": _opt(tl, "GetCurrentTimecode"), "verdict": _verdict(st), **st}]
+    targets = [(i, _item(tl, i, track)) for i in items]
+
+    def run():
+        rows = []
+        for i, it in targets:
+            st = _measure(proj, tl, _mid_frame(it))
+            rows.append({"item": i, "name": it.GetName(), "frame": _mid_frame(it), "verdict": _verdict(st), **st})
+        return rows
+    return _with_playhead(tl, run)
+
+
+@_tool
+def auto_color(items: list[int], node: int = 1, levels: bool = True, balance: bool = True, exposure: bool = True,
+               strength: float = 1.0, iterations: int = 4, track: int = 1) -> list[dict]:
+    """Automatic primary correction of video items, as a CDL on `node` (replacing that node's CDL): levels sets
+    each channel's black and white points (removing casts in shadows and highlights), balance neutralizes the
+    midtones, exposure brings the average brightness to a mid level. strength 0-1 scales the correction. Measured on
+    each clip's middle frame and refined in a closed loop (iterations) on the real output, so color management and
+    later nodes are accounted for. Returns before/after measurements and the CDL. Undo with reset_grade or set_cdl."""
+    if not 0 < strength <= 1:
+        raise ToolError("strength must be above 0 and at most 1")
+    if not 1 <= iterations <= 8:
+        raise ToolError("iterations must be 1-8")
+    if not items:
+        raise ToolError("give the items to correct")
+    proj, tl = _timeline()
+    targets = [(i, _item(tl, i, track)) for i in items]
+
+    def goal_of(st):
+        mean_b, mean_w = sum(st["black"]) / 3, sum(st["white"]) / 3
+        black = [b + strength * ((AUTO_TARGETS["black"] if levels else mean_b if balance else b) - b)
+                 for b in st["black"]]
+        white = [w + strength * ((AUTO_TARGETS["white"] if levels else mean_w if balance else w) - w)
+                 for w in st["white"]]
+        m = st["luma"]["mean"]
+        mid = m + strength * (AUTO_TARGETS["mid"] - m) if exposure else m
+        cast = None
+        if balance:
+            gray = sum(st["neutral"]) / 3
+            cast = [(1 - strength) * (n - gray) for n in st["neutral"]]
+        return {"black": black, "white": white, "mid": mid, "neutral": None, "cast": cast}
+
+    return _with_playhead(tl, lambda: [_correct(proj, tl, i, it, node, goal_of, iterations, track)
+                                       for i, it in targets])
+
+
+@_tool
+def shot_match(reference: int, targets: list[int], node: int = 1, iterations: int = 4, track: int = 1) -> dict:
+    """Match video items to a reference shot: each target's black and white points, brightness and neutral color
+    are driven to the reference's (measured at the middle frames) with a CDL on `node`, refined in a closed loop.
+    The reference is not changed. Works best between shots of the same scene."""
+    if not targets:
+        raise ToolError("give the items to match")
+    if reference in targets:
+        raise ToolError("the reference cannot also be a target")
+    if not 1 <= iterations <= 8:
+        raise ToolError("iterations must be 1-8")
+    proj, tl = _timeline()
+    ref = _item(tl, reference, track)
+    items = [(i, _item(tl, i, track)) for i in targets]
+
+    def run():
+        want = _measure(proj, tl, _mid_frame(ref))
+        goal = {"black": want["black"], "white": want["white"], "mid": want["luma"]["mean"],
+                "neutral": want["neutral"], "cast": None}
+        rows = [_correct(proj, tl, i, it, node, lambda _st: goal, iterations, track) for i, it in items]
+        return {"reference": {"item": reference, "name": ref.GetName(), "verdict": _verdict(want),
+                              "black": want["black"], "white": want["white"], "luma_mean": want["luma"]["mean"],
+                              "neutral": want["neutral"]}, "matched": rows}
+    return _with_playhead(tl, run)
 
 if __name__ == "__main__":
     _setup_logging()

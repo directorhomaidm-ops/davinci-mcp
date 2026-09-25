@@ -460,6 +460,60 @@ class Item:
 
 PNG = b"\x89PNG\r\n\x1a\n"
 
+
+def _png(w, h, rows):
+    """Encode 8-bit RGB rows, cycling through all five PNG row filters so the decoder meets each."""
+    import struct as _st
+    import zlib as _z
+    bpp, out, prev = 3, bytearray(), bytearray(w * 3)
+    for y, row in enumerate(rows):
+        ftype, f = y % 5, bytearray(len(row))
+        for i, v in enumerate(row):
+            a = row[i - bpp] if i >= bpp else 0
+            b, c = prev[i], (prev[i - bpp] if i >= bpp else 0)
+            if ftype == 0:
+                pred = 0
+            elif ftype == 1:
+                pred = a
+            elif ftype == 2:
+                pred = b
+            elif ftype == 3:
+                pred = (a + b) // 2
+            else:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pred = a if pa <= pb and pa <= pc else b if pb <= pc else c
+            f[i] = (v - pred) & 255
+        out += bytes([ftype]) + f
+        prev = row
+
+    def chunk(kind, body):
+        return _st.pack(">I", len(body)) + kind + body + _st.pack(">I", _z.crc32(kind + body) & 0xFFFFFFFF)
+    return PNG + chunk(b"IHDR", _st.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", _z.compress(bytes(out))) \
+        + chunk(b"IEND", b"")
+
+
+def render_look(item, w=48, h=32):
+    """The item's synthetic picture through its CDL (Resolve order: slope, offset, clamp, power) and an optional
+    display curve standing in for color management. look: lo/hi (scene range), cast (per-channel gain), gamma."""
+    look = item.look
+    lo, hi, cast, gamma = look.get("lo", 0.0), look.get("hi", 1.0), look.get("cast", (1, 1, 1)), look.get("gamma", 1.0)
+    cdl = item.cdl or {}
+    slope = [float(v) for v in cdl.get("Slope", "1 1 1").split()]
+    offset = [float(v) for v in cdl.get("Offset", "0 0 0").split()]
+    power = [float(v) for v in cdl.get("Power", "1 1 1").split()]
+    rows = []
+    for y in range(h):
+        row = bytearray()
+        for x in range(w):
+            v = lo + (hi - lo) * x / (w - 1)
+            base = (v, v, v) if y < 24 else (v, 0.4 * v, 0.2 * v)  # a gray ramp, and some saturated color below
+            for c in range(3):
+                lin = min(1.0, max(0.0, base[c] * cast[c] * slope[c] + offset[c]))
+                row.append(round(255 * (lin ** power[c]) ** (1 / gamma)))
+        rows.append(row)
+    return _png(w, h, rows)
+
 TOOL_INPUTS = {
     "MediaIn": {},
     "MediaOut": {"Input": "Image"},
@@ -836,6 +890,11 @@ class Timeline:
     def GetCurrentVideoItem(self):
         return self.playhead_item
 
+    def item_at_playhead(self):
+        h, m, sec, f = (int(x) for x in self.playhead.split(":"))
+        frame = ((h * 60 + m) * 60 + sec) * 24 + f
+        return next((i for i in self.tracks.get(("video", 1), []) if i.start <= frame < i.end), None)
+
     def GrabStill(self):
         return Still() if self.page_is_color else None
 
@@ -1105,6 +1164,11 @@ class Project:
     def ExportCurrentFrameAsStill(self, path):
         if not Path(path).parent.is_dir():
             return False
+        item = self.current.item_at_playhead()
+        if item is not None and getattr(item, "look", None):
+            Path(path).write_bytes(render_look(item))
+            self.exported_frame = path
+            return True
         Path(path).write_bytes(PNG + self.current.playhead.encode())
         self.exported_frame = path
         return True
