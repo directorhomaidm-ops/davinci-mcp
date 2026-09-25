@@ -313,7 +313,7 @@ class Item:
         tr.kind = "transition"
         items = self.timeline.tracks[("video", 1)]
         items.insert(items.index(self) + (1 if options["position"] == "end" else 0), tr)
-        return tr
+        return Item(options["type"], cut + 1, cut - 1)  # measured: the returned object's timing is nonsense
 
     def GetNodeGraph(self, layer=1):
         return self.graph
@@ -468,7 +468,10 @@ class FuInput:
     def animated(self):
         return self.source is not None and self.source.tool.kind in ("BezierSpline", "PolyPath")
 
-    def __setitem__(self, frame, value):
+    def __getattr__(self, name):
+        return None  # like the Resolve bridge: unknown attributes (and explicit dunder lookups) read as None
+
+    def timed(self, frame, value):
         value = self._store(value)
         if self.animated():
             self.keys[frame] = value
@@ -504,7 +507,10 @@ class FuTool:
 
     def SetInput(self, inp_id, value, time=None):
         inp = self.inputs[inp_id]
-        inp.value = inp._store(value)
+        if time is not None:
+            inp.timed(time, value)
+        else:
+            inp.value = inp._store(value)
 
     def GetInput(self, inp_id, time=None):
         inp = self.inputs[inp_id]
@@ -946,7 +952,9 @@ class MediaPool:
         return True
 
     def ExportMetadata(self, path, clips):
-        rows = clips or [c for f in self._folders() for c in f.clips]
+        if not clips:
+            return False  # measured: an empty list fails on live 21.1
+        rows = clips
         Path(path).write_text("\n".join(c.name for c in rows))
         return True
 
@@ -978,7 +986,7 @@ class MediaPool:
             return False
         for c in clips:
             if isinstance(c, dict):
-                frames = c["endFrame"] - c["startFrame"] + 1
+                frames = c["endFrame"] - c["startFrame"]  # measured: endFrame is exclusive
                 tl._append(c["mediaPoolItem"].name, frames, c.get("trackIndex", 1), c["mediaPoolItem"])
             else:
                 tl._append(c.name, c.frames, media=c)

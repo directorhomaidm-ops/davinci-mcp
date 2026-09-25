@@ -96,7 +96,8 @@ def test_append_whole_clips(project):
 def test_append_subclips(project):
     d.append_clips(["a.mov"], start_frame=10, end_frame=19, track=1)
     (entry,) = project.pool.appended[-1]
-    assert (entry["startFrame"], entry["endFrame"]) == (10, 19)
+    assert (entry["startFrame"], entry["endFrame"]) == (10, 20)  # end_frame inclusive, Resolve's endFrame exclusive
+    assert d.list_items()[0]["duration"] == 10
     assert "trackIndex" not in entry  # the form Blackmagic's example uses, which renders
 
 
@@ -109,7 +110,7 @@ def test_append_subclips_other_track(project):
 def test_append_subclip_defaults_end_to_last_frame(project):
     d.append_clips(["b.mov"], start_frame=5)
     (entry,) = project.pool.appended[-1]
-    assert (entry["startFrame"], entry["endFrame"]) == (5, 49)
+    assert (entry["startFrame"], entry["endFrame"]) == (5, 50)  # through the last frame (49) of a 50-frame clip
 
 
 def test_append_unknown_clip(project):
@@ -721,7 +722,9 @@ def test_view_frame_through_mcp_is_image_content(project):
 
 def test_add_transition(project):
     a, b = _two_items(project)
-    assert d.add_transition(1, duration=24) == {"name": "Cross Dissolve", "start": 86488, "end": 86512, "duration": 24}
+    # timing comes from the track, not from the object AddTransition returns
+    assert d.add_transition(1, duration=24) == {"name": "Cross Dissolve", "index": 2, "start": 86488, "end": 86512,
+                                                "duration": 24}
     assert a.transition_options == {"type": "Cross Dissolve", "category": "simple", "position": "end",
                                     "alignment": "center", "duration": 24}
     assert [i["name"] for i in d.list_items()] == ["a.mov", "Cross Dissolve", "b.mov"]
@@ -1248,7 +1251,7 @@ def test_relink_proxy_replace(project, tmp_path):
 
 def test_export_metadata(project, tmp_path):
     out = tmp_path / "meta.csv"
-    assert d.export_metadata(str(out)) == f"metadata of all clip(s) written to {out}"
+    assert d.export_metadata(str(out)) == f"metadata of 2 clip(s) written to {out}"  # never an empty list
     assert out.read_text().split("\n") == ["a.mov", "b.mov"]
     d.export_metadata(str(out), ["b.mov"])
     assert out.read_text() == "b.mov"
@@ -2308,3 +2311,58 @@ def test_validate_dctl(resolve):
     assert d.validate_dctl(one_line) == {"valid": False,
                                          "diagnostic": "DCTL Error: main DCTL function does not have return value."}
     assert d.validate_dctl("float x;")["diagnostic"] == "cannot find main DCTL function."
+
+
+# --- fixes from the live check on Resolve Studio 21.1.0.14 ---
+
+
+def test_append_adds_missing_track_and_verifies(project, monkeypatch):
+    d.append_clips(["a.mov"])
+    assert project.current.GetTrackCount("video") == 1
+    d.append_clips(["b.mov"], start_frame=0, end_frame=9, track=3)
+    assert project.current.GetTrackCount("video") == 3
+    assert [i["name"] for i in d.list_items(track=3)] == ["b.mov"]
+    monkeypatch.setattr(project.pool, "AppendToTimeline", lambda clips: True)  # success reported, nothing placed
+    with pytest.raises(ToolError, match="nothing landed on video track 3"):
+        d.append_clips(["a.mov"], start_frame=0, end_frame=9, track=3)
+
+
+def test_keyframes_use_timed_setinput(project):
+    a, _ = _two_items(project)
+    out = d.dynamic_zoom(1, end_zoom=1.3)
+    assert out["frames"] == [0, 99]
+    keys = a.comps[0].FindTool("DynamicZoom").inputs["Size"].keys
+    assert keys == {0: 1.0, 99: 1.3}
+
+
+def test_comp_range_follows_item_length(project):
+    a, _ = _two_items(project)
+    d.insert_fusion_effect(1, "Blur")
+    a.comps[0].attrs["COMPN_RenderEnd"] = 97.0  # live 21.1 reported a range short of the clip
+    out = d.animate_clip(1, zoom={0: 1.0, 99: 1.2})
+    assert out["keyframes"]["zoom"] == [0, 99]
+    with pytest.raises(ToolError, match=r"outside the clip \(0-99\): \[100\]"):
+        d.animate_clip(1, zoom={100: 1.0})
+
+
+def test_view_frame_retries_from_edit_page(project, resolve, monkeypatch, tmp_path):
+    _two_items(project)
+    real = project.ExportCurrentFrameAsStill
+    monkeypatch.setattr(project, "ExportCurrentFrameAsStill",
+                        lambda path: resolve.page == "edit" and real(path))
+    resolve.OpenPage("deliver")
+    out = d.view_frame(save_to=str(tmp_path / "f.png"))
+    assert (tmp_path / "f.png").exists() and resolve.page == "deliver"
+    monkeypatch.setattr(project, "ExportCurrentFrameAsStill", lambda path: False)
+    with pytest.raises(ToolError, match="also from the Edit page"):
+        d.view_frame()
+
+
+def test_set_speed_explains_titles(project):
+    _two_items(project)
+    tl = project.current
+    title = tl.tracks[("video", 1)][0]
+    title.media = None
+    title.SetSpeed = lambda options: False
+    with pytest.raises(ToolError, match="is a title, generator or transition"):
+        d.set_speed(1, 50)

@@ -395,14 +395,19 @@ def append_clips(
     if missing:
         raise ToolError(f"clips not in media pool: {', '.join(missing)} (see list_clips)")
     clips = [by_name[n] for n in names]
+    while track > int(tl.GetTrackCount("video") or 0):  # appending to a missing track lands the clips elsewhere
+        if not tl.AddTrack("video"):
+            raise ToolError(f"could not add video track {track}")
+    before = len(tl.GetItemListInTrack("video", track) or [])
     if start_frame is None and end_frame is None:
         ok = pool.AppendToTimeline(clips)
     else:
+        # endFrame is exclusive: live Resolve 21.1 made 23-frame items from startFrame 0, endFrame 23.
         infos = [
             {
                 "mediaPoolItem": c,
                 "startFrame": start_frame or 0,
-                "endFrame": end_frame if end_frame is not None else int(float(c.GetClipProperty("Frames") or 0)) - 1,
+                "endFrame": end_frame + 1 if end_frame is not None else int(float(c.GetClipProperty("Frames") or 0)),
             }
             for c in clips
         ]
@@ -414,6 +419,8 @@ def append_clips(
         ok = pool.AppendToTimeline(infos)
     if not ok:
         raise ToolError("append failed")
+    if track != 1 and len(tl.GetItemListInTrack("video", track) or []) == before:
+        raise ToolError(f"Resolve reported success but nothing landed on video track {track}")
     return f"appended {len(clips)} clip(s) to '{tl.GetName()}'"
 
 
@@ -1177,7 +1184,9 @@ def _set_input(c, tool, node, input, value=None, keyframes=None):
             if _source(tool[input])[1] not in ANIMATION_MODIFIERS:
                 raise ToolError(f"{node}.{input} ({kind or 'unknown type'}) cannot be animated")
         for frame, v in sorted(keyframes.items()):
-            _write(lambda x, f=frame: tool[input].__setitem__(f, x), v, point)
+            # SetInput with a time keys an animated input. Not tool[input].__setitem__: the Resolve bridge
+            # returns None for attributes it does not know ('NoneType' object is not callable on live 21.1).
+            _write(lambda x, f=frame: tool.SetInput(input, x, f), v, point)
     frames = sorted(float(f) for f in (tool[input].GetKeyFrames() or {}).values())
     return {"node": node, "input": input, "keyframes": frames}
 
@@ -1291,7 +1300,11 @@ def view_frame(timecode: str | None = None, frame: int | None = None, save_to: s
     path = os.path.abspath(save_to) if save_to else os.path.join(tmp, "frame.png")
     try:
         if not proj.ExportCurrentFrameAsStill(path) or not os.path.exists(path):
-            raise ToolError("ExportCurrentFrameAsStill failed (is a page with a viewer open?)")
+            # Refused on some pages (live 21.1: after a render); the Edit page's viewer always works.
+            with _on_page(_resolve(), "edit"):
+                ok = proj.ExportCurrentFrameAsStill(path) and os.path.exists(path)
+            if not ok:
+                raise ToolError("ExportCurrentFrameAsStill failed, also from the Edit page")
         ext = os.path.splitext(path)[1].lower()
         note = f"frame at {_opt(tl, 'GetCurrentTimecode') or tc}" + (f", saved to {path}" if save_to else "")
         if ext not in (".png", ".jpg", ".jpeg"):
@@ -1338,13 +1351,21 @@ def add_transition(
     options = {"type": type, "category": category, "position": position, "alignment": alignment}
     if duration is not None:
         options["duration"] = duration
+    cut = it.GetEnd() if position == "end" else it.GetStart()
     tr = _method(it, "AddTransition", "21.1")(options)
     if not tr:
         raise ToolError(
             f"no transition created — check the name matches an installed {category} transition and that "
             "both clips have handles (unused media) past the cut"
         )
-    return {"name": tr.GetName(), "start": tr.GetStart(), "end": tr.GetEnd(), "duration": tr.GetDuration()}
+    # The returned object's timing is not the transition's (live 21.1: start 24, end 22), so read the track.
+    items = tl.GetItemListInTrack(track_type, track) or []
+    placed = next((x for i, x in enumerate(items) if _is_transition(items, i) and x.GetStart() <= cut <= x.GetEnd()),
+                  None)
+    if placed is None:
+        return {"name": tr.GetName(), "note": "added, but not found on the track to report its timing"}
+    return {"name": placed.GetName(), "index": items.index(placed) + 1, "start": placed.GetStart(),
+            "end": placed.GetEnd(), "duration": placed.GetDuration()}
 
 
 @_tool
@@ -1427,9 +1448,7 @@ def dynamic_zoom(
     if c.FindTool("DynamicZoom"):
         raise ToolError("clip already has a DynamicZoom node; delete_fusion_node it first")
     tool = _insert_before_output(c, "Transform", "DynamicZoom")
-    attrs = c.GetAttrs() or {}
-    first = int(attrs.get("COMPN_RenderStart", 0))
-    last = int(attrs.get("COMPN_RenderEnd", first + int(it.GetDuration()) - 1))
+    first, last = _comp_range(c, it)
     _set_input(c, tool, "DynamicZoom", "Size", keyframes={first: start_zoom, last: end_zoom})
     if list(start_center) != list(end_center) or list(start_center) != [0.5, 0.5]:
         _set_input(c, tool, "DynamicZoom", "Center", keyframes={first: start_center, last: end_center})
@@ -1689,7 +1708,8 @@ def set_speed(
     if stretch_keyframes is not None:
         options["StretchKeyframesToFit"] = stretch_keyframes
     if not _method(it, "SetSpeed", "21.1")(options):
-        raise ToolError("SetSpeed failed")
+        why = "" if _opt(it, "GetMediaPoolItem") else f" ('{it.GetName()}' is a title, generator or transition)"
+        raise ToolError("SetSpeed failed" + why)
     return {"item": it.GetName(), "speed": _opt(it, "GetSpeed"), "duration": it.GetDuration()}
 
 
@@ -2045,10 +2065,13 @@ def export_metadata(path: str, clips: list[str] | None = None) -> str:
     """Write clip metadata to a CSV file: the given clips, or the whole media pool."""
     _, proj = _project()
     path = os.path.abspath(path)
-    targets = _pool_clips(proj, clips) if clips else []
+    # An empty list means "nothing" to live Resolve 21.1 (the export fails), so the whole pool is listed.
+    targets = _pool_clips(proj, clips) if clips else [c for _, c in _walk(proj.GetMediaPool().GetRootFolder())]
+    if not targets:
+        raise ToolError("the media pool is empty")
     if not proj.GetMediaPool().ExportMetadata(path, targets) or not os.path.exists(path):
         raise ToolError(f"ExportMetadata failed: {path}")
-    return f"metadata of {len(targets) or 'all'} clip(s) written to {path}"
+    return f"metadata of {len(targets)} clip(s) written to {path}"
 
 
 # --- Interchange and project ---
@@ -2961,10 +2984,10 @@ MOTION_INPUTS = {"zoom": "Size", "position": "Center", "rotation": "Angle"}
 
 
 def _comp_range(c, it):
-    attrs = c.GetAttrs() or {}
-    first = int(attrs.get("COMPN_RenderStart", 0))
-    last = int(attrs.get("COMPN_RenderEnd", first + int(it.GetDuration()) - 1))
-    return first, last
+    """(first, last) comp frames of the clip. The length comes from the timeline item: live Resolve 21.1 reported
+    a render range one frame short (0-21 on a 23-frame clip), which would refuse keyframes on the last frame."""
+    first = int((c.GetAttrs() or {}).get("COMPN_RenderStart", 0))
+    return first, first + int(it.GetDuration()) - 1
 
 
 @_tool
