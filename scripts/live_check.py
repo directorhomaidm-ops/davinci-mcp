@@ -13,8 +13,10 @@ What it touches:
 - A scratch project "davinci-mcp live check <time>" is created, used, and deleted at the end.
 - Test media (PNG image sequences and a WAV tone, generated here) and all outputs go to a new folder,
   printed at the start and kept, with report.md / report.json inside.
-Studio-only calls (stabilize, smart reframe, scene cuts, voice isolation, captions, Dolby Vision) run only with
---studio: on the free edition Resolve opens an upgrade dialog that blocks every later call.
+Studio-only calls (stabilize, voice isolation, Dolby Vision, Super Scale, Speed Warp, transcription) run on
+DaVinci Resolve Studio, or with --studio: on the free edition Resolve opens an upgrade dialog that blocks every
+later call, so they are skipped there.
+The scratch project may refuse deletion (Resolve holds projects opened in the session): delete it by hand.
 """
 import argparse
 import json
@@ -105,7 +107,7 @@ def make_media(folder, frames=48):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--yes", action="store_true", help="do not ask before starting")
-    ap.add_argument("--studio", action="store_true", help="also run Studio-only calls (never on the free edition)")
+    ap.add_argument("--studio", action="store_true", help="force Studio-only calls (automatic on Studio; never on the free edition)")
     ap.add_argument("--render-timeout", type=int, default=180, help="seconds to wait for the test render")
     args = ap.parse_args()
 
@@ -114,6 +116,8 @@ def main():
         print("\nCannot reach Resolve: is it running, with Preferences > System > General > External scripting "
               "set to Local?")
         return write_report(None, {})
+    if "studio" in (st.get("product") or "").lower():
+        args.studio = True  # the upgrade dialog only exists on the free edition
     pm = d._resolve().GetProjectManager()
     original = st.get("project")
     work = Path(tempfile.mkdtemp(prefix="davinci_mcp_live_"))
@@ -287,8 +291,9 @@ def run_checks(args, work, is_211):
         path=str(work / "beeps.wav")), 60))
     step("21: classify_audio on the tone", lambda: d.classify_audio(clips=["ref_tone.wav"]),
          needs=True if _version_at_least(21) else "needs Resolve 21")
-    step("studio: generate_voiceover (needs the AI Speech Generator package)",
-         lambda: d.generate_voiceover("davinci-mcp live check.", file_name="vo_check.wav"),
+    vo = step("studio: generate_voiceover (needs the AI Speech Generator package)",
+         lambda: d.generate_voiceover("So, um, welcome to the live check. Today we test the cut.",
+                                      file_name="vo_check.wav"),
          needs=studio_note(args) if _version_at_least(21) else "needs Resolve 21")
 
     print("\nAudio")
@@ -296,11 +301,22 @@ def run_checks(args, work, is_211):
     step("audio: add_track 5.1", lambda: d.add_track(format="5.1", name="Surround"))
 
     print("\nStudio only")
-    studio = True if args.studio else "run with --studio (the free edition blocks on an upgrade dialog)"
+    studio = studio_note(args)
     step("studio: stabilize item 1", lambda: d.stabilize(1), needs=studio)
     step("studio: voice_isolation A1", lambda: d.voice_isolation(1, amount=50), needs=studio if wav else "no audio")
     step("studio: set_hdr dolby 4.0 + analyze", lambda: (d.set_hdr(dolby_vision="4.0"), d.analyze_dolby_vision()),
          needs=studio)
+
+    print("\nAI editing (last: the cut tools make new timelines)")
+    step("ai: super_scale 2x then none on the red sequence", lambda: (d.super_scale([seq[1]], "2x"),
+                                                                      d.super_scale([seq[1]], "none")),
+         needs=studio if have_media is True else have_media, note="shows how Resolve reads Super Scale back")
+    step("ai: ai_slow_motion 50% with speed_warp on item 1", lambda: d.ai_slow_motion(1, 50),
+         needs=(studio if is_211 else "needs Resolve 21.1") if have_items is True else have_items)
+    step("ai: remove_silences on the beeps (expect 10 parts)", lambda: _silence_cut(work))
+    step("ai: transcribe the voiceover, word timing, cut_by_transcript", lambda: _transcript_cut(vo["clip"]),
+         needs=(studio if is_211 else "needs Resolve 21.1") if vo else "no voiceover (needs the AI Speech Generator)",
+         note="confirms the transcript's word format and that the filler 'um' is cut")
 
 
 # --- helpers for individual checks ------------------------------------------------------------------------------
@@ -371,6 +387,23 @@ def _dctl():
     return {"good": ok, "bad": bad}
 
 
+def _silence_cut(work):
+    d.import_media([str(work / "beeps.wav")], bin="Live Check")
+    out = d.remove_silences("beeps.wav", min_silence=0.5, padding=0.05, timeline="Beeps cut")
+    items = d.list_items(track_type="audio")
+    expect(out["parts"] == 10, f"expected 10 parts, got {out}")
+    expect(len(items) == out["parts"], f"{out['parts']} parts but {len(items)} audio items: {items}")
+    return {"cut": {k: out[k] for k in ("parts", "kept_seconds", "removed_seconds")}, "items": items[:3]}
+
+
+def _transcript_cut(clip):
+    d.transcribe_audio([clip])
+    t = d.get_transcript(clip, words=True)
+    expect(t["segments"], f"no transcript segments: {t}")
+    out = d.cut_by_transcript(clip, timeline="VO edited")
+    return {"first_words": t["segments"][0].get("words", [])[:4], "cut": out}
+
+
 def _pip(seq):
     d.append_clips([seq[0]], track=2, start_frame=0, end_frame=23)
     out = d.picture_in_picture(1, scale=0.3, corner="bottom_right", track=2)
@@ -388,7 +421,7 @@ def _all_cuts():
     out = d.transition_all_cuts(duration=8)
     listed = d.list_transitions()
     removed = d.remove_transitions()
-    return {"added": out, "listed": len(listed), "removed": removed}
+    return {"added": out, "listed": listed, "removed": removed}  # listed rows show how 21.1 reports transition timing
 
 
 def _multicam(seq):

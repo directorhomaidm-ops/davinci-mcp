@@ -94,8 +94,16 @@ class Clip:
     def GetName(self):
         return self.name
 
-    def SetClipProperty(self, key, value):
+    def SetClipProperty(self, key, value, *extra):
         if key == "Input Color Space" and value not in KNOWN_SPACES:
+            return False
+        if key == "Super Scale":  # README: 0 auto, 1 none, 2-4 x; 2x Enhanced takes sharpness and noise reduction
+            if value not in range(5) or (extra and (value != 2 or len(extra) != 2)):
+                return False
+            self.props[key] = f"{value}x Enhanced" if extra else str(value)
+            self.super_scale_args = (value, *extra)
+            return True
+        if extra:
             return False
         self.props[key] = value
         return True
@@ -208,7 +216,8 @@ class ColorGroup:
         return self.name
 
     def GetClipsInTimeline(self, timeline=None):
-        return list(self.members)
+        import copy
+        return [copy.copy(m) for m in self.members]  # like the bridge: new wrappers, same clip
 
     def GetPreClipNodeGraph(self):
         return self.pre
@@ -228,6 +237,11 @@ class Item:
         self.versions = {0: ["Version 1"], 1: []}
         self.version = {"versionName": "Version 1", "versionType": 0}
         self.copied_to, self.exported_lut = None, None
+        Item.uid = getattr(Item, "uid", 0) + 1
+        self.uid = f"item-{Item.uid}"
+
+    def GetUniqueId(self):
+        return self.uid
 
     def GetMediaPoolItem(self):
         return self.media
@@ -389,7 +403,11 @@ class Item:
         return self.end - self.start
 
     def SetProperty(self, key, value):
-        if key not in {"ZoomX", "ZoomY", "Pan", "Tilt", "Opacity"}:
+        ranges = {"RetimeProcess": range(4), "MotionEstimation": range(6)}
+        if key in ranges:
+            if value not in ranges[key]:
+                return False
+        elif key not in {"ZoomX", "ZoomY", "Pan", "Tilt", "Opacity"}:
             return False
         self.props[key] = value
         return True
