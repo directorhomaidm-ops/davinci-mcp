@@ -411,6 +411,21 @@ set_fusion_input(item=1, node="Blur1", input="XBlurSize", value=8)
 set_fusion_input(item=1, node="Push", input="Size", keyframes={"0": 1.0, "120": 1.15})
 ```
 
+### Automatic color correction
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `analyze_color` | `items: list[int] \| None` (default: the frame under the playhead), `track = 1` | per frame: `verdict`, `black`/`white` (per channel, 0.5/99.5 percentiles), `mean`, `luma` percentiles, `neutral`, `saturation`, `clipped_pct`, `crushed_pct` | Frame export failed |
+| `auto_color` | `items: list[int]`, `node = 1`, `levels = True`, `balance = True`, `exposure = True`, `strength = 1.0`, `iterations = 4`, `track = 1` | per item: `before`/`after` (verdict, black, white, luma_mean, neutral), `cdl`, `iterations`, `error`, `display_exponent`, `warnings` | Bad strength/iterations; SetCDL refused |
+| `shot_match` | `reference: int`, `targets: list[int]`, `node = 1`, `iterations = 4`, `track = 1` | `{reference, matched: [rows as auto_color]}` | Reference among targets |
+
+Notes:
+
+- Resolve's API has no Auto Color or Shot Match, so the picture is measured here: the frame is exported as PNG (what the viewer shows, graded and color managed) and decoded in pure Python. Each clip is measured at its middle frame; the playhead is put back afterwards.
+- The correction is an ASC CDL on `node` (it replaces that node's CDL), found in a closed loop: solve, apply, export, measure. The loop fits how the display curve (color management, later nodes) bends the CDL's output from the measured black and white points, so it converges on log/RCM projects too; `display_exponent` reports that fit (1.0 = the CDL alone).
+- `levels` sets each channel's black and white points (0.03 / 0.94), `balance` makes neutral areas gray, `exposure` brings the mean brightness to 0.42. `strength` scales all three.
+- Balance needs neutral areas (low-saturation midtones). Without them it assumes the frame averages to gray and says so in `warnings`; use `balance=False` or `shot_match` for frames dominated by one color.
+
 ### Animated titles and templates
 
 | Tool | Parameters | Returns | Errors |

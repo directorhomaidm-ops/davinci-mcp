@@ -9,7 +9,7 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 import davinci_mcp as d
-from conftest import Clip
+from conftest import Clip, render_look
 
 
 def test_status_without_project(resolve):
@@ -208,6 +208,7 @@ def test_all_tools_registered():
         "gallery_albums", "import_stills", "validate_dctl", "super_scale", "ai_slow_motion", "remove_silences",
         "cut_by_transcript", "social_platforms", "social_timeline", "social_render", "social_export",
         "animated_title", "lower_third", "save_template", "list_templates", "apply_template", "batch_titles",
+        "analyze_color", "auto_color", "shot_match",
     }
 
 
@@ -2773,3 +2774,111 @@ def test_apply_template_same_comp_name(project, templates, monkeypatch):
     monkeypatch.setattr(Item, "LoadFusionCompByName", lambda self, n: loaded.append(n) or True)
     d.apply_template("Soft", item=2)
     assert loaded == ["Soft"] and [c.name for c in b.comps][-1] == "Soft"
+
+
+
+# --- automatic color correction ---
+
+
+def test_png_decoder_all_filters(tmp_path):
+    class It:
+        look, cdl = {"lo": 0.1, "hi": 0.8, "cast": (1.1, 1.0, 0.9)}, None
+    path = tmp_path / "f.png"
+    path.write_bytes(render_look(It()))
+    w, h, px = d._png_pixels(str(path), samples=10 ** 6)
+    assert (w, h, len(px)) == (48, 32, 48 * 32)
+    # row 7 (filter 2, Up) and row 9 (filter 4, Paeth), last column: v = 0.8
+    assert px[7 * 48 + 47] == pytest.approx((0.88, 0.8, 0.72), abs=0.003)
+    assert px[9 * 48 + 47] == pytest.approx((0.88, 0.8, 0.72), abs=0.003)
+    assert px[30 * 48 + 47] == pytest.approx((0.88, 0.32, 0.144), abs=0.003)  # the saturated rows
+    # every pixel, including row 24 (Paeth) where the gray ramp turns into the colored rows
+    for y in range(32):
+        for x in range(48):
+            v = 0.1 + 0.7 * x / 47
+            base = (v, v, v) if y < 24 else (v, 0.4 * v, 0.2 * v)
+            want = tuple(round(255 * min(1.0, b * g)) / 255 for b, g in zip(base, (1.1, 1.0, 0.9)))
+            assert px[y * 48 + x] == pytest.approx(want, abs=1e-9), (x, y)
+
+
+def _looks(project, a_look, b_look=None):
+    a, b = _two_items(project)
+    a.look, b.look = a_look, b_look or a_look
+    return a, b
+
+
+def test_analyze_color(project, resolve):
+    a, b = _looks(project, {"lo": 0.2, "hi": 0.6, "cast": (1.12, 1.0, 0.85)})
+    project.current.playhead = "01:00:00:10"
+    (row,) = d.analyze_color([2])
+    assert (row["item"], row["frame"]) == (2, 86525)  # b.mov: 50 frames from 86500
+    assert "low contrast (flat)" in row["verdict"] and "warm cast" in row["verdict"]
+    assert row["neutral_from"] == "neutral areas" and row["neutral"][0] > row["neutral"][2]
+    assert project.current.playhead == "01:00:00:10"  # restored
+    project.current.playhead = "01:00:00:20"
+    (here,) = d.analyze_color()
+    assert here["frame"] == "01:00:00:20" and here["pixels_sampled"] == 48 * 32
+
+
+def _balanced(row, tol=0.02):
+    after = row["after"]
+    assert after["black"] == pytest.approx([0.03] * 3, abs=tol)
+    assert after["white"] == pytest.approx([0.94] * 3, abs=tol)
+    assert max(after["neutral"]) - min(after["neutral"]) < tol
+    assert after["luma_mean"] == pytest.approx(0.42, abs=tol)
+
+
+@pytest.mark.parametrize("gamma", [1.0, 1.6])  # 1.6: a display transform the loop has to see through
+def test_auto_color_converges(project, resolve, gamma):
+    a, _ = _looks(project, {"lo": 0.15, "hi": 0.65, "cast": (1.15, 1.0, 0.8), "gamma": gamma})
+    resolve.OpenPage("edit")
+    (row,) = d.auto_color([1])
+    _balanced(row)
+    assert row["error"] < 0.02 and row["iterations"] <= 4
+    assert "warm cast" in row["before"]["verdict"] and row["after"]["verdict"] == ["balanced"]
+    assert a.cdl["NodeIndex"] == "1" and resolve.page == "edit"
+
+
+def test_auto_color_strength_and_parts(project):
+    a, b = _looks(project, {"lo": 0.15, "hi": 0.65, "cast": (1.15, 1.0, 0.8)})
+    half, = d.auto_color([1], strength=0.5)
+    before = half["before"]
+    assert half["after"]["black"][1] == pytest.approx((before["black"][1] + 0.03) / 2, abs=0.02)
+    n = half["after"]["neutral"]
+    spread0 = max(before["neutral"]) - min(before["neutral"])
+    assert max(n) - min(n) == pytest.approx(spread0 / 2, abs=0.02)  # half the cast left, not compounded
+    only_balance, = d.auto_color([2], levels=False, exposure=False)
+    ob = only_balance["after"]
+    assert max(ob["neutral"]) - min(ob["neutral"]) < 0.02
+    assert ob["luma_mean"] == pytest.approx(only_balance["before"]["luma_mean"], abs=0.03)  # brightness kept
+    for kwargs, msg in [({"strength": 0}, "strength"), ({"iterations": 0}, "iterations")]:
+        with pytest.raises(ToolError, match=msg):
+            d.auto_color([1], **kwargs)
+
+
+def test_shot_match(project):
+    a, b = _looks(project, {"lo": 0.05, "hi": 0.9, "cast": (1.0, 1.0, 1.05)},
+                  {"lo": 0.2, "hi": 0.6, "cast": (1.2, 1.0, 0.8), "gamma": 1.3})
+    out = d.shot_match(1, [2])
+    ref, (row,) = out["reference"], out["matched"]
+    assert a.cdl is None  # the reference is left alone
+    for key in ("black", "white", "neutral"):
+        assert row["after"][key] == pytest.approx(ref[key], abs=0.025)
+    with pytest.raises(ToolError, match="cannot also be a target"):
+        d.shot_match(1, [1, 2])
+
+
+
+def test_auto_color_replaces_an_existing_cdl(project):
+    a, _ = _looks(project, {"lo": 0.15, "hi": 0.65, "cast": (1.15, 1.0, 0.8)})
+    d.set_cdl(1, slope=[2.0, 0.5, 1.0], offset=[0.1, 0.0, 0.0])  # an old grade on the node
+    (row,) = d.auto_color([1])
+    _balanced(row)
+    assert "warm cast" in row["before"]["verdict"]  # measured from the neutral node, not the old grade
+
+
+def test_auto_color_warns_without_neutral_areas(project):
+    _looks(project, {"lo": 0.5, "hi": 0.55, "cast": (1.6, 0.6, 0.3)})  # one strong color filling the frame
+    (row,) = d.auto_color([1])
+    assert "no neutral areas" in row["warnings"][0]
+    (row,) = d.auto_color([1], balance=False)
+    assert row["warnings"] == []
