@@ -376,8 +376,8 @@ def run_checks(args, work, is_211):
          note="on a YRGB timeline; error under 0.03 is a pass")
     step("color auto: shot_match item 2 to item 1", lambda: _shot_match(), needs=need_ramps)
     step("color auto: probe: auto_color and shot_match under automatic color management", lambda: _color_managed(),
-         needs=need_ramps, note="informational: does not converge yet (CDL on log values, channels mixed by the "
-         "output transform); tracks the error")
+         needs=need_ramps, note="informational: improves but may not reach 0.03 (CDL on log values, channels mixed "
+         "and saturated colors gamut-clipped by the output transform); tracks the error")
 
     print("\nMedia organization")
     step("organize: Type strings Resolve reports", lambda: _types(), note="the type grouping reads these")

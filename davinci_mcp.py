@@ -4888,10 +4888,20 @@ def _pct(values, q):
 
 def _frame_stats(px):
     n = len(px)
-    chans = [sorted(p[c] for p in px) for c in range(3)]
+    # Black and white points ignore colored clips (one channel clipped while another is clearly not): those are out
+    # of the display's gamut, not levels. Under color management a saturated area clips that way (live 21.1: a
+    # quarter of a frame at G = B = 0), which pinned the per-channel black points at 0 whatever the CDL did.
+    levels = [p for p in px if not (min(p) <= 0.005 < 0.1 <= max(p) or max(p) >= 0.995 > 0.9 >= min(p))]
+    levels = levels if len(levels) >= n // 2 else px
+    chans = [sorted(p[c] for p in levels) for c in range(3)]
     luma = [0.2126 * r + 0.7152 * g + 0.0722 * b for r, g, b in px]
-    neutral = [p for p, y in zip(px, luma) if max(p) - min(p) < 0.12 and 0.15 < y < 0.85]
-    ref = neutral if len(neutral) >= max(50, n // 50) else px
+    # Neutral areas as a weighted mean: full weight below 0.06 saturation fading to none at 0.24, and away from the
+    # luma extremes. A hard cut let pixels jump in and out as a correction changed them, so the measurement jumped
+    # too and the refinement's Jacobian described nothing (live 21.1).
+    weights = [max(0.0, min(1.0, (0.24 - (max(p) - min(p))) / 0.18)) * max(0.0, min(1.0, (y - 0.1) / 0.1,
+               (0.9 - y) / 0.1)) for p, y in zip(px, luma)]
+    total = math.fsum(weights)
+    neutral_ok = total >= max(50, n // 50) / 2
     ys = sorted(luma)
     r4 = lambda v: round(v, 4)  # noqa: E731
     return {
@@ -4900,11 +4910,15 @@ def _frame_stats(px):
         "mean": [r4(math.fsum(c) / n) for c in chans],
         "luma": {"p1": r4(_pct(ys, 0.01)), "median": r4(_pct(ys, 0.5)), "p99": r4(_pct(ys, 0.99)),
                  "mean": r4(math.fsum(ys) / n)},
-        "neutral": [r4(math.fsum(p[c] for p in ref) / len(ref)) for c in range(3)],
-        "neutral_from": "neutral areas" if ref is neutral else "whole frame",
+        "neutral": [r4(math.fsum(w * p[c] for w, p in zip(weights, px)) / total if neutral_ok
+                       else math.fsum(p[c] for p in px) / n) for c in range(3)],
+        "neutral_from": "neutral areas" if neutral_ok else "whole frame",
         "saturation": r4(math.fsum(max(p) - min(p) for p in px) / n),
         "clipped_pct": round(100 * sum(max(p) >= 0.995 for p in px) / n, 2),
         "crushed_pct": round(100 * sum(min(p) <= 0.005 for p in px) / n, 2),
+        # per channel, among the pixels the black and white points come from: how many sit at 0 and at 1
+        "crushed_share": [r4(sum(p[c] <= 0.005 for p in levels) / len(levels)) for c in range(3)],
+        "clipped_share": [r4(sum(p[c] >= 0.995 for p in levels) / len(levels)) for c in range(3)],
         "pixels_sampled": n,
     }
 
@@ -5038,47 +5052,155 @@ def _refine(base, tn, goal, g):
     return out
 
 
-def _error(st, goal):
-    errs = [abs(st["black"][c] - goal["black"][c]) for c in range(3)]
-    errs += [abs(st["white"][c] - goal["white"][c]) for c in range(3)]
+def _residuals(st, goal):
+    """Signed misses of a measurement against the goal: black and white points, then the neutral color (shot match)
+    or the brightness and the cast still allowed (auto)."""
+    # A clipped black or white point reads 0 or 1 however far past it the picture is, which gives the refinement
+    # nothing to follow (live 21.1: S-Log3-decoded frames clipped a third of their pixels). When the goal is not
+    # clipped itself, the share of pixels at the clip is added to the miss: it shrinks as the level comes back.
+    res = [st["black"][c] - goal["black"][c]
+           - (st["crushed_share"][c] if st["black"][c] <= 0.005 < goal["black"][c] else 0.0) for c in range(3)]
+    res += [st["white"][c] - goal["white"][c]
+            + (st["clipped_share"][c] if st["white"][c] >= 0.995 > goal["white"][c] else 0.0) for c in range(3)]
     if goal["neutral"] is not None:
-        errs += [abs(st["neutral"][c] - goal["neutral"][c]) for c in range(3)]
+        res += [st["neutral"][c] - goal["neutral"][c] for c in range(3)]
     else:
-        errs.append(abs(st["luma"]["mean"] - goal["mid"]))
+        res.append(st["luma"]["mean"] - goal["mid"])
         if goal["cast"] is not None:
             gray = sum(st["neutral"]) / 3
-            errs += [abs((st["neutral"][c] - gray) - goal["cast"][c]) for c in range(3)]
-    return max(errs)
+            res += [(st["neutral"][c] - gray) - goal["cast"][c] for c in range(3)]
+    return res
+
+
+def _error(st, goal):
+    return max(abs(r) for r in _residuals(st, goal))
+
+
+def _linsolve(a, b):
+    """x with a x = b for a small square system (Gaussian elimination, partial pivoting); None if singular."""
+    n = len(b)
+    m = [list(row) + [v] for row, v in zip(a, b)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(m[r][col]))
+        if abs(m[piv][col]) < 1e-12:
+            return None
+        m[col], m[piv] = m[piv], m[col]
+        for r in range(col + 1, n):
+            f = m[r][col] / m[col][col]
+            for k in range(col, n + 1):
+                m[r][k] -= f * m[col][k]
+    x = [0.0] * n
+    for r in range(n - 1, -1, -1):
+        x[r] = (m[r][n] - sum(m[r][k] * x[k] for k in range(r + 1, n))) / m[r][r]
+    return x
+
+
+CDL_KINDS = ("slope",) * 3 + ("offset",) * 3 + ("power",) * 3
+CDL_STEPS = (0.1,) * 3 + (0.03,) * 3 + (0.1,) * 3  # finite-difference steps: several 8-bit code values of change
+
+
+def _levenberg(try_cdl, cdl, st, goal, budget):
+    """Model-free refinement for when the display transform defeats the model (color management: the CDL acts on
+    log values and the output transform mixes channels). Levenberg-Marquardt over the 9 CDL values on the measured
+    misses: a finite-difference Jacobian (9 measurements), Broyden updates after accepted steps, more damping and a
+    retry after a worse one. try_cdl(cdl) applies and measures. Returns the (cdl, stats) with the
+    smallest largest miss measured, and the measurements used."""
+    x = list(cdl[0]) + list(cdl[1]) + list(cdl[2])
+    r = _residuals(st, goal)
+    best = (max(abs(e) for e in r), cdl, st)
+    clamp = lambda v: [_clampv(k, xi) for k, xi in zip(CDL_KINDS, v)]  # noqa: E731
+    as_cdl = lambda v: (v[0:3], v[3:6], v[6:9])  # noqa: E731
+    sq = lambda v: math.fsum(e * e for e in v)  # noqa: E731
+    jac, lam, used = None, 0.1, 0
+    while used < budget and max(abs(e) for e in r) >= 0.015:
+        if jac is None:
+            if used + len(x) > budget:
+                break
+            cols = []
+            for i, h in enumerate(CDL_STEPS):
+                xp = list(x)
+                xp[i] = x[i] + h if _clampv(CDL_KINDS[i], x[i] + h) == x[i] + h else x[i] - h
+                rp = _residuals(try_cdl(as_cdl(xp)), goal)
+                used += 1
+                cols.append([(a - b) / (xp[i] - x[i]) for a, b in zip(rp, r)])
+            jac = [[cols[j][i] for j in range(len(x))] for i in range(len(r))]  # rows: misses, columns: CDL values
+        jtj = [[math.fsum(jac[k][i] * jac[k][j] for k in range(len(r))) for j in range(len(x))] for i in range(len(x))]
+        jtr = [math.fsum(jac[k][i] * r[k] for k in range(len(r))) for i in range(len(x))]
+        for i in range(len(x)):
+            jtj[i][i] += lam * (jtj[i][i] + 1e-6)
+        step = _linsolve(jtj, [-v for v in jtr])
+        if step is None:
+            break
+        xn = clamp([a + b for a, b in zip(x, step)])
+        stn = try_cdl(as_cdl(xn))
+        used += 1
+        rn = _residuals(stn, goal)
+        if max(abs(e) for e in rn) < best[0]:  # judged, like the result, by the largest miss
+            best = (max(abs(e) for e in rn), as_cdl(xn), stn)
+        if sq(rn) < sq(r):
+            dx = [a - b for a, b in zip(xn, x)]
+            dd = math.fsum(v * v for v in dx)
+            if dd > 1e-12:  # Broyden: make the Jacobian explain the step just taken
+                pred = [math.fsum(jac[k][j] * dx[j] for j in range(len(x))) for k in range(len(r))]
+                for k in range(len(r)):
+                    u = (rn[k] - r[k] - pred[k]) / dd
+                    for j in range(len(x)):
+                        jac[k][j] += u * dx[j]
+            x, r, st, lam = xn, rn, stn, max(1e-4, lam / 3)
+        else:
+            lam *= 4
+            if lam > 1e2:  # the Jacobian no longer describes this spot: measure it again
+                jac, lam = None, 0.1
+    return best[1:], used
 
 
 def _correct(proj, tl, index, it, node, goal_of, iterations, track):
     """Closed loop on one item: reset the node's CDL, measure, then solve, apply and re-measure until the goal is
     met or iterations run out, refitting the display response from every measurement. goal_of(first_stats) gives
-    the absolute targets. Returns the report row."""
+    the absolute targets. The fitted model is exact for a gamma-like display and converges in about two steps; when
+    it has not met the goal (color management, live 21.1), _levenberg continues from the best result. The best
+    measured CDL is the one left on the node. Returns the report row."""
     identity = ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
     set_cdl(index, *identity, node=node, track=track)
     frame = _mid_frame(it)
     before = _measure(proj, tl, frame)
     goal = goal_of(before)
+
+    def try_cdl(c):
+        set_cdl(index, *c, node=node, track=track)
+        return _measure(proj, tl, frame)
+
     cdl, st, hist, g, steps = identity, before, [], 1.0, 0
+    best = (identity, before)
     tn = _neutral_goal(before, goal)
     for steps in range(1, iterations + 1):
         if hist:  # integral feedback: move the model's neutral target by what the measurement still misses
             want = _neutral_goal(st, goal)
             tn = [min(0.97, max(0.03, t + w - n)) for t, w, n in zip(tn, want, st["neutral"])]
         cdl = _refine(before, tn, goal, g)
-        set_cdl(index, *cdl, node=node, track=track)
-        st = _measure(proj, tl, frame)
+        st = try_cdl(cdl)
         hist.append((cdl, st))
+        if _error(st, goal) < _error(best[1], goal):
+            best = (cdl, st)
+        elif not _error(st, goal) < 0.015:  # worse than before: the model does not describe this display
+            break
         if _error(st, goal) < 0.015:  # about 4 code values of 8-bit
             break
         g = _fit_display(before, hist)
+    refined = 0
+    if _error(best[1], goal) >= 0.015:
+        # ponytail: fixed budget of 48 measurements (~25 s on live 21.1); raise it if hard frames need more
+        best, refined = _levenberg(try_cdl, *best, goal, budget=48)
+    cdl, st = best
+    if refined or hist[-1][0] is not cdl:
+        set_cdl(index, *cdl, node=node, track=track)  # leave the best measured CDL on the node
     warnings = []
     if before["neutral_from"] != "neutral areas" and goal["neutral"] is None and goal["cast"] is not None:
         warnings.append("no neutral areas in the frame: balance assumed the whole frame averages to gray (wrong "
                         "for a frame dominated by one color; use balance=False or shot_match)")
     return {"item": index, "name": it.GetName(), "frame": frame, "node": node, "iterations": steps,
-            "error": round(_error(st, goal), 4), "display_exponent": round(g, 3), "warnings": warnings,
+            "refine_measurements": refined, "error": round(_error(st, goal), 4), "display_exponent": round(g, 3),
+            "warnings": warnings,
             "cdl": {"slope": [round(v, 4) for v in cdl[0]], "offset": [round(v, 4) for v in cdl[1]],
                     "power": [round(v, 4) for v in cdl[2]]},
             "before": {"verdict": _verdict(before), "black": before["black"], "white": before["white"],

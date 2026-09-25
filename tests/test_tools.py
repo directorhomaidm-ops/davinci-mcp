@@ -3101,3 +3101,24 @@ def test_clean_bins_keeps_the_bin_itself(project):
     project.pool.root.subfolders.append(Folder("Empty"))
     assert d.clean_bins("Empty") == {"deleted": []}
     assert "Empty" in [f.name for f in project.pool.root.subfolders]
+
+
+def test_linsolve():
+    assert d._linsolve([[2, 1, 0], [1, 3, 1], [0, 1, 4]], [3, 5, 5]) == pytest.approx([1, 1, 1])
+    assert d._linsolve([[1, 2], [2, 4]], [1, 2]) is None  # singular
+
+
+def test_levenberg_sees_through_a_channel_mixing_display():
+    # a display that mixes channels (as color management does): each output channel takes 20% of the others, which
+    # the per-channel model cannot describe; the model-free refinement must still reach the goal
+    def display(cdl):
+        levels = {}
+        for key, scene in (("black", 0.2), ("white", 0.8), ("neutral", 0.5)):  # a goal within the CDL limits
+            raw = [min(1.0, max(0.0, scene * cdl[0][c] + cdl[1][c])) ** cdl[2][c] for c in range(3)]
+            levels[key] = [0.6 * raw[c] + 0.2 * raw[(c + 1) % 3] + 0.2 * raw[(c + 2) % 3] for c in range(3)]
+        return {**levels, "crushed_share": [0.0] * 3, "clipped_share": [0.0] * 3}
+
+    goal = {"black": [0.05] * 3, "white": [0.9] * 3, "neutral": [0.4, 0.42, 0.44], "mid": None, "cast": None}
+    identity = ([1.0] * 3, [0.0] * 3, [1.0] * 3)
+    (cdl, st), used = d._levenberg(display, identity, display(identity), goal, budget=48)
+    assert d._error(st, goal) < 0.015 and used <= 48
