@@ -4,12 +4,13 @@ import logging
 import math
 import os
 import subprocess
+from datetime import datetime
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 import davinci_mcp as d
-from conftest import Clip, render_look
+from conftest import Clip, Folder, render_look
 
 
 def test_status_without_project(resolve):
@@ -208,7 +209,8 @@ def test_all_tools_registered():
         "gallery_albums", "import_stills", "validate_dctl", "super_scale", "ai_slow_motion", "remove_silences",
         "cut_by_transcript", "social_platforms", "social_timeline", "social_render", "social_export",
         "animated_title", "lower_third", "save_template", "list_templates", "apply_template", "batch_titles",
-        "analyze_color", "auto_color", "shot_match",
+        "analyze_color", "auto_color", "shot_match", "auto_organize", "color_code", "find_unused",
+        "find_duplicates", "find_offline", "clean_bins",
     }
 
 
@@ -2882,3 +2884,181 @@ def test_auto_color_warns_without_neutral_areas(project):
     assert "no neutral areas" in row["warnings"][0]
     (row,) = d.auto_color([1], balance=False)
     assert row["warnings"] == []
+
+
+
+# --- automatic media organization ---
+
+
+@pytest.fixture
+def media(project, tmp_path):
+    """Real files for date/size checks: interview.mov (2026-01-02), music.wav, logo.png (a still), and a timeline."""
+    files = {}
+    for name, day in (("interview.mov", 2), ("music.wav", 3), ("logo.png", 3)):
+        f = tmp_path / "card" / name
+        f.parent.mkdir(exist_ok=True)
+        f.write_bytes(b"x" * 10)
+        t = datetime(2026, 1, day, 12).timestamp()
+        os.utime(f, (t, t))
+        files[name] = f
+    root = project.pool.root
+    root.clips += [Clip("interview.mov", 200, str(files["interview.mov"])), Clip("music.wav", 0, str(files["music.wav"])),
+                   Clip("logo.png", 1, str(files["logo.png"]))]
+    tl = Clip("Main", 0, "")
+    tl.type = "Timeline"
+    root.clips.append(tl)
+    return files
+
+
+def _bins(folder, prefix=""):
+    out = {}
+    for f in folder.subfolders:
+        path = f"{prefix}/{f.name}"
+        out[path] = sorted(c.name for c in f.clips)
+        out.update(_bins(f, path))
+    return out
+
+
+def test_auto_organize_by_type(project, media):
+    plan = d.auto_organize(dry_run=True)
+    assert plan["plan"] == {"/Audio": ["music.wav"], "/Stills": ["logo.png"], "/Timelines": ["Main"],
+                            "/Video": ["a.mov", "b.mov", "interview.mov"]}
+    assert _bins(project.pool.root) == {"/B-roll": ["b.mov"]}  # nothing moved on a dry run
+    out = d.auto_organize()
+    assert out["moved"] == 6 and out["already_in_place"] == 0
+    assert _bins(project.pool.root) == {"/B-roll": [], "/Audio": ["music.wav"], "/Stills": ["logo.png"],
+                                        "/Timelines": ["Main"], "/Video": ["a.mov", "b.mov", "interview.mov"]}
+    again = d.auto_organize()
+    assert (again["already_in_place"], again["moved"], again["plan"]) == (6, 0, {})
+    with pytest.raises(ToolError, match="by must be from"):
+        d.auto_organize(by="mood")
+
+
+def test_auto_organize_nested_into_bin(project, media):
+    out = d.auto_organize(by=["type", "date"], bin="/", into="Organized", color=True)
+    bins = _bins(project.pool.root)
+    assert bins["/Organized/Video/2026-01-02"] == ["interview.mov"]
+    assert bins["/Organized/Video/No date"] == ["a.mov", "b.mov"]  # no file on disk
+    assert bins["/Organized/Audio/2026-01-03"] == ["music.wav"]
+    assert out["colored"] == {"Video": 3, "Audio": 1, "Stills": 1, "Timelines": 1}
+
+
+def test_auto_organize_other_keys(project, media):
+    plan = d.auto_organize(by="extension", dry_run=True)["plan"]
+    assert plan["/MOV"] == ["a.mov", "b.mov", "interview.mov"] and plan["/WAV"] == ["music.wav"]
+    plan = d.auto_organize(by="folder", bin="B-roll", dry_run=True)["plan"]
+    assert plan == {"/media": ["b.mov"]}
+    plan = d.auto_organize(by="fps", dry_run=True)["plan"]
+    assert plan == {"/24 fps": ["Main", "a.mov", "b.mov", "interview.mov", "logo.png", "music.wav"]}
+    clip = next(c for c in project.pool.root.clips if c.name == "interview.mov")
+    clip.metadata.update({"Camera Manufacturer": "Blackmagic", "Camera Type": "Pocket 6K"})
+    plan = d.auto_organize(by="camera", dry_run=True)["plan"]
+    assert plan["/Blackmagic Pocket 6K"] == ["interview.mov"]
+
+
+def test_color_code(project, media):
+    out = d.color_code(colors={"Audio": "Teal"})
+    assert out["colors"]["Audio"] == "Teal" and out["colored"]["Video"] == 3
+    clip = next(c for c in project.pool.root.clips if c.name == "music.wav")
+    assert clip.GetClipColor() == "Teal"
+    with pytest.raises(ToolError, match="unknown clip colors"):
+        d.color_code(colors={"Audio": "Gold"})
+
+
+def test_find_unused(project, media):
+    d.append_clips(["a.mov", "interview.mov"])
+    out = d.find_unused(move_to="Unused")
+    assert sorted(r["name"] for r in out["unused"]) == ["b.mov", "logo.png", "music.wav"]  # never the timeline
+    assert _bins(project.pool.root)["/Unused"] == ["b.mov", "logo.png", "music.wav"]
+
+
+def test_find_duplicates(project, media, tmp_path):
+    root = project.pool.root
+    first = next(c for c in root.clips if c.name == "interview.mov")
+    again = Clip("interview.mov", 200, first.path)
+    root.subfolders[0].clips.append(again)  # imported twice, into B-roll
+    copy = tmp_path / "backup" / "music.wav"
+    copy.parent.mkdir()
+    copy.write_bytes(b"x" * 10)
+    root.clips.append(Clip("music copy", 0, str(copy)))
+    project.current = None
+    d.create_timeline("Main 2")
+    d.append_clips(["b.mov"])
+    project.current.tracks[("video", 1)][0].media = again  # the B-roll copy is the one in use
+    out = d.find_duplicates()
+    assert out["same_file"] == [{"file": os.path.normcase(first.path),
+                                 "clips": [{"name": "interview.mov", "bin": "/"}, {"name": "interview.mov", "bin": "B-roll"}]}]
+    assert out["same_name_and_size"] == [{"files": sorted([str(media["music.wav"]), str(copy)])}]
+    removed = d.find_duplicates(remove=True)["removed"]
+    assert removed == [{"name": "interview.mov", "bin": "/"}]  # the used entry stays
+    assert first not in root.clips and again in root.subfolders[0].clips
+
+
+def test_find_offline_and_relink(project, tmp_path):
+    root = project.pool.root
+    root.clips.append(Clip("x.mov", 10, "/old drive/x.mov"))
+    root.clips.append(Clip("gone.mov", 10, "/old drive/gone.mov"))
+    out = d.find_offline(bin=None)
+    assert [r["name"] for r in out["offline"]] == ["a.mov", "x.mov", "gone.mov", "b.mov"]
+    (tmp_path / "new" / "day1").mkdir(parents=True)
+    (tmp_path / "new" / "day1" / "x.mov").write_bytes(b"x")
+    (tmp_path / "new" / "a.mov").write_bytes(b"x")
+    out = d.find_offline(search=str(tmp_path / "new"))
+    assert sorted(r["name"] for r in out["relinked"]) == ["a.mov", "x.mov"]
+    assert sorted(out["still_offline"]) == ["b.mov", "gone.mov"]
+    assert next(c for c in root.clips if c.name == "x.mov").path == str(tmp_path / "new" / "day1" / "x.mov")
+    with pytest.raises(ToolError, match="folder not found"):
+        d.find_offline(search=str(tmp_path / "nowhere"))
+
+
+def test_clean_bins(project):
+    root = project.pool.root
+    empty = Folder("Empty", subfolders=[Folder("Also empty")])
+    keep = Folder("Keep", subfolders=[Folder("Hollow")])
+    keep.clips.append(Clip("k.mov"))
+    root.subfolders += [empty, keep]
+    out = d.clean_bins()
+    assert out["deleted"] == ["/Empty", "/Keep/Hollow"]
+    assert [f.name for f in root.subfolders] == ["B-roll", "Keep"] and keep.subfolders == []
+    assert d.clean_bins("Keep") == {"deleted": []}
+
+
+
+def test_media_kind_without_a_type_column(project):
+    root = project.pool.root
+    for name, frames, path in (("seq_[1-48].png", 48, "/x/seq_%04d.png"), ("logo.png", 1, "/x/logo.png"),
+                               ("vo.wav", 0, "/x/vo.wav"), ("gen", 0, "")):
+        c = Clip(name, frames, path)
+        c.path = path  # "" for a clip without a file (a generator)
+        c.type = "unknown"  # a Type Resolve reports that says nothing: fall back to the file
+        root.clips.append(c)
+    plan = d.auto_organize(dry_run=True)["plan"]
+    assert "seq_[1-48].png" in plan["/Video"] and plan["/Stills"] == ["logo.png"]
+    assert plan["/Audio"] == ["vo.wav"] and plan["/Other"] == ["gen"]
+
+
+def test_find_unused_matches_by_unique_id(project, media, monkeypatch):
+    import copy
+    d.append_clips(["a.mov"])
+    item = project.current.tracks[("video", 1)][0]
+    monkeypatch.setattr(item, "GetMediaPoolItem", lambda: copy.copy(item.media))  # a new wrapper per call, as live
+    assert "a.mov" not in [r["name"] for r in d.find_unused()["unused"]]
+
+
+def test_find_duplicates_keeps_every_used_entry(project, media):
+    root = project.pool.root
+    first = next(c for c in root.clips if c.name == "interview.mov")
+    second, third = Clip("interview.mov", 200, first.path), Clip("interview.mov", 200, first.path)
+    root.clips += [second, third]
+    d.create_timeline("T")
+    d.append_clips(["a.mov", "b.mov"])
+    items = project.current.tracks[("video", 1)]
+    items[0].media, items[1].media = first, second  # two of the three copies are in use
+    removed = d.find_duplicates(remove=True)["removed"]
+    assert len(removed) == 1 and third not in root.clips and first in root.clips and second in root.clips
+
+
+def test_clean_bins_keeps_the_bin_itself(project):
+    project.pool.root.subfolders.append(Folder("Empty"))
+    assert d.clean_bins("Empty") == {"deleted": []}
+    assert "Empty" in [f.name for f in project.pool.root.subfolders]
