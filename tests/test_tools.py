@@ -206,7 +206,7 @@ def test_all_tools_registered():
         "node_graph", "set_node_lut", "set_node_enabled", "reset_grade", "apply_drx_to", "color_groups",
         "create_color_group", "delete_color_group", "assign_color_group", "apply_arri_cdl_lut", "color_cache",
         "gallery_albums", "import_stills", "validate_dctl", "super_scale", "ai_slow_motion", "remove_silences",
-        "cut_by_transcript",
+        "cut_by_transcript", "social_platforms", "social_timeline", "social_render", "social_export",
     }
 
 
@@ -2534,3 +2534,105 @@ def test_cut_by_transcript_max_gap(project):
     joined = d.cut_by_transcript("a.mov", remove_fillers=False, remove_phrases=["wrong take"], max_gap=0.3,
                                  padding=0, timeline="joined")
     assert joined["kept"][0] == [0.0, 2.0]
+
+
+
+# --- social media delivery ---
+
+
+def test_social_platforms():
+    rows = {r["platform"]: r for r in d.social_platforms()}
+    assert rows["tiktok"] == {"platform": "tiktok", "name": "TikTok", "resolution": [1080, 1920], "aspect": "9:16",
+                              "bitrate_kbps": 12000}
+    assert rows["instagram_feed"]["aspect"] == "4:5" and rows["youtube"]["aspect"] == "16:9"
+
+
+def test_social_timeline_vertical_copy(project):
+    _two_items(project)
+    src = project.current
+    out = d.social_timeline("tiktok", reframe=True)
+    assert out == {"timeline": "Main - TikTok", "platform": "TikTok", "resolution": [1080, 1920], "fit": "fill",
+                   "warnings": [], "reframed": 2}
+    copy = project.current
+    assert copy.name == "Main - TikTok" and copy is not src
+    assert (copy.settings["timelineResolutionWidth"], copy.settings["timelineResolutionHeight"]) == ("1080", "1920")
+    assert copy.settings["timelineInputResMismatchBehavior"] == "scaleToFill"
+    assert all(i.reframed for i in copy.tracks[("video", 1)])
+    assert src.settings["timelineResolutionWidth"] == "1920"  # the edit itself is untouched
+    assert not any(i.reframed for i in src.tracks[("video", 1)])
+    with pytest.raises(ToolError, match="already exists"):
+        d.social_timeline("tiktok", timeline="Main")
+    with pytest.raises(ToolError, match="unknown platform"):
+        d.social_timeline("myspace")
+    with pytest.raises(ToolError, match="fit must be"):
+        d.social_timeline("youtube", fit="zoom")
+
+
+def test_social_timeline_refused_resolution_and_fit(project, monkeypatch):
+    _two_items(project)
+    Timeline = type(project.current)
+    real = Timeline.SetSetting
+    monkeypatch.setattr(Timeline, "SetSetting",
+                        lambda self, k, v: False if k == "timelineInputResMismatchBehavior" else real(self, k, v))
+    out = d.social_timeline("instagram_feed")
+    assert "fit 'fill' not applied" in out["warnings"][0]
+    monkeypatch.setattr(Timeline, "SetSetting",
+                        lambda self, k, v: False if k.startswith("timelineResolution") else real(self, k, v))
+    with pytest.raises(ToolError, match="Resolve kept"):
+        d.social_timeline("tiktok", timeline="Main")
+
+
+def test_social_timeline_loudness(project):
+    d.append_clips(["a.mov"])
+    project.current.tracks[("audio", 1)] = [project.current.tracks[("video", 1)][0]]
+    out = d.social_timeline("youtube_shorts", loudness=-14)
+    assert out["loudness"] == {"lufs": -14, "audio_tracks": [1]}
+    items, options = project.current.normalized
+    assert options["targetLoudness"] == -14.0 and len(items) == 1
+
+
+def test_social_render(project, tmp_path):
+    _two_items(project)
+    with pytest.raises(ToolError, match="run social_timeline\\('tiktok'\\) first"):
+        d.social_render("tiktok", str(tmp_path))
+    out = d.social_render("youtube", str(tmp_path))  # 1920x1080 already
+    assert (out["platform"], out["bitrate_kbps"], out["started"]) == ("YouTube", 16000, True)
+    name, settings, fc = project.job_made[out["job"]]
+    assert fc == ("mp4", "H264")
+    assert {k: settings[k] for k in ("FormatWidth", "FormatHeight", "VideoQuality", "CustomName", "ExportAudio")} == \
+        {"FormatWidth": 1920, "FormatHeight": 1080, "VideoQuality": 16000, "CustomName": "Main - YouTube",
+         "ExportAudio": True}
+    with pytest.raises(ToolError, match="kbps"):
+        d.social_render("youtube", str(tmp_path), bitrate=50)
+
+
+def test_social_export_all(project, tmp_path):
+    _two_items(project)
+    d.social_timeline("tiktok")
+    project.current.settings["hand_tweak"] = "kept"
+    d.switch_timeline("Main")
+    out = d.social_export(["tiktok", "youtube", "instagram_feed"], str(tmp_path))
+    assert [(j["platform"], j["timeline"], j["timeline_was"]) for j in out["jobs"]] == [
+        ("tiktok", "Main - TikTok", "reused"), ("youtube", "Main - YouTube", "created"),
+        ("instagram_feed", "Main - Instagram Feed", "created")]
+    made = [project.job_made[j["job"]] for j in out["jobs"]]
+    assert [m[0] for m in made] == ["Main - TikTok", "Main - YouTube", "Main - Instagram Feed"]
+    assert [(m[1]["FormatWidth"], m[1]["FormatHeight"]) for m in made] == [(1080, 1920), (1920, 1080), (1080, 1350)]
+    assert [m[1]["CustomName"] for m in made] == ["Main - TikTok", "Main - YouTube", "Main - Instagram Feed"]
+    assert project.current.name == "Main" and out["started"]
+    assert all(project.jobs[j["job"]]["JobStatus"] == "Rendering" for j in out["jobs"])
+    tiktok = next(t for t in project.timelines if t.name == "Main - TikTok")
+    assert tiktok.settings["hand_tweak"] == "kept"
+    with pytest.raises(ToolError, match="listed twice"):
+        d.social_export(["x", "x"], str(tmp_path))
+    with pytest.raises(ToolError, match="unknown platform"):
+        d.social_export(["x", "vine"], str(tmp_path))
+
+
+def test_social_timeline_reframe_skips_titles(project, monkeypatch):
+    _two_items(project)
+    Item = type(project.current.tracks[("video", 1)][0])
+    monkeypatch.setattr(Item, "SmartReframe", lambda self: self.media is not None)  # titles have nothing to follow
+    project.current.tracks[("video", 1)][1].media = None
+    out = d.social_timeline("tiktok", reframe=True)
+    assert (out["reframed"], out["warnings"]) == (1, [])

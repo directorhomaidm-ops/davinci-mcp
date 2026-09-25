@@ -318,6 +318,17 @@ def run_checks(args, work, is_211):
          needs=(studio if is_211 else "needs Resolve 21.1") if vo else "no voiceover (needs the AI Speech Generator)",
          note="confirms the transcript's word format and that the filler 'um' is cut")
 
+    print("\nSocial media delivery")
+    feed = step("social: social_timeline instagram_feed (4:5) from 'Check'", lambda: d.social_timeline(
+        "instagram_feed", timeline="Check"), needs=have_items,
+        note="warnings show whether the fit setting (timelineInputResMismatchBehavior) was accepted")
+    if feed:
+        job = step("social: social_render instagram_feed", lambda: d.social_render("instagram_feed", str(work)))
+        if job:
+            step("social: render done + output exists", lambda: _wait_render(job["job"], args.render_timeout))
+    step("social: social_export tiktok + youtube (queued only)", lambda: d.social_export(
+        ["tiktok", "youtube"], str(work), timeline="Check", start=False), needs=have_items)
+
 
 # --- helpers for individual checks ------------------------------------------------------------------------------
 

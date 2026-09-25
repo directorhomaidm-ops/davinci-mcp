@@ -744,6 +744,16 @@ class Timeline:
         if key == "useCustomSettings":
             self.settings[key] = value
             return True
+        if key in ("timelineResolutionWidth", "timelineResolutionHeight"):
+            if self.settings.get("useCustomSettings") != "1":
+                return False  # assumed: a timeline follows the project's format until custom settings are on
+            self.settings[key] = value
+            return True
+        if key == "timelineInputResMismatchBehavior":
+            if value not in ("centerCrop", "scaleToFit", "scaleToFill", "stretch"):
+                return False
+            self.settings[key] = value
+            return True
         return color_set(self.settings, key, value)
 
     def AnalyzeDolbyVision(self, items=None, analysis=None):
@@ -879,6 +889,8 @@ class Timeline:
     def DuplicateTimeline(self, name):
         copy = Timeline(name, self.start)
         copy.project = self.project
+        copy.settings = dict(self.settings)
+        copy.tracks = {k: [Item(i.name, i.start, i.end, i.media, copy) for i in v] for k, v in self.tracks.items()}
         self.project.timelines.append(copy)
         self.project.current = copy  # measured: the copy silently becomes current
         return copy
@@ -1156,6 +1168,8 @@ class Project:
     def AddRenderJob(self):
         job = f"job-{len(self.jobs) + 1}"
         self.jobs[job] = {"JobStatus": "Ready", "CompletionPercentage": 0}
+        self.job_made = getattr(self, "job_made", {})
+        self.job_made[job] = (self.current.name if self.current else None, dict(self.render_settings), self.format_codec)
         return job
 
     def StartRendering(self, jobs=None, isInteractiveMode=False):
