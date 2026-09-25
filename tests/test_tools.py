@@ -1,12 +1,15 @@
 import asyncio
 import json
 import logging
+import math
 import os
+import subprocess
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 import davinci_mcp as d
+from conftest import Clip
 
 
 def test_status_without_project(resolve):
@@ -202,7 +205,8 @@ def test_all_tools_registered():
         "remove_transitions", "letterbox", "picture_in_picture", "split_screen", "vignette", "camera_shake",
         "node_graph", "set_node_lut", "set_node_enabled", "reset_grade", "apply_drx_to", "color_groups",
         "create_color_group", "delete_color_group", "assign_color_group", "apply_arri_cdl_lut", "color_cache",
-        "gallery_albums", "import_stills", "validate_dctl",
+        "gallery_albums", "import_stills", "validate_dctl", "super_scale", "ai_slow_motion", "remove_silences",
+        "cut_by_transcript",
     }
 
 
@@ -2381,3 +2385,152 @@ def test_add_transition_found_by_position_when_timing_is_odd(project, monkeypatc
     monkeypatch.setattr(a, "AddTransition", odd)
     out = d.add_transition(1, duration=24)
     assert (out["name"], out["index"]) == ("Cross Dissolve", 2) and "timing not usable" in out["note"]
+
+
+
+# --- AI editing ---
+
+
+def test_super_scale(project):
+    clip = next(c for c in project.pool.root.clips if c.name == "a.mov")
+    assert d.super_scale(["a.mov"], "3x") == [{"clip": "a.mov", "super_scale": "3", "enhanced": False}]
+    out = d.super_scale(["a.mov"], "2x", sharpness=0.4, noise_reduction=0.2)
+    assert out[0]["enhanced"] and clip.super_scale_args == (2, 0.4, 0.2)
+    for kwargs, msg in [({"scale": "8x"}, "scale must be"), ({"scale": "3x", "sharpness": 0.5, "noise_reduction": 0},
+                                                              "use scale='2x'"),
+                        ({"sharpness": 0.5}, "needs both"), ({"sharpness": 2, "noise_reduction": 0}, "between 0 and 1")]:
+        with pytest.raises(ToolError, match=msg):
+            d.super_scale(["a.mov"], **kwargs)
+
+
+def test_ai_slow_motion(project):
+    a, _ = _two_items(project)
+    out = d.ai_slow_motion(1, 50)
+    assert a.speed == {"Percentage": 50.0}
+    assert (a.props["RetimeProcess"], a.props["MotionEstimation"]) == (3, 5)  # optical_flow, speed_warp
+    assert (out["retime"], out["motion_estimation"]) == ("optical_flow", "speed_warp")
+    with pytest.raises(ToolError, match="below 100"):
+        d.ai_slow_motion(1, 150)
+    with pytest.raises(ToolError, match="engine must be"):
+        d.ai_slow_motion(1, 50, engine="magic")
+
+
+def _talk_wav(path, pattern, rate=16000):
+    """pattern: [(seconds, loud)], a 300 Hz tone where loud, digital silence elsewhere."""
+    import wave as _wave
+    frames = bytearray()
+    for sec_, loud in pattern:
+        for i in range(int(sec_ * rate)):
+            v = int(12000 * math.sin(2 * math.pi * 300 * i / rate)) if loud else 0
+            frames += v.to_bytes(2, "little", signed=True)
+    with _wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+
+
+@pytest.fixture
+def talk(project, tmp_path):
+    """talk.wav in the pool: 1 s speech, 1 s pause, 1 s speech, 0.3 s pause, 1 s speech (4.3 s at 24 fps)."""
+    path = tmp_path / "talk.wav"
+    _talk_wav(path, [(1, True), (1, False), (1, True), (0.3, False), (1, True)])
+    clip = Clip("talk.wav", frames=0, path=str(path))
+    project.pool.root.clips.append(clip)
+    return clip
+
+
+def test_remove_silences(project, talk):
+    out = d.remove_silences("talk.wav", min_silence=0.5, padding=0.1)
+    # only the 1 s pause is long enough; 0.1 s of it stays on each side
+    assert (out["parts"], out["pauses_found"]) == (2, 1)
+    assert out["kept"] == [[0.0, 1.12], [1.88, 4.29]]  # frames 27 and 45..103 of 103
+    assert out["timeline"] == "talk.wav - no silences" and project.current.name == out["timeline"]
+    (infos,) = project.pool.appended
+    assert [(i["startFrame"], i["endFrame"]) for i in infos] == [(0, 27), (45, 103)]
+    with pytest.raises(ToolError, match="may be taken"):
+        d.remove_silences("talk.wav")  # same default name again
+    with pytest.raises(ToolError, match="no pause"):
+        d.remove_silences("talk.wav", min_silence=2, timeline="x")
+    with pytest.raises(ToolError, match="padding must be"):
+        d.remove_silences("talk.wav", padding=0.3)
+
+
+def test_remove_silences_needs_wav_or_ffmpeg(project, monkeypatch, tmp_path):
+    clip = next(c for c in project.pool.root.clips if c.name == "a.mov")
+    clip.path = str(tmp_path / "a.mov")
+    (tmp_path / "a.mov").write_bytes(b"\0")
+    monkeypatch.setattr(d.shutil, "which", lambda name: None)
+    with pytest.raises(ToolError, match="ffmpeg is not installed"):
+        d.remove_silences("a.mov")
+
+
+def test_remove_silences_through_ffmpeg(project, monkeypatch, tmp_path):
+    clip = next(c for c in project.pool.root.clips if c.name == "a.mov")
+    clip.path = str(tmp_path / "a.mov")
+    (tmp_path / "a.mov").write_bytes(b"\0")
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        _talk_wav(cmd[-1], [(1, True), (1, False), (1, True)])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(d.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(d.subprocess, "run", fake_run)
+    out = d.remove_silences("a.mov")
+    assert calls[0][:4] == ["/usr/bin/ffmpeg", "-v", "error", "-y"] and out["parts"] == 2
+    assert not os.path.exists(calls[0][-1])  # the temporary WAV is removed
+
+
+TALK = {
+    "language": "en",
+    "segments": [
+        {"start": "01:00:00:00", "end": "01:00:02:00", "text": "So um welcome", "speaker": None,
+         "words": [{"start": "01:00:00:00", "end": "01:00:00:06", "text": "So"},
+                   {"start": "01:00:00:12", "end": "01:00:00:18", "text": "um,"},
+                   {"start": "01:00:01:00", "end": "01:00:02:00", "text": "welcome"}]},
+        {"start": "01:00:02:00", "end": "01:00:02:12", "text": "(...)", "speaker": None, "words": []},
+        {"start": "01:00:02:12", "end": "01:00:03:00", "text": "Wrong take sorry", "speaker": None, "words": []},
+        {"start": "01:00:03:00", "end": "01:00:04:00", "text": "Today we grade", "speaker": None,
+         "words": [{"start": "01:00:03:00", "end": "01:00:03:12", "text": "Today"},
+                   {"start": "01:00:03:12", "end": "01:00:04:00", "text": "we grade"}]},
+    ],
+}
+
+
+def test_cut_by_transcript(project):
+    clip = next(c for c in project.pool.root.clips if c.name == "a.mov")
+    clip.GetTranscription = lambda nested=False: TALK
+    out = d.cut_by_transcript("a.mov", remove_phrases=["wrong take"], padding=0.1)
+    assert out["removed"] == {"fillers": 1, "segments": 1}
+    (infos,) = project.pool.appended
+    # 24 fps, padding 2.4 frames: "So" 0-6 -> 0-9; the filler (12-18) is cut; "welcome" 24-48 -> 21-51, padded
+    # at most halfway back to the filler; the pause and the retake (48-72) are cut; "Today we grade" 72-96 -> 72-99,
+    # not padded into the retake before it.
+    assert [(i["startFrame"], i["endFrame"]) for i in infos] == [(0, 9), (21, 51), (72, 99)]
+    assert out["timeline"] == "a.mov - edited"
+
+
+def test_cut_by_transcript_keep_only_and_errors(project):
+    clip = next(c for c in project.pool.root.clips if c.name == "a.mov")
+    clip.GetTranscription = lambda nested=False: TALK
+    out = d.cut_by_transcript("a.mov", keep_only=["today"], timeline="today only")
+    assert out["parts"] == 1 and out["removed"]["segments"] == 2
+    with pytest.raises(ToolError, match="nothing left"):
+        d.cut_by_transcript("a.mov", keep_only=["absent"], timeline="none")
+    clip.GetTranscription = None
+    clip.props["Transcription"] = "So um welcome…"
+    with pytest.raises(ToolError, match="needs Resolve 21.1"):
+        d.cut_by_transcript("a.mov", timeline="old")
+
+
+def test_cut_by_transcript_max_gap(project):
+    clip = next(c for c in project.pool.root.clips if c.name == "a.mov")
+    clip.GetTranscription = lambda nested=False: TALK
+    # fillers kept; the 0.25 s gaps between "So", "um" and "welcome" exceed max_gap 0.2, so each word is a part
+    out = d.cut_by_transcript("a.mov", remove_fillers=False, remove_phrases=["wrong take"], max_gap=0.2, padding=0)
+    assert out["kept"][:3] == [[0.0, 0.25], [0.5, 0.75], [1.0, 2.0]]
+    joined = d.cut_by_transcript("a.mov", remove_fillers=False, remove_phrases=["wrong take"], max_gap=0.3,
+                                 padding=0, timeline="joined")
+    assert joined["kept"][0] == [0.0, 2.0]

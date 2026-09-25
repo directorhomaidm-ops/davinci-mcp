@@ -22,6 +22,7 @@ import logging
 import math
 import random
 import struct
+import subprocess
 import wave
 from array import array
 import os
@@ -4064,6 +4065,267 @@ def validate_dctl(source: str) -> dict:
         raise ToolError(f"unexpected ValidateDCTL result: {result!r}")
     return {"valid": result is None, "diagnostic": result}
 
+
+
+# --- AI editing ---
+#
+# Resolve's neural features that the API reaches beyond the ones above (transcription, captions, Magic Mask, Smart
+# Reframe, scene cuts, voice isolation, audio classification, speech generation): Super Scale and Speed Warp. Plus
+# cut editing driven by analysis: pauses found in the audio here, words from Resolve's own transcript. Cut tools
+# never touch the source: they build a new timeline from the kept ranges of the clip.
+
+SUPER_SCALE = {"auto": 0, "none": 1, "2x": 2, "3x": 3, "4x": 4}
+FILLER_WORDS = ("um", "umm", "uh", "uhh", "uhm", "erm", "er", "ah", "hmm", "mm", "mhm",
+                "ام", "امم", "اممم", "إمم", "مم", "ممم", "اه", "آه", "اها")
+
+
+@_tool
+def super_scale(clips: list[str], scale: str = "2x", sharpness: float | None = None,
+                noise_reduction: float | None = None) -> list[dict]:
+    """AI upscaling of media-pool clips (Studio): scale auto, none, 2x, 3x or 4x. Giving sharpness and
+    noise_reduction (0-1, both) selects 2x Enhanced. It applies wherever the clip is used; set a higher timeline or
+    render resolution to benefit. Returns the property as Resolve reads it back."""
+    if scale not in SUPER_SCALE:
+        raise ToolError(f"scale must be one of: {', '.join(SUPER_SCALE)}")
+    enhanced = sharpness is not None or noise_reduction is not None
+    if enhanced:
+        if scale != "2x":
+            raise ToolError("sharpness and noise_reduction select 2x Enhanced: use scale='2x'")
+        if sharpness is None or noise_reduction is None:
+            raise ToolError("2x Enhanced needs both sharpness and noise_reduction")
+        if not (0 <= sharpness <= 1 and 0 <= noise_reduction <= 1):
+            raise ToolError("sharpness and noise_reduction must be between 0 and 1")
+    _, proj = _project()
+    args = (SUPER_SCALE[scale],) + ((float(sharpness), float(noise_reduction)) if enhanced else ())
+    out = []
+    for c in _pool_clips(proj, clips):
+        ok = c.SetClipProperty("Super Scale", *args)
+        now = c.GetClipProperty("Super Scale")
+        if not ok:
+            raise ToolError(f"{c.GetName()}: Resolve refused Super Scale {scale} (Studio only); it reads {now!r}")
+        out.append({"clip": c.GetName(), "super_scale": now, "enhanced": enhanced})
+    return out
+
+
+@_tool
+def ai_slow_motion(item: int, percent: float = 50, engine: str = "speed_warp", ripple: bool = False,
+                   track: int = 1) -> dict:
+    """Smooth slow motion with interpolated frames (Resolve 21.1+): slows a video item to `percent` (below 100)
+    and sets its retiming to optical flow with the given motion engine: speed_warp (neural, Studio),
+    enhanced_better, enhanced_faster, standard_better or standard_faster."""
+    engines = PROPERTY_ENUMS["MotionEstimation"][1:]
+    if not 0 < percent < 100:
+        raise ToolError("percent must be above 0 and below 100 for slow motion (use set_speed otherwise)")
+    if engine not in engines:
+        raise ToolError(f"engine must be one of: {', '.join(engines)}")
+    out = set_speed(item, percent, ripple=ripple, track=track)
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    props = {"RetimeProcess": _prop_value("RetimeProcess", "optical_flow"),
+             "MotionEstimation": _prop_value("MotionEstimation", engine)}
+    failed = [k for k, v in props.items() if not it.SetProperty(k, v)]
+    if failed:
+        raise ToolError(f"speed is now {percent}% but Resolve refused {', '.join(failed)}"
+                        + (" (Speed Warp is Studio only)" if engine == "speed_warp" else ""))
+    return {**out, "retime": "optical_flow", "motion_estimation": engine}
+
+
+def _audio_wav(path):
+    """(PCM WAV path, temp dir to delete or None): the file itself, or its audio converted by ffmpeg."""
+    if path.lower().endswith((".wav", ".wave")):
+        return path, None
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        raise ToolError(f"{os.path.basename(path)} is not a WAV and ffmpeg is not installed to read its audio "
+                        "(install ffmpeg, or render the audio to WAV and import it)")
+    tmp = tempfile.mkdtemp(prefix="davinci_mcp_")
+    out = os.path.join(tmp, "audio.wav")
+    try:
+        r = subprocess.run([ff, "-v", "error", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000",
+                            "-c:a", "pcm_s16le", out], capture_output=True, text=True, timeout=900)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise ToolError(f"ffmpeg failed on {os.path.basename(path)}: {e}") from e
+    if r.returncode or not os.path.exists(out):
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise ToolError(f"ffmpeg could not read audio from {os.path.basename(path)}: {r.stderr.strip()[:300]}")
+    return out, tmp
+
+
+def _pauses(env, hop, duration, threshold_db, min_silence):
+    """(start, end) seconds of runs quieter than threshold_db lasting at least min_silence."""
+    floor = 10 ** (threshold_db / 20)
+    out, i, n = [], 0, len(env)
+    while i < n:
+        if env[i] > floor:
+            i += 1
+            continue
+        j = i
+        while j < n and env[j] <= floor:
+            j += 1
+        if (j - i) * hop >= min_silence:
+            out.append((i * hop, duration if j >= n else j * hop))
+        i = j
+    return out
+
+
+def _keep_between(pauses, duration, padding):
+    """Complement of the pauses over [0, duration], each pause shrunk by `padding` on the sides next to sound."""
+    keep, t = [], 0.0
+    for a, b in pauses:
+        a2 = a if a <= 0 else a + padding
+        b2 = b if b >= duration else b - padding
+        if b2 <= a2:
+            continue
+        if a2 > t:
+            keep.append((t, a2))
+        t = b2
+    if duration > t:
+        keep.append((t, duration))
+    return keep
+
+
+def _clip_fps(proj, clip):
+    try:
+        return float(clip.GetClipProperty("FPS") or 0) or float(proj.GetSetting("timelineFrameRate"))
+    except (TypeError, ValueError):
+        raise ToolError(f"cannot read a frame rate for {clip.GetName()}") from None
+
+
+def _cut_timeline(proj, clip, ranges, name):
+    """New current timeline made of the clip's frame ranges ([start, end) in clip frames), in order."""
+    if not ranges:
+        raise ToolError("nothing left to keep")
+    pool = proj.GetMediaPool()
+    tl = pool.CreateEmptyTimeline(name)
+    if not tl:
+        raise ToolError(f"cannot create timeline {name!r} (the name may be taken; pass timeline=)")
+    proj.SetCurrentTimeline(tl)
+    # endFrame is exclusive (measured on 21.1), matching the [start, end) ranges.
+    infos = [{"mediaPoolItem": clip, "startFrame": a, "endFrame": b} for a, b in ranges]
+    if not pool.AppendToTimeline(infos):
+        raise ToolError(f"timeline {name!r} was created but appending the kept parts failed")
+    return tl
+
+
+def _to_frames(ranges_s, fps, total):
+    out = []
+    for a, b in ranges_s:
+        fa, fb = max(0, int(math.floor(a * fps))), min(total, int(math.ceil(b * fps)))
+        if out and fa <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], fb))
+        elif fb > fa:
+            out.append((fa, fb))
+    return out
+
+
+def _cut_report(name, ranges, fps, total):
+    kept = sum(b - a for a, b in ranges)
+    return {"timeline": name, "parts": len(ranges), "kept_seconds": round(kept / fps, 2),
+            "removed_seconds": round((total - kept) / fps, 2),
+            "kept": [[round(a / fps, 2), round(b / fps, 2)] for a, b in ranges[:200]]}
+
+
+@_tool
+def remove_silences(clip: str, threshold_db: float = -40.0, min_silence: float = 0.5, padding: float = 0.1,
+                    timeline: str | None = None) -> dict:
+    """Jump-cut a talking clip: find the pauses in its audio (quieter than threshold_db for at least min_silence
+    seconds) and build a new timeline from the parts between them, leaving `padding` seconds of each pause so
+    words are not clipped. Raise threshold_db (e.g. -35) for noisy rooms. The clip and existing timelines are
+    untouched. WAV is read directly, other formats through ffmpeg when installed; the analysis runs here."""
+    if not -90 <= threshold_db <= -10:
+        raise ToolError("threshold_db must be between -90 and -10")
+    if min_silence < 0.1:
+        raise ToolError("min_silence must be at least 0.1 seconds")
+    if not 0 <= padding < min_silence / 2:
+        raise ToolError("padding must be 0 or more and under half of min_silence")
+    _, proj = _project()
+    (c,) = _pool_clips(proj, [clip])
+    wav, tmp = _audio_wav(_clip_file(proj, clip))
+    try:
+        env, duration = _wav_envelope(wav)
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    hop = duration / len(env) if env else 0.01
+    fps = _clip_fps(proj, c)
+    total = int(float(c.GetClipProperty("Frames") or 0)) or int(round(duration * fps))
+    pauses = _pauses(env, hop, duration, threshold_db, min_silence)
+    if not pauses:
+        raise ToolError(f"no pause of {min_silence}s under {threshold_db} dB found; nothing to cut")
+    ranges = _to_frames(_keep_between(pauses, duration, padding), fps, total)
+    name = timeline or f"{c.GetName()} - no silences"
+    _cut_timeline(proj, c, ranges, name)
+    return {**_cut_report(name, ranges, fps, total), "pauses_found": len(pauses)}
+
+
+def _token(text):
+    return (text or "").strip().strip(".,!?;:،؛؟…\"'()[]").lower()
+
+
+@_tool
+def cut_by_transcript(clip: str, remove_fillers: bool = True, fillers: list[str] | None = None,
+                      remove_phrases: list[str] | None = None, keep_only: list[str] | None = None,
+                      max_gap: float = 0.75, padding: float = 0.08, timeline: str | None = None) -> dict:
+    """Text-based editing from Resolve's transcript (run transcribe_audio first; Resolve 21.1+). Builds a new
+    timeline of the clip without filler words (um, uh, امم... or your own `fillers`), without the segments that
+    contain any of remove_phrases (retakes, off-topic lines), and, with keep_only, with only the segments that
+    contain one of those phrases. Pauses longer than max_gap seconds between kept words are cut too; padding
+    seconds are kept around words where the neighbours allow. The clip and existing timelines are untouched."""
+    if max_gap < 0 or padding < 0:
+        raise ToolError("max_gap and padding must be 0 or more")
+    _, proj = _project()
+    (c,) = _pool_clips(proj, [clip])
+    t, _ = _transcript(c)
+    if not t["segments"]:
+        raise ToolError("cutting by transcript needs Resolve 21.1 (earlier versions only expose a preview)")
+    fps, origin = _clip_timing(c)
+    sec = lambda tc: (_tc_frames(tc, fps) - origin) / fps  # noqa: E731
+    filler_set = {_token(f) for f in (fillers if fillers is not None else FILLER_WORDS)} if remove_fillers else set()
+    tokens, dropped = [], {"fillers": 0, "segments": 0}  # tokens: (start, end, keep) in time order
+    for seg in t["segments"]:
+        text = (seg.get("text") or "").strip()
+        if not text or text == "(...)":
+            continue  # a silence segment: its time is cut by max_gap
+        low = text.lower()
+        if (keep_only and not any(k.lower() in low for k in keep_only)) or \
+                (remove_phrases and any(ph.lower() in low for ph in remove_phrases)):
+            dropped["segments"] += 1
+            tokens.append((sec(seg["start"]), sec(seg["end"]), False))
+            continue
+        words = seg.get("words") or []
+        if not words:
+            tokens.append((sec(seg["start"]), sec(seg["end"]), True))
+            continue
+        for w in words:
+            filler = _token(w.get("text")) in filler_set
+            dropped["fillers"] += filler
+            tokens.append((sec(w["start"]), sec(w["end"]), not filler))
+    tokens.sort()
+    ranges, cur = [], None
+    for i, (a, b, keep) in enumerate(tokens):
+        if not keep:
+            if cur:
+                ranges.append(cur)
+            cur = None
+            continue
+        prev_end = tokens[i - 1][1] if i else 0.0
+        nxt = tokens[i + 1][0] if i + 1 < len(tokens) else None
+        lo = a - min(padding, max(0.0, (a - prev_end) / 2) if i else padding)
+        hi = b + (min(padding, max(0.0, (nxt - b) / 2)) if nxt is not None else padding)
+        if cur and a - cur[2] <= max_gap:
+            cur = (cur[0], hi, b)
+        else:
+            if cur:
+                ranges.append(cur)
+            cur = (max(0.0, lo), hi, b)
+    if cur:
+        ranges.append(cur)
+    total = int(float(c.GetClipProperty("Frames") or 0)) or int(math.ceil(max((b for _, b, _ in tokens), default=0) * fps))
+    frames = _to_frames([(a, b) for a, b, _ in ranges], fps, total)
+    name = timeline or f"{c.GetName()} - edited"
+    _cut_timeline(proj, c, frames, name)
+    return {**_cut_report(name, frames, fps, total), "removed": dropped}
 
 if __name__ == "__main__":
     _setup_logging()

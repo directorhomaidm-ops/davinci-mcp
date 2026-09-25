@@ -411,6 +411,24 @@ set_fusion_input(item=1, node="Blur1", input="XBlurSize", value=8)
 set_fusion_input(item=1, node="Push", input="Size", keyframes={"0": 1.0, "120": 1.15})
 ```
 
+### AI editing
+
+Resolve's AI features already covered elsewhere: `magic_mask`, `smart_reframe`, `stabilize`, `detect_scene_cuts`, `voice_isolation`, `transcribe_audio`, `create_subtitles`, `classify_audio`, `generate_voiceover`, `smart_switch`, `analyze_dolby_vision`.
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `super_scale` | `clips: list[str]`, `scale: "auto" \| "none" \| "2x" \| "3x" \| "4x" = "2x"`, `sharpness`, `noise_reduction` (0-1, both: 2x Enhanced) | `[{clip, super_scale, enhanced}]` as Resolve reads it back | Refused (Studio only); bad scale |
+| `ai_slow_motion` | `item: int`, `percent: float = 50` (under 100), `engine = "speed_warp"`, `ripple = False`, `track = 1` | `set_speed` result + retiming | Resolve older than 21.1; engine refused |
+| `remove_silences` | `clip: str`, `threshold_db = -40`, `min_silence = 0.5`, `padding = 0.1`, `timeline: str \| None` | `{timeline, parts, kept_seconds, removed_seconds, kept, pauses_found}` | No pause found; not WAV and no ffmpeg |
+| `cut_by_transcript` | `clip: str`, `remove_fillers = True`, `fillers`, `remove_phrases`, `keep_only`, `max_gap = 0.75`, `padding = 0.08`, `timeline` | `{timeline, parts, kept_seconds, removed_seconds, kept, removed: {fillers, segments}}` | No transcript; Resolve older than 21.1; nothing left |
+
+Notes:
+
+- `remove_silences` and `cut_by_transcript` never change the source: they build a new timeline (default names `<clip> - no silences` and `<clip> - edited`) from the kept ranges of the clip and make it current.
+- `remove_silences` analyzes the audio here. WAV files are read directly; other formats need `ffmpeg` on the PATH. Raise `threshold_db` (e.g. `-35`) in noisy rooms.
+- `cut_by_transcript` uses Resolve's word timing (run `transcribe_audio` first). The default fillers are English (um, uh, erm, hmm...) and Arabic (امم, اه...); pass `fillers` for others. A removed filler always cuts, even inside a short pause.
+- `ai_slow_motion` sets `RetimeProcess` to optical flow and `MotionEstimation` to the engine. Speed Warp is Studio only.
+
 ## Configuration
 
 | Variable | Default | Purpose |
