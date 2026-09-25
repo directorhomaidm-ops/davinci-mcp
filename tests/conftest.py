@@ -41,6 +41,8 @@ class Clip:
     def __init__(self, name, frames=100, path=None):
         self.name, self.frames = name, frames
         self.props, self.transcribed_with = {}, None
+        Clip.uids = getattr(Clip, "uids", 0) + 1
+        self.uid = f"clip-{Clip.uids}"
         self.path = path or f"/media/{name}"
         self.metadata, self.color, self.flags, self.markers, self.proxy = {}, "", [], {}, None
 
@@ -108,8 +110,19 @@ class Clip:
         self.props[key] = value
         return True
 
+    def GetUniqueId(self):
+        return self.uid  # stable per clip, kept by copies (the bridge's new wrappers)
+
+    def kind(self):
+        """Resolve's Type column (assumed spellings: Video + Audio, Audio, Still, Timeline)."""
+        ext = Path(self.path or self.name).suffix.lower()
+        if getattr(self, "type", None):
+            return self.type
+        return "Audio" if ext == ".wav" else "Still" if ext in (".png", ".jpg") and self.frames <= 1 else "Video + Audio"
+
     def GetClipProperty(self, key=None):
         allp = {"Frames": str(self.frames), "File Path": self.path, "FPS": "24", "Resolution": "1920x1080",
+                "Type": self.kind(),
                 "Start TC": "01:00:00:00",
                 "Proxy Media Path": self.proxy or "", "Reel Name": "", **self.props}
         return allp if key is None else allp.get(key)
@@ -1056,6 +1069,13 @@ class MediaPool:
             for f in self._folders():
                 if c in f.clips:
                     f.clips.remove(c)
+        return True
+
+    def DeleteFolders(self, folders):
+        for target in folders:
+            for f in list(self._folders()):
+                if target in f.subfolders:
+                    f.subfolders.remove(target)
         return True
 
     def RelinkClips(self, clips, folder):

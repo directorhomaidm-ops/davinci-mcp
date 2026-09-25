@@ -366,6 +366,16 @@ def run_checks(args, work, is_211):
          note="display_exponent shows the curve color management adds; error under 0.03 is a pass")
     step("color auto: shot_match item 2 to item 1", lambda: _shot_match(), needs=need_ramps)
 
+    print("\nMedia organization")
+    step("organize: Type strings Resolve reports", lambda: _types(), note="the type grouping reads these")
+    step("organize: auto_organize by type (dry run, whole pool)", lambda: d.auto_organize(dry_run=True))
+    step("organize: auto_organize Live Check by type into Live Check/Sorted", lambda: d.auto_organize(
+        bin="Live Check", into="Live Check/Sorted"))
+    step("organize: find_unused / find_duplicates / find_offline", lambda: {
+        "unused": len(d.find_unused()["unused"]), "duplicates": d.find_duplicates(),
+        "offline": d.find_offline()["offline"]})
+    step("organize: clean_bins", lambda: d.clean_bins())
+
     print("\nAnimated titles and templates")
     d.TEMPLATES_DIR = str(work / "templates")  # keep the check's templates out of your own folder
     step("titles: animated_title pop + slide_left exit at the end of 'Check'", lambda: _anim_title(),
@@ -479,6 +489,11 @@ def _shot_match():
     row = out["matched"][0]
     expect(row["error"] < 0.03, f"did not converge: {row}")
     return out
+
+
+def _types():
+    pool = d._project()[1].GetMediaPool()
+    return {c.GetName(): c.GetClipProperty("Type") for _, c in d._walk(pool.GetRootFolder())}
 
 
 def _end(name):

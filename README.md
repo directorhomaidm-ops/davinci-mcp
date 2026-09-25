@@ -411,6 +411,24 @@ set_fusion_input(item=1, node="Blur1", input="XBlurSize", value=8)
 set_fusion_input(item=1, node="Push", input="Size", keyframes={"0": 1.0, "120": 1.15})
 ```
 
+### Automatic media organization
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `auto_organize` | `by: str \| list[str] = "type"` (type, date, camera, resolution, fps, extension, folder, category), `bin`, `into = "/"`, `dry_run = False`, `color = False` | `{by, clips, already_in_place, plan: {bin: [clips]}, moved, colored?}` | Unknown key; MoveClips refused |
+| `color_code` | `bin`, `colors: dict` (type -> clip color) | `{colored, colors}` | Unknown color |
+| `find_unused` | `bin`, `move_to: str \| None` | `{unused: [{name, bin, type}], moved_to?}` | — |
+| `find_duplicates` | `bin`, `remove = False` | `{same_file, same_name_and_size, removed?}` | DeleteClips refused |
+| `find_offline` | `search: str \| None` (folder), `bin`, `max_files = 200000` | `{offline, relinked?, still_offline?, files_searched?}` | Search folder missing |
+| `clean_bins` | `bin = "/"` | `{deleted: [bins]}` | — |
+
+Notes:
+
+- `by=["type", "date"]` nests bins (`Video/2026-09-24`). `date` is the media file's date on disk, `folder` its folder on disk, `category` the audio classification (`classify_audio`). Clips already in the right bin stay; run with `dry_run=True` to see the plan first.
+- Clips are handled by identity (`GetUniqueId`), not by name, so same-named clips from different cards are kept apart.
+- `find_unused` scans every track of every timeline (not inside compound or multicam clips) and never lists timelines. `find_duplicates(remove=True)` only removes extra media-pool entries of the same file, never one used on a timeline; files on disk are never touched.
+- `find_offline(search=...)` finds missing files by name under a folder and relinks them with Resolve's RelinkClips.
+
 ### Automatic color correction
 
 | Tool | Parameters | Returns | Errors |

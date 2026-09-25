@@ -5145,6 +5145,301 @@ def shot_match(reference: int, targets: list[int], node: int = 1, iterations: in
                               "neutral": want["neutral"]}, "matched": rows}
     return _with_playhead(tl, run)
 
+
+# --- Automatic media organization ---
+#
+# Clips are handled as objects, not by name: pools often hold several clips with the same name (the same file
+# imported twice, "A001.mov" from two cards), which name lookups would merge. Identity across API calls is
+# GetUniqueId, since every call hands back a new wrapper.
+
+AUDIO_EXTS = {".wav", ".wave", ".mp3", ".aif", ".aiff", ".m4a", ".flac", ".aac", ".ogg", ".opus"}
+STILL_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".dpx", ".psd", ".heic", ".bmp", ".gif", ".webp"}
+ORGANIZE_KEYS = ("type", "date", "camera", "resolution", "fps", "extension", "folder", "category")
+KIND_COLORS = {"Video": "Blue", "Audio": "Green", "Stills": "Yellow", "Timelines": "Purple", "Compound clips": "Orange",
+               "Multicam": "Pink", "Fusion": "Violet", "Subtitles": "Tan", "Other": "Beige"}
+
+
+def _uid(obj):
+    return _opt(obj, "GetUniqueId") or id(obj)
+
+
+def _file(c):
+    path = c.GetClipProperty("File Path") or ""
+    return path if path else None
+
+
+def _media_kind(c):
+    t = str(c.GetClipProperty("Type") or "").lower()
+    for word, kind in (("timeline", "Timelines"), ("compound", "Compound clips"), ("multicam", "Multicam"),
+                       ("fusion", "Fusion"), ("subtitle", "Subtitles"), ("still", "Stills")):
+        if word in t:
+            return kind
+    if "video" in t:
+        return "Video"
+    if "audio" in t:
+        return "Audio"
+    path = _file(c) or c.GetName()
+    ext = os.path.splitext(path)[1].lower()
+    frames = str(c.GetClipProperty("Frames") or "")
+    if ext in AUDIO_EXTS:
+        return "Audio"
+    if ext in STILL_EXTS:
+        return "Video" if frames.isdigit() and int(frames) > 1 else "Stills"  # an image sequence is footage
+    return "Video" if _file(c) else "Other"
+
+
+def _file_date(c):
+    path = _file(c)
+    if not path or not os.path.exists(path):
+        return "No date"
+    st = os.stat(path)
+    t = min(v for v in (getattr(st, "st_birthtime", None), st.st_mtime) if v)
+    return datetime.fromtimestamp(t).strftime("%Y-%m-%d")
+
+
+def _bin_name(v):
+    v = str(v).strip().replace("/", "-").replace("\\", "-")
+    return v or "Unknown"
+
+
+def _organize_key(c, key):
+    if key == "type":
+        return _media_kind(c)
+    if key == "date":
+        return _file_date(c)
+    if key == "camera":
+        cam = " ".join(x for x in (c.GetMetadata("Camera Manufacturer") or "", c.GetMetadata("Camera Type") or "",
+                                   c.GetClipProperty("Camera #") or "") if x).strip()
+        return cam or "Unknown camera"
+    if key == "resolution":
+        return c.GetClipProperty("Resolution") or ("Audio" if _media_kind(c) == "Audio" else "Unknown resolution")
+    if key == "fps":
+        try:
+            fps = float(c.GetClipProperty("FPS") or 0)
+        except ValueError:
+            fps = 0
+        return f"{fps:g} fps" if fps else ("Audio" if _media_kind(c) == "Audio" else "Unknown fps")
+    if key == "extension":
+        ext = os.path.splitext(_file(c) or c.GetName())[1].lstrip(".").upper()
+        return ext or "No extension"
+    if key == "folder":
+        path = _file(c)
+        return os.path.basename(os.path.dirname(path)) if path else "No file"
+    return _audio_class(c)["category"] or "Unclassified"  # category
+
+
+def _folder_path(proj):
+    """uid of every clip -> its bin path ("/" for the root, else "A/B")."""
+    return {_uid(c): (prefix.rstrip("/") or "/") for prefix, c in _walk(proj.GetMediaPool().GetRootFolder())}
+
+
+def _ensure_bin(proj, path):
+    pool = proj.GetMediaPool()
+    folder = pool.GetRootFolder()
+    for part in [p for p in path.strip("/").split("/") if p]:
+        nxt = next((f for f in folder.GetSubFolderList() or [] if f.GetName() == part), None)
+        if nxt is None:
+            nxt = pool.AddSubFolder(folder, part)
+            if not nxt:
+                raise ToolError(f"could not create bin {part} in {folder.GetName()}")
+        folder = nxt
+    return folder
+
+
+def _source_clips(proj, bin):
+    folder = _bin(proj, bin) if bin else proj.GetMediaPool().GetRootFolder()
+    return [c for _, c in _walk(folder)]
+
+
+@_tool
+def auto_organize(by: list[str] | str = "type", bin: str | None = None, into: str = "/", dry_run: bool = False,
+                  color: bool = False) -> dict:
+    """Sort media-pool clips into bins automatically. by: one key or a list for nested bins, from type (Video,
+    Audio, Stills, Timelines, Compound clips, Multicam...), date (the file's date), camera (metadata), resolution,
+    fps, extension, folder (the file's folder on disk) and category (audio classification, see classify_audio).
+    E.g. by=["type", "date"] makes Video/2026-09-24. bin limits it to one bin (and its sub-bins); into is where the
+    new bins go ("/" or e.g. "Organized"). dry_run=True only returns the plan. color=True also colors clips by type.
+    Clips already in the right bin stay; files on disk are never touched."""
+    keys = [by] if isinstance(by, str) else list(by)
+    bad = [k for k in keys if k not in ORGANIZE_KEYS]
+    if not keys or bad:
+        raise ToolError(f"by must be from: {', '.join(ORGANIZE_KEYS)} (got {bad or keys})")
+    _, proj = _project()
+    clips = _source_clips(proj, bin)
+    where = _folder_path(proj)
+    root = into.strip("/")
+    plan, stay = {}, 0
+    for c in clips:
+        parts = ([root] if root else []) + [_bin_name(_organize_key(c, k)) for k in keys]
+        target = "/".join(parts)
+        if where.get(_uid(c)) == target:
+            stay += 1
+            continue
+        plan.setdefault(target, []).append(c)
+    out = {"by": keys, "clips": len(clips), "already_in_place": stay,
+           "plan": {f"/{t}": sorted(c.GetName() for c in cs) for t, cs in sorted(plan.items())}, "dry_run": dry_run}
+    if dry_run:
+        return out
+    pool = proj.GetMediaPool()
+    for target, cs in sorted(plan.items()):
+        if not pool.MoveClips(cs, _ensure_bin(proj, target)):
+            raise ToolError(f"MoveClips failed for /{target} (earlier bins were already filled)")
+    if color:
+        out["colored"] = color_code(bin=bin)["colored"]
+    out["moved"] = sum(len(cs) for cs in plan.values())
+    return out
+
+
+@_tool
+def color_code(bin: str | None = None, colors: dict | None = None) -> dict:
+    """Color media-pool clips by type (default Video Blue, Audio Green, Stills Yellow, Timelines Purple, Compound
+    clips Orange, Multicam Pink, Fusion Violet, Subtitles Tan, Other Beige). colors overrides the mapping, e.g.
+    {"Audio": "Teal"}. bin limits it to one bin and its sub-bins."""
+    mapping = {**KIND_COLORS, **(colors or {})}
+    bad = {k: v for k, v in mapping.items() if v not in CLIP_COLORS}
+    if bad:
+        raise ToolError(f"unknown clip colors {bad} (one of {', '.join(CLIP_COLORS)})")
+    _, proj = _project()
+    counts, failed = {}, []
+    for c in _source_clips(proj, bin):
+        kind = _media_kind(c)
+        if not c.SetClipColor(mapping[kind]):
+            failed.append(c.GetName())
+            continue
+        counts[kind] = counts.get(kind, 0) + 1
+    if failed:
+        raise ToolError(f"SetClipColor failed on {', '.join(failed[:10])}")
+    return {"colored": counts, "colors": {k: mapping[k] for k in counts}}
+
+
+def _used_ids(proj):
+    """uids of media-pool items used on any timeline (every track type), plus the timelines themselves."""
+    used = set()
+    for i in range(1, int(proj.GetTimelineCount() or 0) + 1):
+        tl = proj.GetTimelineByIndex(i)
+        for kind in ("video", "audio", "subtitle"):
+            for n in range(1, int(tl.GetTrackCount(kind) or 0) + 1):
+                for it in tl.GetItemListInTrack(kind, n) or []:
+                    mp = _opt(it, "GetMediaPoolItem")
+                    if mp:
+                        used.add(_uid(mp))
+    return used
+
+
+@_tool
+def find_unused(bin: str | None = None, move_to: str | None = None) -> dict:
+    """Media-pool clips not used on any timeline of the project (all video, audio and subtitle tracks are scanned;
+    uses inside compound or multicam clips are not). Timeline clips are never listed. move_to moves them into that
+    bin (created if needed), e.g. "Unused"."""
+    _, proj = _project()
+    used = _used_ids(proj)
+    where = _folder_path(proj)
+    unused = [c for c in _source_clips(proj, bin) if _uid(c) not in used and _media_kind(c) != "Timelines"]
+    out = {"unused": [{"name": c.GetName(), "bin": where.get(_uid(c)), "type": _media_kind(c)} for c in unused]}
+    if move_to and unused:
+        if not proj.GetMediaPool().MoveClips(unused, _ensure_bin(proj, move_to)):
+            raise ToolError("MoveClips failed")
+        out["moved_to"] = "/" + move_to.strip("/")
+    return out
+
+
+@_tool
+def find_duplicates(bin: str | None = None, remove: bool = False) -> dict:
+    """Clips imported more than once: `same_file` groups point at the same file; `same_name_and_size` groups are
+    different paths with the same file name and size (likely copies, e.g. from backups). remove=True deletes the
+    extra media-pool entries of same_file groups, keeping one per file (the one used on a timeline when there is
+    one); entries used on timelines are never deleted. Files on disk are never touched."""
+    _, proj = _project()
+    where = _folder_path(proj)
+    by_path, by_name_size = {}, {}
+    for c in _source_clips(proj, bin):
+        path = _file(c)
+        if not path or _media_kind(c) == "Timelines":
+            continue
+        by_path.setdefault(os.path.normcase(os.path.abspath(path)), []).append(c)
+    for path, cs in by_path.items():
+        if os.path.exists(path):
+            by_name_size.setdefault((os.path.basename(path).lower(), os.path.getsize(path)), []).append(path)
+    row = lambda c: {"name": c.GetName(), "bin": where.get(_uid(c))}  # noqa: E731
+    same_file = {p: cs for p, cs in by_path.items() if len(cs) > 1}
+    out = {"same_file": [{"file": p, "clips": [row(c) for c in cs]} for p, cs in sorted(same_file.items())],
+           "same_name_and_size": [{"files": sorted(ps)} for ps in by_name_size.values() if len(ps) > 1]}
+    if remove and same_file:
+        used = _used_ids(proj)
+        extra = []
+        for cs in same_file.values():
+            keep = next((c for c in cs if _uid(c) in used), cs[0])
+            extra += [c for c in cs if c is not keep and _uid(c) not in used]
+        if extra and not proj.GetMediaPool().DeleteClips(extra):
+            raise ToolError("DeleteClips failed")
+        out["removed"] = [row(c) for c in extra]
+    return out
+
+
+@_tool
+def find_offline(search: str | None = None, bin: str | None = None, max_files: int = 200000) -> dict:
+    """Clips whose media file is missing (moved drive, renamed folder). With search (a folder), look for each
+    missing file by name under it (recursively, up to max_files files) and relink the ones found with Resolve's
+    RelinkClips; the result says which were relinked and which are still offline."""
+    _, proj = _project()
+    offline = [c for c in _source_clips(proj, bin)
+               if _file(c) and _media_kind(c) not in ("Timelines", "Compound clips", "Multicam")
+               and not os.path.exists(_file(c)) and "%" not in _file(c) and "[" not in os.path.basename(_file(c))]
+    out = {"offline": [{"name": c.GetName(), "file": _file(c)} for c in offline]}
+    if not search or not offline:
+        return out
+    root = os.path.abspath(search)
+    if not os.path.isdir(root):
+        raise ToolError(f"folder not found: {root}")
+    wanted = {os.path.basename(_file(c)).lower(): [] for c in offline}
+    for c in offline:
+        wanted[os.path.basename(_file(c)).lower()].append(c)
+    found, seen = {}, 0
+    for dirpath, _, files in os.walk(root):
+        for fn in files:
+            seen += 1
+            if fn.lower() in wanted and fn.lower() not in found:
+                found[fn.lower()] = dirpath
+        if seen >= max_files or len(found) == len(wanted):
+            break
+    by_dir = {}
+    for name, d in found.items():
+        by_dir.setdefault(d, []).extend(wanted[name])
+    pool = proj.GetMediaPool()
+    for d, cs in by_dir.items():
+        pool.RelinkClips(cs, d)
+    relinked = [c for cs in by_dir.values() for c in cs if _file(c) and os.path.exists(_file(c))]
+    out.update(relinked=[{"name": c.GetName(), "file": _file(c)} for c in relinked],
+               still_offline=[c.GetName() for c in offline if c not in relinked], files_searched=seen)
+    return out
+
+
+@_tool
+def clean_bins(bin: str = "/") -> dict:
+    """Delete empty bins under `bin` (a bin whose sub-bins are all empty counts as empty). The bin itself and the
+    root are kept."""
+    _, proj = _project()
+    start = _bin(proj, bin)
+    empty = []
+
+    def visit(folder, path):
+        subs = folder.GetSubFolderList() or []
+        all_empty = True
+        for f in subs:
+            if not visit(f, f"{path}/{f.GetName()}"):
+                all_empty = False
+        mine = not (folder.GetClipList() or []) and all_empty
+        if mine and folder is not start:
+            empty.append((path, folder))
+        return mine
+
+    visit(start, "" if bin.strip("/") == "" else "/" + bin.strip("/"))
+    # only the top-most empty bins: deleting a bin deletes what is inside
+    tops = [(p, f) for p, f in empty if not any(p.startswith(q + "/") for q, _ in empty)]
+    if tops and not proj.GetMediaPool().DeleteFolders([f for _, f in tops]):
+        raise ToolError("DeleteFolders failed")
+    return {"deleted": sorted(p for p, _ in tops)}
+
 if __name__ == "__main__":
     _setup_logging()
     log.info("starting", extra={"fields": {"platform": sys.platform, "pid": os.getpid()}})
