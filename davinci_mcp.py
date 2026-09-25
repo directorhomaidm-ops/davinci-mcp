@@ -389,7 +389,8 @@ def append_clips(
     names: list[str], start_frame: int | None = None, end_frame: int | None = None, track: int = 1
 ) -> str:
     """Append media-pool clips (by name, in order) to the end of the current timeline.
-    start_frame/end_frame (clip-relative, both inclusive) make a subclip of each clip."""
+    start_frame/end_frame (counted from the clip's first frame, both inclusive) make a subclip of each clip.
+    On a track other than 1 only the video is placed."""
     proj, tl = _timeline()
     pool = proj.GetMediaPool()
     by_name = _clips_by_name(proj)
@@ -404,20 +405,19 @@ def append_clips(
     if start_frame is None and end_frame is None:
         ok = pool.AppendToTimeline(clips)
     else:
-        # endFrame is exclusive: live Resolve 21.1 made 23-frame items from startFrame 0, endFrame 23.
-        infos = [
-            {
-                "mediaPoolItem": c,
-                "startFrame": start_frame or 0,
-                "endFrame": end_frame + 1 if end_frame is not None else int(float(c.GetClipProperty("Frames") or 0)),
-            }
-            for c in clips
-        ]
-        # Only pass trackIndex when asked: appends carrying it were measured to read back fine but render almost
-        # nothing on live Resolve 21.0.4, while Blackmagic's own example (no trackIndex) renders normally.
+        # Resolve counts startFrame/endFrame in the clip's own frame numbers (image sequences start at 1, so
+        # startFrame 0 adds a blank frame) and endFrame is exclusive (live 21.1).
+        def info(c):
+            first = int(float(c.GetClipProperty("Start") or 0))
+            last = end_frame if end_frame is not None else int(float(c.GetClipProperty("Frames") or 0)) - 1
+            return {"mediaPoolItem": c, "startFrame": first + (start_frame or 0), "endFrame": first + last + 1}
+
+        infos = [info(c) for c in clips]
+        # Only pass trackIndex when asked, and then with mediaType 1 (video only): a trackIndex append without it
+        # reads back fine but renders black (live 21.0.4 and 21.1), while Blackmagic's example (neither) renders.
         if track != 1:
-            for info in infos:
-                info["trackIndex"] = track
+            for entry in infos:
+                entry.update(trackIndex=track, mediaType=1)
         ok = pool.AppendToTimeline(infos)
     if not ok:
         raise ToolError("append failed")
@@ -2474,7 +2474,8 @@ def delete_project(name: str) -> str:
         raise ToolError(f"project not found in the current folder: {name} (see project_browser)")
     # The first attempt is flaky on live Resolve; one retry.
     if not (pm.DeleteProject(name) or pm.DeleteProject(name)):
-        raise ToolError(f"Resolve refused to delete {name} (it may still be held from being open earlier)")
+        raise ToolError(f"Resolve refused to delete {name}: it will not delete a project opened since it was launched; "
+                        "restart Resolve and delete it then")
     return f"deleted project {name}"
 
 
@@ -3739,11 +3740,38 @@ PIP_CORNERS = {"top_right": (1, 1), "top_left": (-1, 1), "bottom_right": (1, -1)
                "center": (0, 0)}
 
 
+def _placed_size(it, w, h, mode="scaleToFit"):
+    """Size in timeline pixels at which Resolve places an item's source for an input-mismatch `mode`, before Zoom.
+    Measured on live 21.1: Zoom scales the size the item's own Scaling gives, Pan/Tilt move the picture (that width /
+    timeline width) and (that height / timeline height) pixels per unit, and Crop counts pixels of the picture as the
+    timeline's own mode places it (see _timeline_mode)."""
+    try:
+        sw, sh = (int(v) for v in str(it.GetMediaPoolItem().GetClipProperty("Resolution")).split("x"))
+    except (AttributeError, TypeError, ValueError):
+        return w, h  # ponytail: no readable source size (titles, generators); treat it as frame-sized
+    if mode == "stretch":
+        return w, h
+    if mode == "centerCrop":
+        return sw, sh
+    fit = (max if mode == "scaleToCrop" else min)(w / sw, h / sh)
+    return sw * fit, sh * fit
+
+
+def _timeline_mode(proj, tl, w, h):
+    """The input-mismatch mode Resolve actually uses on a timeline. Live 21.1: a timeline on project settings in a
+    vertical project fills (scaleToCrop) whatever timelineInputResMismatchBehavior says; landscape projects and
+    timelines with their own settings follow the setting."""
+    if str(tl.GetSetting("useCustomSettings")) != "1" and h > w:
+        return "scaleToCrop"  # ponytail: measured on 21.1 only; re-measure if Resolve fixes the vertical case
+    return tl.GetSetting("timelineInputResMismatchBehavior") or proj.GetSetting("timelineInputResMismatchBehavior")
+
+
 @_tool
 def picture_in_picture(item: int, scale: float = 0.35, corner: str = "top_right", margin: float = 0.04,
                        track: int = 2) -> dict:
-    """Shrink a clip on an upper track into a corner over the picture below: scale 0.05-1 of full frame, corner
-    top_right, top_left, bottom_right, bottom_left or center, margin as a fraction of the frame. Uses the clip's
+    """Shrink a clip on an upper track into a corner over the picture below: the whole clip fits in `scale` (0.05-1)
+    of the frame, corner top_right, top_left, bottom_right, bottom_left or center, margin as a fraction of the frame.
+    Works when the clip's shape differs from the timeline's (e.g. 16:9 in a vertical timeline). Uses the clip's
     Edit-page Zoom and Position, so it can be adjusted in the Inspector afterwards."""
     if not 0.05 <= scale <= 1:
         raise ToolError("scale must be 0.05-1")
@@ -3754,31 +3782,44 @@ def picture_in_picture(item: int, scale: float = 0.35, corner: str = "top_right"
         raise ToolError(f"corner must be one of: {', '.join(PIP_CORNERS)}")
     _, tl = _timeline()
     w, h = _resolution(tl)
-    pan = sx * (w * (1 - scale) / 2 - margin * w)
-    tilt = sy * (h * (1 - scale) / 2 - margin * h)
-    props = {"ZoomX": scale, "ZoomY": scale, "Pan": round(pan, 1), "Tilt": round(tilt, 1)}
+    # The clip's own Scaling is set to fit: a timeline on project settings can fill even when its mismatch setting
+    # reads scaleToFit (live 21.1), so the placed size is only known once the clip says fit.
+    pw, ph = _placed_size(_item(tl, item, track), w, h)
+    zoom = scale * min(w / pw, h / ph)  # the whole picture inside scale x the frame
+    x = sx * (w / 2 - pw * zoom / 2 - margin * w)  # screen pixels from the center, up positive
+    y = sy * (h / 2 - ph * zoom / 2 - margin * h)
+    props = {"Scaling": "fit", "ZoomX": round(zoom, 4), "ZoomY": round(zoom, 4), "Pan": round(x * w / pw, 1),
+             "Tilt": round(y * h / ph, 1)}
     return set_item_properties(item, props, track=track)
 
 
 @_tool
 def split_screen(left: int, right: int, left_track: int = 2, right_track: int = 1, gap: float = 0.0) -> dict:
-    """Show two clips side by side: `left` (on left_track) and `right` (on right_track), each cropped to half the
-    frame width and moved to its half, with an optional `gap` (fraction of the frame width) between them. Put the two
-    clips on different tracks at the same time. Uses Edit-page Crop and Position."""
+    """Show two clips side by side: `left` (on left_track) and `right` (on right_track), each filling its half of the
+    frame (zoomed to cover it and cropped around the picture's center), with an optional `gap` (fraction of the frame
+    width) between them. Works when a clip's shape differs from the timeline's. Put the two clips on different tracks
+    at the same time. Uses Edit-page Scaling, Zoom, Crop and Position."""
     if not 0 <= gap < 0.5:
         raise ToolError("gap must be 0-0.5")
-    _, tl = _timeline()
-    w, _ = _resolution(tl)
-    half = w / 2
-    crop = w / 4 + gap * w / 2  # a quarter of the picture off each side, plus half the gap on each clip
-    shift = round(w / 4, 1)
-    out = {
-        "left": set_item_properties(left, {"CropLeft": round(crop, 1), "CropRight": round(crop, 1), "Pan": -shift},
-                                    track=left_track),
-        "right": set_item_properties(right, {"CropLeft": round(crop, 1), "CropRight": round(crop, 1), "Pan": shift},
-                                     track=right_track),
-    }
-    return {"half_width": half, **out}
+    proj, tl = _timeline()
+    w, h = _resolution(tl)
+    cell = w * (1 - gap) / 2  # each clip's width on screen
+    mode = _timeline_mode(proj, tl, w, h)
+
+    def place(index, track, side):
+        it = _item(tl, index, track)
+        pw, ph = _placed_size(it, w, h)  # the clip is set to fit
+        tw, th = _placed_size(it, w, h, mode)  # what Crop counts in
+        zoom = max(cell / pw, h / ph)  # cover the cell
+        crop_x = max(0.0, (pw * zoom - cell) / 2 / zoom * tw / pw)
+        crop_y = max(0.0, (ph * zoom - h) / 2 / zoom * th / ph)
+        props = {"Scaling": "fit", "ZoomX": round(zoom, 4), "ZoomY": round(zoom, 4),
+                 "CropLeft": round(crop_x, 1), "CropRight": round(crop_x, 1),
+                 "CropTop": round(crop_y, 1), "CropBottom": round(crop_y, 1),
+                 "Pan": round(side * (w - cell) / 2 * w / pw, 1), "Tilt": 0.0}
+        return set_item_properties(index, props, track=track)
+
+    return {"half_width": round(cell, 1), "left": place(left, left_track, -1), "right": place(right, right_track, 1)}
 
 
 @_tool

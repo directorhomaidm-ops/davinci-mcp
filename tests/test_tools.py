@@ -108,13 +108,21 @@ def test_append_subclips(project):
 def test_append_subclips_other_track(project):
     d.append_clips(["a.mov"], start_frame=0, end_frame=9, track=2)
     (entry,) = project.pool.appended[-1]
-    assert entry["trackIndex"] == 2
+    assert (entry["trackIndex"], entry["mediaType"]) == (2, 1)  # without mediaType the item renders black
 
 
 def test_append_subclip_defaults_end_to_last_frame(project):
     d.append_clips(["b.mov"], start_frame=5)
     (entry,) = project.pool.appended[-1]
     assert (entry["startFrame"], entry["endFrame"]) == (5, 50)  # through the last frame (49) of a 50-frame clip
+
+
+def test_append_subclip_counts_from_the_clips_first_frame(project):
+    project.pool.root.clips[0].props["Start"] = "1"  # image sequences number their frames from 1
+    d.append_clips(["a.mov"], start_frame=0, end_frame=23)
+    (entry,) = project.pool.appended[-1]
+    assert (entry["startFrame"], entry["endFrame"]) == (1, 25)
+    assert d.list_items()[0]["duration"] == 24
 
 
 def test_append_unknown_clip(project):
@@ -2135,22 +2143,61 @@ def test_picture_in_picture(project):
     item.SetProperty = lambda k, v: item.props.__setitem__(k, v) or True
     d.picture_in_picture(1, scale=0.25, corner="bottom_left", margin=0.05)
     # x: 1920 * 0.75 / 2 - 96 = 624 to the left; y: 1080 * 0.75 / 2 - 54 = 351 down
-    assert item.props == {"ZoomX": 0.25, "ZoomY": 0.25, "Pan": -624.0, "Tilt": -351.0}
+    assert item.props == {"Scaling": 2, "ZoomX": 0.25, "ZoomY": 0.25, "Pan": -624.0, "Tilt": -351.0}
     with pytest.raises(ToolError, match="corner must be"):
         d.picture_in_picture(1, corner="middle")
 
 
-def test_split_screen(project):
+def test_picture_in_picture_16x9_clip_in_a_vertical_timeline(project):
+    # measured on live 21.1: a 640x360 clip fitted into 1080x1920 is placed 1080x607.5, and Tilt moves it
+    # 607.5/1920 px per unit, so the corner offset in Tilt units is the pixel offset divided by that
+    tl = project.current
+    tl.settings.update(timelineResolutionWidth="1080", timelineResolutionHeight="1920")
+    d.append_clips(["a.mov"], track=2, start_frame=0, end_frame=49)
+    item = tl.tracks[("video", 2)][0]
+    item.media.props["Resolution"] = "640x360"
+    item.SetProperty = lambda k, v: item.props.__setitem__(k, v) or True
+    d.picture_in_picture(1, scale=0.3, corner="bottom_right")
+    # 324 x 182 px; right edge 43 px in, bottom edge 77 px up: 792 px down = 2503 Tilt units
+    assert item.props == {"Scaling": 2, "ZoomX": 0.3, "ZoomY": 0.3, "Pan": 334.8, "Tilt": -2503.3}
+
+
+def _split_items(project):
     d.append_clips(["a.mov"], track=2, start_frame=0, end_frame=49)
     d.append_clips(["b.mov"], start_frame=0, end_frame=49)
     left = project.current.tracks[("video", 2)][0]
     right = project.current.tracks[("video", 1)][0]
     for it in (left, right):
         it.SetProperty = (lambda i: lambda k, v: i.props.__setitem__(k, v) or True)(it)
+    return left, right
+
+
+def test_split_screen(project):
+    left, right = _split_items(project)
     d.split_screen(1, 1, gap=0.02)
-    # each clip keeps the middle half minus half the gap: crop 480 + 19.2 px per side, moved a quarter frame
-    assert left.props == {"CropLeft": 499.2, "CropRight": 499.2, "Pan": -480.0}
-    assert right.props == {"CropLeft": 499.2, "CropRight": 499.2, "Pan": 480.0}
+    # each clip keeps the middle 940.8 px of its 1920 px picture, centered on its half; 38.4 px gap in the middle
+    same = {"Scaling": 2, "ZoomX": 1.0, "ZoomY": 1.0, "CropLeft": 489.6, "CropRight": 489.6, "CropTop": 0.0,
+            "CropBottom": 0.0, "Tilt": 0.0}
+    assert left.props == {**same, "Pan": -489.6}
+    assert right.props == {**same, "Pan": 489.6}
+
+
+def test_split_screen_16x9_clips_in_a_vertical_timeline(project):
+    # measured on live 21.1: fitted 1080x607.5, zoomed 3.16 to cover a 540x1920 half. A timeline on project settings
+    # in a vertical project fills, so Crop counts pixels of the filled 3413x1920 picture: 3.16x the fitted ones
+    project.current.settings.update(timelineResolutionWidth="1080", timelineResolutionHeight="1920")
+    left, right = _split_items(project)
+    for it in (left, right):
+        it.media.props["Resolution"] = "640x360"
+    d.split_screen(1, 1)
+    same = {"Scaling": 2, "ZoomX": 3.1605, "ZoomY": 3.1605, "CropLeft": 1436.7, "CropRight": 1436.7, "CropTop": 0.0,
+            "CropBottom": 0.0, "Tilt": 0.0}
+    assert left.props == {**same, "Pan": -270.0}
+    assert right.props == {**same, "Pan": 270.0}
+    # with its own settings the timeline follows its mode (fit here), and Crop counts fitted pixels
+    project.current.settings.update(useCustomSettings="1", timelineInputResMismatchBehavior="scaleToFit")
+    d.split_screen(1, 1)
+    assert (left.props["CropLeft"], right.props["CropRight"]) == (454.6, 454.6)
 
 
 def test_vignette(project):
