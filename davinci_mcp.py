@@ -1351,21 +1351,25 @@ def add_transition(
     options = {"type": type, "category": category, "position": position, "alignment": alignment}
     if duration is not None:
         options["duration"] = duration
-    cut = it.GetEnd() if position == "end" else it.GetStart()
     tr = _method(it, "AddTransition", "21.1")(options)
     if not tr:
         raise ToolError(
             f"no transition created — check the name matches an installed {category} transition and that "
             "both clips have handles (unused media) past the cut"
         )
-    # The returned object's timing is not the transition's (live 21.1: start 24, end 22), so read the track.
+    # Found by position, next to the clip: live 21.1 reports transition timing that does not bracket the cut
+    # (start 24, end 22), so a timing search misses it.
     items = tl.GetItemListInTrack(track_type, track) or []
-    placed = next((x for i, x in enumerate(items) if _is_transition(items, i) and x.GetStart() <= cut <= x.GetEnd()),
-                  None)
-    if placed is None:
-        return {"name": tr.GetName(), "note": "added, but not found on the track to report its timing"}
-    return {"name": placed.GetName(), "index": items.index(placed) + 1, "start": placed.GetStart(),
-            "end": placed.GetEnd(), "duration": placed.GetDuration()}
+    i = item if position == "end" else item - 1  # 0-based slot the transition takes
+    if not (0 <= i < len(items) and _is_transition(items, i)):
+        return {"name": tr.GetName(), "note": "added, but not found next to the clip"}
+    out = {"name": items[i].GetName(), "index": i + 1}
+    start, end = items[i].GetStart(), items[i].GetEnd()
+    if start < end:
+        out.update(start=start, end=end, duration=end - start)
+    else:
+        out["note"] = f"Resolve reports start {start}, end {end} for it; timing not usable"
+    return out
 
 
 @_tool
@@ -3934,14 +3938,17 @@ def apply_drx_to(path: str, group: str | None = None, stage: str = "pre", timeli
 def color_groups() -> list[dict]:
     """The project's color groups and, for each, its clips on the current timeline (video track and index)."""
     proj, tl = _timeline()
+    # Matched by GetUniqueId: each API call hands back a new wrapper, so id() never matches (live 21.1).
     where = {}
     for n in range(1, int(tl.GetTrackCount("video") or 0) + 1):
         for i, it in enumerate(tl.GetItemListInTrack("video", n) or [], 1):
-            where[id(it)] = (n, i)
+            where[_opt(it, "GetUniqueId") or id(it)] = (n, i)
     out = []
     for g in proj.GetColorGroupsList() or []:
-        clips = [{"track": where.get(id(c), (None, None))[0], "item": where.get(id(c), (None, None))[1],
-                  "name": c.GetName()} for c in g.GetClipsInTimeline(tl) or []]
+        clips = []
+        for c in g.GetClipsInTimeline(tl) or []:
+            track, index = where.get(_opt(c, "GetUniqueId") or id(c), (None, None))
+            clips.append({"track": track, "item": index, "name": c.GetName()})
         out.append({"group": g.GetName(), "clips": clips})
     return out
 

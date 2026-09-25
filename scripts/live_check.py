@@ -388,7 +388,7 @@ def _all_cuts():
     out = d.transition_all_cuts(duration=8)
     listed = d.list_transitions()
     removed = d.remove_transitions()
-    return {"added": out, "listed": len(listed), "removed": removed}
+    return {"added": out, "listed": listed, "removed": removed}  # listed rows show how 21.1 reports transition timing
 
 
 def _multicam(seq):

@@ -2366,3 +2366,18 @@ def test_set_speed_explains_titles(project):
     title.SetSpeed = lambda options: False
     with pytest.raises(ToolError, match="is a title, generator or transition"):
         d.set_speed(1, 50)
+
+
+def test_add_transition_found_by_position_when_timing_is_odd(project, monkeypatch):
+    a, b = _two_items(project)
+    real = a.AddTransition
+
+    def odd(options):
+        out = real(options)
+        tr = project.current.tracks[("video", 1)][1]
+        tr.start, tr.end = tr.end, tr.start  # live 21.1: timing that does not bracket the cut
+        return out
+
+    monkeypatch.setattr(a, "AddTransition", odd)
+    out = d.add_transition(1, duration=24)
+    assert (out["name"], out["index"]) == ("Cross Dissolve", 2) and "timing not usable" in out["note"]

@@ -208,7 +208,8 @@ class ColorGroup:
         return self.name
 
     def GetClipsInTimeline(self, timeline=None):
-        return list(self.members)
+        import copy
+        return [copy.copy(m) for m in self.members]  # like the bridge: new wrappers, same clip
 
     def GetPreClipNodeGraph(self):
         return self.pre
@@ -228,6 +229,11 @@ class Item:
         self.versions = {0: ["Version 1"], 1: []}
         self.version = {"versionName": "Version 1", "versionType": 0}
         self.copied_to, self.exported_lut = None, None
+        Item.uid = getattr(Item, "uid", 0) + 1
+        self.uid = f"item-{Item.uid}"
+
+    def GetUniqueId(self):
+        return self.uid
 
     def GetMediaPoolItem(self):
         return self.media
