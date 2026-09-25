@@ -144,6 +144,9 @@ class Folder:
         return getattr(self, "stale", False)
 
 
+import os
+
+
 class Graph:
     """Resolve 19+ node graph."""
 
@@ -160,18 +163,58 @@ class Graph:
         return self.luts.get(n, "")
 
     def SetLUT(self, n, path):
-        if not path.endswith(".cube"):
+        if not path.endswith(".cube") or os.path.isabs(path):
+            return False  # measured: only paths inside the master LUT folder resolve
+        if path.startswith("davinci-mcp/") and path.split("/", 1)[1] not in self.installed():
             return False
         self.luts[n] = path
         return True
 
+    def installed(self):
+        folder = os.environ.get("RESOLVE_LUT_DIR", "")
+        return os.listdir(os.path.join(folder, "davinci-mcp")) if folder and os.path.isdir(os.path.join(folder, "davinci-mcp")) else []
+
+    def GetToolsInNode(self, n):
+        return ["Primaries", "Curves"] if n == 1 else ["LUT"]
+
+    def GetNodeCacheMode(self, n):
+        return 0
+
+    def SetNodeEnabled(self, n, on):
+        self.disabled = getattr(self, "disabled", set())
+        (self.disabled.discard if on else self.disabled.add)(n)
+        return UI["page"] == "color"
+
+    def ResetAllGrades(self):
+        self.reset = UI["page"] == "color"
+        return self.reset
+
+    def ApplyGradeFromDRX(self, path, mode):
+        if UI["page"] != "color":
+            return False
+        self.drx = (path, mode)
+        return True
+
+    def ApplyArriCdlLut(self):
+        return UI["page"] == "color" and getattr(self, "arri", False)
+
 
 class ColorGroup:
     def __init__(self, name):
-        self.name = name
+        self.name, self.members = name, []
+        self.pre, self.post = Graph(("Group Pre",)), Graph(("Group Post",))
 
     def GetName(self):
         return self.name
+
+    def GetClipsInTimeline(self, timeline=None):
+        return list(self.members)
+
+    def GetPreClipNodeGraph(self):
+        return self.pre
+
+    def GetPostClipNodeGraph(self):
+        return self.post
 
 
 class Item:
@@ -279,11 +322,33 @@ class Item:
         return self.color_group
 
     def SetCDL(self, cdl):
+        if UI["page"] != "color":
+            return False  # grade writes are refused off the Color page
         self.cdl = cdl
         return True
 
     def CopyGrades(self, items):
+        if UI["page"] != "color":
+            return False
         self.copied_to = items
+        return True
+
+    def AssignToColorGroup(self, group):
+        if UI["page"] != "color":
+            return False
+        self.RemoveFromColorGroup()
+        group.members.append(self)
+        self.color_group = group
+        return True
+
+    def RemoveFromColorGroup(self):
+        if self.color_group:
+            self.color_group.members.remove(self)
+        self.color_group = None
+        return True
+
+    def SetColorOutputCache(self, on):
+        self.color_cache = on
         return True
 
     def GetCurrentVersion(self):
@@ -293,14 +358,14 @@ class Item:
         return self.versions[kind]
 
     def AddVersion(self, name, kind):
-        if name in self.versions[kind]:
+        if UI["page"] != "color" or name in self.versions[kind]:
             return False
         self.versions[kind].append(name)
         self.version = {"versionName": name, "versionType": kind}
         return True
 
     def LoadVersionByName(self, name, kind):
-        if name not in self.versions[kind]:
+        if UI["page"] != "color" or name not in self.versions[kind]:
             return False
         self.version = {"versionName": name, "versionType": kind}
         return True
@@ -531,8 +596,21 @@ class Still:
 
 
 class Album:
-    def __init__(self):
-        self.stills, self.exported = [], []
+    def __init__(self, name="Stills 1"):
+        self.name, self.stills, self.exported = name, [], []
+
+    def GetStills(self):
+        return self.stills
+
+    def GetLabel(self, still):
+        return getattr(still, "label", "")
+
+    def ImportStills(self, paths):
+        for pth in paths:
+            st = Still()
+            st.label = os.path.basename(pth)
+            self.stills.append(st)
+        return True
 
     def ExportStills(self, stills, folder, prefix, fmt):
         self.exported.append((stills, folder, prefix, fmt))
@@ -542,9 +620,24 @@ class Album:
 class Gallery:
     def __init__(self):
         self.album = Album()
+        self.powergrades = []
 
     def GetCurrentStillAlbum(self):
         return self.album
+
+    def GetAlbumName(self, album):
+        return album.name
+
+    def GetGalleryStillAlbums(self):
+        return [self.album]
+
+    def GetGalleryPowerGradeAlbums(self):
+        return self.powergrades
+
+    def CreateGalleryPowerGradeAlbum(self):
+        album = Album(f"PowerGrade {len(self.powergrades) + 1}")
+        self.powergrades.append(album)
+        return album
 
 
 class Timeline:
@@ -690,8 +783,14 @@ class Timeline:
         return Still() if self.page_is_color else None
 
     def ApplyGradeFromDRX(self, path, mode, items):
+        if UI["page"] != "color":
+            return False
         self.drx = (path, mode, items)
         return True
+
+    def GetNodeGraph(self):
+        self.timeline_graph = getattr(self, "timeline_graph", None) or Graph(("Timeline",))
+        return self.timeline_graph
 
     def GetName(self):
         return self.name
@@ -897,9 +996,28 @@ class Project:
         self.format_codec, self.rendering = None, False
         self.color = {"colorScienceMode": "davinciYRGB", "hdrMasteringOn": "0", "hdrDolbyControlsOn": "0"}
         self.gallery = Gallery()
+        self.color_groups = []
 
     def GetGallery(self):
         return self.gallery
+
+    def GetColorGroupsList(self):
+        return self.color_groups
+
+    def AddColorGroup(self, name):
+        group = ColorGroup(name)
+        self.color_groups.append(group)
+        return group
+
+    def DeleteColorGroup(self, group):
+        for m in list(group.members):
+            m.RemoveFromColorGroup()
+        self.color_groups.remove(group)
+        return True
+
+    def RefreshLUTList(self):
+        self.luts_refreshed = True
+        return True
 
     def GetSetting(self, key):
         return self.color.get(key, "")
@@ -1180,6 +1298,13 @@ class Resolve:
     SMART_SWITCH_ANALYSIS_MODE_NONE, SMART_SWITCH_ANALYSIS_MODE_DETECT_WIDE_ANGLE = 670, 671
     SMART_SWITCH_ANALYSIS_MODE_AUDIO_ONLY = 672
     FLATTEN_MULTICAM_COPY_GRADE, FLATTEN_MULTICAM_RETAIN_GRADE_FROM_ANGLE = 680, 681
+
+    def ValidateDCTL(self, source):
+        if "transform" not in source:
+            return "cannot find main DCTL function."
+        if "\n" not in source.strip():
+            return "DCTL Error: main DCTL function does not have return value."  # measured single-line misread
+        return None
 
     def SetKeyframeMode(self, mode):
         self.keyframe_mode = (mode, UI["page"])
