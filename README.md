@@ -323,6 +323,26 @@ Notes:
 - Multicam needs Resolve 21.1: `create_multicam` → `append_clips([name])` → `smart_switch` (automatic cuts to whoever is speaking) or cutting angles in the UI → optionally `flatten_multicam`. Creation and flattening were validated with renders on 21.1 by others; Smart Switch was not (it returned False on silent test cards), so treat it as experimental and check the result with `view_frame`. Switching a single cut to another angle has no API.
 - `auto_align_clips` syncs clips already on the timeline (e.g. before building a multicam by hand). Select every video clip AND its linked audio: Resolve moves only what is selected, and waveform alignment of video alone returned False.
 
+### Visual effects and transitions
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `list_transitions` | `track: int = 1`, `track_type: str = "video"` | `[{index, name, start, end, duration, between}]` | |
+| `transition_all_cuts` | `type: str = "Cross Dissolve"`, `duration: int \| None = 12`, `alignment`, `category`, `track`, `track_type` | `{cuts, added, skipped_existing, failed_no_handles}` | Bad option; no transition could be added; Resolve older than 21.1 |
+| `remove_transitions` | `items: list[int] \| None` (all when omitted), `track`, `track_type` | Confirmation string | An index that is not a transition |
+| `letterbox` | `aspect: float \| None = 2.39`, `item: int \| None`, `track: int = 1` | `{target, aspect, resolution, bounds}` | Aspect outside 0.2–10; Resolve older than 21.1 |
+| `picture_in_picture` | `item: int`, `scale: float = 0.35`, `corner: str = "top_right"`, `margin: float = 0.04`, `track: int = 2` | `{item, set}` | Out-of-range values; unknown corner |
+| `split_screen` | `left: int`, `right: int`, `left_track: int = 2`, `right_track: int = 1`, `gap: float = 0` | `{half_width, left, right}` | Gap out of range |
+| `vignette` | `item: int`, `amount: float = 0.5`, `size: float = 0.85`, `softness: float = 0.35`, `track: int = 1` | `{item, nodes, set}` | Out-of-range values; clip already has one |
+| `camera_shake` | `item: int`, `amount: float = 0.01`, `every: int = 2`, `seed: int = 1`, `track: int = 1` | `{item, node, keyframes, seed, zoom}` | Out-of-range values |
+
+Notes:
+
+- `transition_all_cuts` finds every cut (a clip ending exactly where the next starts), skips cuts already covered by a transition, and reports cuts whose clips lack handles instead of stopping (Resolve 21.1 `AddTransition`). `remove_transitions` deletes transition items only, on the Edit page (switching to it and back); the clips stay in place.
+- `letterbox` uses Resolve's own output blanking (21.1), exact to the pixel: bars for aspects wider than the frame, pillarbox bars for narrower ones. For one clip it first turns off the clip's use of the timeline's blanking, without which Resolve refuses the override (measured). `aspect=None` removes it.
+- `picture_in_picture` and `split_screen` set the clips' Edit-page Zoom, Position and Crop, so they work on any version and stay adjustable in the Inspector. Put the inset or second clip on a track above.
+- `vignette` and `camera_shake` are built in the clip's Fusion comp. `camera_shake` keyframes the `Motion` Transform (shared with `animate_clip`) with seeded random offsets plus a matching zoom so no edge shows; it leaves an already animated zoom alone. `vignette`'s node input names are not yet confirmed on a live Resolve; the live check covers them.
+
 ### Fusion (VFX and motion graphics)
 
 `item` is the 1-based index from `list_items` on video `track` (default 1); `comp` is the 1-based composition index on that item (default 1). Nodes are addressed by name (`MediaIn1`, `Blur1`, …).

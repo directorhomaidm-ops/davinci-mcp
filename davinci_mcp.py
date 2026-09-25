@@ -55,7 +55,7 @@ mcp = MCPServer(
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
     "clip properties, transitions, titles, markers, color grading and management, HDR, Fusion compositing, audio, "
     "media management, projects and review notes, transcripts, subtitle files and titles, keyframes, multicam, "
-    "sound effects and music (voiceover, test tones, beat detection), "
+    "sound effects and music (voiceover, test tones, beat detection), visual effects and transitions, "
     "interchange export and rendering. "
     "Start with timeline_overview to see the edit and view_frame to see the picture. "
     "Frames are absolute timeline frames.",
@@ -3514,6 +3514,241 @@ def mark_beats(item: int, track: int = 1, every: int = 1, color: str = "Yellow",
             skipped += 1
     return {"item": it.GetName(), "bpm": found["bpm"], "markers": len(placed), "skipped": skipped,
             "first_frames": placed[:8]}
+
+
+
+# --- Transitions ---
+
+
+def _is_transition(items, i):
+    kind = _opt(items[i], "GetType")  # 21.1: native lowercase type
+    return kind == "transition" if kind else _kind(items, i) == "transition"
+
+
+@_tool
+def list_transitions(track: int = 1, track_type: str = "video") -> list[dict]:
+    """Transitions on a track: item index, name (the transition type), start, end, duration, and the clips it joins."""
+    _, tl = _timeline()
+    items = _track_items(tl, track_type, track)
+    out = []
+    for i, it in enumerate(items):
+        if not _is_transition(items, i):
+            continue
+        before = next((x.GetName() for x in reversed(items[:i]) if not _is_transition(items, items.index(x))), None)
+        after = next((x.GetName() for x in items[i + 1:] if not _is_transition(items, items.index(x))), None)
+        out.append({"index": i + 1, "name": it.GetName(), "start": it.GetStart(), "end": it.GetEnd(),
+                    "duration": it.GetDuration(), "between": [before, after]})
+    return out
+
+
+@_tool
+def transition_all_cuts(
+    type: str = "Cross Dissolve",
+    duration: int | None = 12,
+    alignment: str = "center",
+    category: str = "simple",
+    track: int = 1,
+    track_type: str = "video",
+) -> dict:
+    """Put the same transition on every cut of a track in one call (Resolve 21.1+): every place where a clip ends
+    exactly where the next clip starts, skipping cuts that already have a transition. Cuts whose clips have no handles
+    (unused media past the cut) are reported, not fatal."""
+    if alignment not in ("left", "center", "right"):
+        raise ToolError("alignment must be left, center or right")
+    if category not in TRANSITION_CATEGORIES:
+        raise ToolError(f"category must be one of: {', '.join(TRANSITION_CATEGORIES)}")
+    if duration is not None and duration < 1:
+        raise ToolError("duration must be a positive number of frames")
+    _, tl = _timeline()
+    items = _track_items(tl, track_type, track)
+    clips = [it for i, it in enumerate(items) if not _is_transition(items, i)]
+    cuts = [(a, b) for a, b in zip(clips, clips[1:]) if a.GetEnd() == b.GetStart()]
+    options = {"type": type, "category": category, "position": "end", "alignment": alignment}
+    if duration is not None:
+        options["duration"] = duration
+    added, failed, skipped = [], [], 0
+    for a, b in cuts:  # clip objects stay valid while new transition items shift the indexes
+        if _covered(tl, track_type, track, a.GetEnd()):
+            skipped += 1
+            continue
+        tr = _method(a, "AddTransition", "21.1")(options)
+        (added if tr else failed).append(f"{a.GetName()} | {b.GetName()}")
+    if cuts and not added and failed:
+        raise ToolError(f"no transition added: check '{type}' is an installed {category} transition and that the clips "
+                        "have handles")
+    return {"cuts": len(cuts), "added": len(added), "skipped_existing": skipped, "failed_no_handles": failed}
+
+
+def _covered(tl, track_type, track, frame):
+    items = _track_items(tl, track_type, track)
+    return any(_is_transition(items, i) and it.GetStart() <= frame <= it.GetEnd() for i, it in enumerate(items))
+
+
+@_tool
+def remove_transitions(items: list[int] | None = None, track: int = 1, track_type: str = "video") -> str:
+    """Remove transitions from a track: the given item indexes (see list_transitions), or all of them. The clips
+    stay where they are."""
+    resolve = _resolve()
+    _, tl = _timeline()
+    all_items = _track_items(tl, track_type, track)
+    found = [it for i, it in enumerate(all_items) if _is_transition(all_items, i)]
+    if items is not None:
+        chosen = []
+        for i in items:
+            if not 1 <= i <= len(all_items) or not _is_transition(all_items, i - 1):
+                raise ToolError(f"item {i} on {track_type} track {track} is not a transition")
+            chosen.append(all_items[i - 1])
+        found = chosen
+    if not found:
+        return "no transitions to remove"
+    with _on_page(resolve, "edit"):
+        ok = tl.DeleteClips(found, False)
+    if not ok:
+        raise ToolError("DeleteClips failed")
+    return f"removed {len(found)} transition(s)"
+
+
+# --- Visual effects ---
+
+
+def _resolution(tl):
+    try:
+        return int(tl.GetSetting("timelineResolutionWidth")), int(tl.GetSetting("timelineResolutionHeight"))
+    except (TypeError, ValueError):
+        raise ToolError("cannot read the timeline resolution") from None
+
+
+@_tool
+def letterbox(aspect: float | None = 2.39, item: int | None = None, track: int = 1) -> dict:
+    """Cinematic bars through Resolve's output blanking (Resolve 21.1+): black bars cropping the picture to `aspect`
+    (e.g. 2.39, 2.0, 1.85; pillarbox bars when narrower than the frame), exact to the pixel. Applies to the whole
+    timeline, or to one video item. aspect=None removes it (the item goes back to the timeline's blanking)."""
+    _, tl = _timeline()
+    w, h = _resolution(tl)
+    if aspect is not None and not 0.2 <= aspect <= 10:
+        raise ToolError("aspect must be between 0.2 and 10")
+    target = _item(tl, item, track) if item is not None else tl
+    label = f"'{target.GetName()}'" if item is not None else f"timeline '{tl.GetName()}'"
+    if aspect is None:
+        if item is not None:
+            if not _method(target, "SetUseTimelineForOutputBlanking", "21.1")(True):
+                raise ToolError("could not return the item to the timeline's blanking")
+            return {"target": label, "blanking": "timeline's"}
+        bounds = {"Top": 0, "Bottom": h, "Left": 0, "Right": w}
+    elif w / h > aspect:  # pillarbox
+        pic_w = round(h * aspect)
+        bounds = {"Top": 0, "Bottom": h, "Left": (w - pic_w) // 2, "Right": (w - pic_w) // 2 + pic_w}
+    else:
+        pic_h = round(w / aspect)
+        bounds = {"Top": (h - pic_h) // 2, "Bottom": (h - pic_h) // 2 + pic_h, "Left": 0, "Right": w}
+    if item is not None:
+        # A clip override only takes once the clip stops inheriting the timeline's blanking.
+        if not _method(target, "SetUseTimelineForOutputBlanking", "21.1")(False):
+            raise ToolError(f"could not give {label} its own blanking")
+    if not _method(target, "SetOutputBlanking", "21.1")(bounds):
+        raise ToolError(f"SetOutputBlanking failed on {label}")
+    return {"target": label, "aspect": aspect, "resolution": [w, h], "bounds": bounds}
+
+
+PIP_CORNERS = {"top_right": (1, 1), "top_left": (-1, 1), "bottom_right": (1, -1), "bottom_left": (-1, -1),
+               "center": (0, 0)}
+
+
+@_tool
+def picture_in_picture(item: int, scale: float = 0.35, corner: str = "top_right", margin: float = 0.04,
+                       track: int = 2) -> dict:
+    """Shrink a clip on an upper track into a corner over the picture below: scale 0.05-1 of full frame, corner
+    top_right, top_left, bottom_right, bottom_left or center, margin as a fraction of the frame. Uses the clip's
+    Edit-page Zoom and Position, so it can be adjusted in the Inspector afterwards."""
+    if not 0.05 <= scale <= 1:
+        raise ToolError("scale must be 0.05-1")
+    if not 0 <= margin <= 0.4:
+        raise ToolError("margin must be 0-0.4")
+    sx, sy = PIP_CORNERS.get(corner, (None, None))
+    if sx is None:
+        raise ToolError(f"corner must be one of: {', '.join(PIP_CORNERS)}")
+    _, tl = _timeline()
+    w, h = _resolution(tl)
+    pan = sx * (w * (1 - scale) / 2 - margin * w)
+    tilt = sy * (h * (1 - scale) / 2 - margin * h)
+    props = {"ZoomX": scale, "ZoomY": scale, "Pan": round(pan, 1), "Tilt": round(tilt, 1)}
+    return set_item_properties(item, props, track=track)
+
+
+@_tool
+def split_screen(left: int, right: int, left_track: int = 2, right_track: int = 1, gap: float = 0.0) -> dict:
+    """Show two clips side by side: `left` (on left_track) and `right` (on right_track), each cropped to half the
+    frame width and moved to its half, with an optional `gap` (fraction of the frame width) between them. Put the two
+    clips on different tracks at the same time. Uses Edit-page Crop and Position."""
+    if not 0 <= gap < 0.5:
+        raise ToolError("gap must be 0-0.5")
+    _, tl = _timeline()
+    w, _ = _resolution(tl)
+    half = w / 2
+    crop = w / 4 + gap * w / 2  # a quarter of the picture off each side, plus half the gap on each clip
+    shift = round(w / 4, 1)
+    out = {
+        "left": set_item_properties(left, {"CropLeft": round(crop, 1), "CropRight": round(crop, 1), "Pan": -shift},
+                                    track=left_track),
+        "right": set_item_properties(right, {"CropLeft": round(crop, 1), "CropRight": round(crop, 1), "Pan": shift},
+                                     track=right_track),
+    }
+    return {"half_width": half, **out}
+
+
+@_tool
+def vignette(item: int, amount: float = 0.5, size: float = 0.85, softness: float = 0.35, track: int = 1) -> dict:
+    """Darken the edges of a video clip: amount 0-1 (how dark the corners get), size 0.2-2 of the frame, softness
+    0-1. Built in the clip's Fusion comp as an inverted ellipse mask driving a BrightnessContrast node named Vignette;
+    refine with set_fusion_input. Experimental: input names not yet confirmed on a live Resolve."""
+    if not 0 < amount <= 1 or not 0.2 <= size <= 2 or not 0 <= softness <= 1:
+        raise ToolError("amount must be 0-1, size 0.2-2, softness 0-1")
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    c = _clip_comp(it)
+    if c.FindTool("Vignette"):
+        raise ToolError("this clip already has a Vignette node; change it with set_fusion_input")
+    darken = _insert_before_output(c, "BrightnessContrast", "Vignette")
+    with _locked(c):
+        mask = c.AddTool("EllipseMask", -1, -1)
+        if not mask:
+            raise ToolError("could not add EllipseMask")
+        mask.SetAttrs({"TOOLS_Name": "VignetteMask"})
+        if not darken.ConnectInput("EffectMask", mask):
+            raise ToolError("could not connect the mask to Vignette")
+    applied = {}
+    for node, tool, key, value in (("VignetteMask", mask, "Width", size), ("VignetteMask", mask, "Height", size),
+                                   ("VignetteMask", mask, "SoftEdge", softness), ("VignetteMask", mask, "Invert", 1),
+                                   ("Vignette", darken, "Gain", 1 - amount)):
+        applied[f"{node}.{key}"] = _set_input(c, tool, node, key, value=value)["value"]
+    return {"item": it.GetName(), "nodes": ["Vignette", "VignetteMask"], "set": applied}
+
+
+@_tool
+def camera_shake(item: int, amount: float = 0.01, every: int = 2, seed: int = 1, track: int = 1) -> dict:
+    """Handheld/impact camera shake on a video clip: random position jitter of `amount` (fraction of the frame,
+    e.g. 0.005 subtle, 0.02 strong) keyframed every `every` frames, with a matching zoom so no edge shows. Same seed,
+    same shake. Built on the clip's Fusion Transform node Motion (shared with animate_clip)."""
+    if not 0 < amount <= 0.1 or every < 1:
+        raise ToolError("amount must be 0-0.1 and every at least 1")
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    c = _clip_comp(it)
+    first, last = _comp_range(c, it)
+    rnd = random.Random(seed)
+    frames = list(range(0, last - first + 1, every))
+    if frames[-1] != last - first:
+        frames.append(last - first)
+    center = {f: [round(0.5 + rnd.uniform(-amount, amount), 5), round(0.5 + rnd.uniform(-amount, amount), 5)]
+              for f in frames}
+    tool = c.FindTool("Motion") or _insert_before_output(c, "Transform", "Motion")
+    _set_input(c, tool, "Motion", "Center", keyframes={first + f: v for f, v in center.items()})
+    out = {"item": it.GetName(), "node": "Motion", "keyframes": len(frames), "seed": seed}
+    if _source(tool["Size"])[1] in ANIMATION_MODIFIERS:
+        out["zoom"] = "left as animated; keep it at least %.3f so no edge shows" % (1 + 2 * amount)
+    else:
+        out["zoom"] = _set_input(c, tool, "Motion", "Size", value=1 + 2 * amount)["value"]
+    return out
 
 
 if __name__ == "__main__":
