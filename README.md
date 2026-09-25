@@ -284,6 +284,26 @@ Notes:
 - `set_title_text` edits Fusion titles (Text+), in any language; Resolve's standard titles have no scripting access. Color is Text+'s first shading element (`Red1`/`Green1`/`Blue1`).
 - `render(..., subtitles="burn_in" | "separate_file" | "embedded")` delivers the timeline's subtitle track on Resolve 21+. It is refused on earlier versions, where these settings were measured to have no effect; check the output.
 
+### Keyframes and multicam
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `animate_clip` | `item: int`, `zoom: {frame: float}`, `position: {frame: [x, y]}`, `rotation: {frame: degrees}`, `track: int = 1` | `{item, node, keyframes}` | Nothing given; frame outside the clip; zoom ≤ 0 |
+| `list_keyframes` | `item: int`, `comp: int = 1`, `track: int = 1` | `[{node, input, keyframes: [{frame, value}]}]` | No comp |
+| `clear_keyframes` | `item: int`, `node: str`, `input: str`, `comp`, `track` | `{node, input, value}` | Not animated; unknown input |
+| `set_color_keyframe_mode` | `mode: "all" \| "color" \| "sizing"` | Confirmation string | Unknown mode |
+| `create_multicam` | `clips: list[str]`, `name`, `sync: "timecode" \| "in" \| "out" \| "audio" \| "marker"`, `audio_mode`, `angle_names`, `audio_channel`, `split_at_gaps`, `use_full_extents`, `create_bin`, `same_camera`, `start_timecode`, `frame_rate` | Names of the multicam clips created | Fewer than 2 clips; option for another sync mode; Resolve older than 21.1 |
+| `auto_align_clips` | `video_items`, `audio_items: list[int]`, `sync: "timecode" \| "waveform"`, `waveform_track: int \| "mix" \| "auto"`, `video_track`, `audio_track` | Confirmation string | Waveform without audio items; fewer than 2 items; Resolve older than 21.1 |
+| `smart_switch` | `item: int`, `min_edit_seconds`, `change_delay_seconds`, `wide_angle: "auto" \| name \| None`, `wide_frequency`, `wide_for_intro_outro`, `wide_for_silence`, `video_only`, `quality`, `analysis`, `track` | Confirmation string | Out-of-range timing; not a multicam clip with speech; Studio only |
+| `flatten_multicam` | `item: int`, `grade: "copy" \| "angle" = "copy"`, `track: int = 1` | Confirmation string | Not a multicam clip |
+
+Notes:
+
+- `animate_clip` frames count from the clip's first frame (0) and are converted to the clip's Fusion comp frame numbers. The motion lives in a Fusion `Transform` node named `Motion`, the route measured to render on live Resolve: Resolve's Edit-page keyframe methods are not in its current API reference. Calling it again adds keyframes to the same node. For any other animated value use `set_fusion_input(..., keyframes=...)`; `list_keyframes` shows everything animated in a clip.
+- `set_color_keyframe_mode` sets what a Color page keyframe records (switching to the Color page and back): the grade keyframes themselves are made in the Color page, which the API cannot do.
+- Multicam needs Resolve 21.1: `create_multicam` → `append_clips([name])` → `smart_switch` (automatic cuts to whoever is speaking) or cutting angles in the UI → optionally `flatten_multicam`. Creation and flattening were validated with renders on 21.1 by others; Smart Switch was not (it returned False on silent test cards), so treat it as experimental and check the result with `view_frame`. Switching a single cut to another angle has no API.
+- `auto_align_clips` syncs clips already on the timeline (e.g. before building a multicam by hand). Select every video clip AND its linked audio: Resolve moves only what is selected, and waveform alignment of video alone returned False.
+
 ### Fusion (VFX and motion graphics)
 
 `item` is the 1-based index from `list_items` on video `track` (default 1); `comp` is the 1-based composition index on that item (default 1). Nodes are addressed by name (`MediaIn1`, `Blur1`, …).
