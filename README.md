@@ -259,10 +259,37 @@ Notes:
 Notes:
 
 - `set_cdl` defaults are the identity grade (slope 1, offset 0, power 1, saturation 1), so pass only what you change.
-- `apply_lut` only accepts LUTs Resolve has already indexed. After copying a new `.cube` into a LUT folder, run *Project Settings → Color Management → Update Lists* first.
+- `apply_lut` and `set_node_lut` take a path relative to Resolve's LUT folders (`Film/Kodak.cube`) or an absolute path to any `.cube` file. Resolve only resolves LUTs inside its master LUT folder, so an outside file is copied to `<master LUT folder>/davinci-mcp/`, the LUT list is refreshed, and the returned path is the one Resolve uses. Set `RESOLVE_LUT_DIR` if your master folder is not the default.
+- Grade writes (`set_cdl`, `copy_grade`, `apply_drx`, versions, LUTs, node bypass, reset, color groups) switch to the Color page and back: Resolve refuses them on other pages.
 - `grab_still` needs the Color page open (`open_page("color")`) and stores the still in the current gallery album as a grade reference. To get the image itself use `view_frame`: Resolve's gallery export only works while the Gallery panel is visible, while the frame export `view_frame` uses works on any page with a viewer.
 - `magic_mask` only tracks: Magic Mask needs clicks on the subject and the API cannot place them. Seed it once in the Color page (select the clip, open the Magic Mask palette, click the subject), then call `magic_mask`. Power Windows and their tracker have no API at all. Studio only.
 - `export_lut` needs Resolve 18 or later and switches to the Color page for the export (Resolve refuses it on other pages), then back. Node reads/writes use Resolve 19's node graph when present and fall back to the older per-item calls on earlier versions.
+
+### Advanced grading
+
+Graph tools take one target: `item` (with `layer` and `track`), `group` (a color group, `stage` `"pre"` or `"post"` clip), or `timeline_grade=True` (the timeline-wide grade, Resolve 21.1+).
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `node_graph` | target | `{graph, nodes: [{index, label, tools, lut, cache}]}` | Not exactly one target; bad stage |
+| `set_node_lut` | `node: int`, `lut_path: str`, target | Confirmation string with the path Resolve used | Node out of range; LUT unknown |
+| `set_node_enabled` | `node: int`, `enabled: bool`, target | Confirmation string | Node out of range |
+| `reset_grade` | target | Confirmation string | Reset refused |
+| `apply_drx_to` | `path: str`, `group` + `stage` or `timeline_grade=True`, `keyframes = "none"` | Confirmation string | File missing |
+| `color_groups` | — | `[{group, clips: [{track, item, name}]}]` | — |
+| `create_color_group` / `delete_color_group` | `name: str` | Confirmation string | Name exists / not found |
+| `assign_color_group` | `items: list[int]`, `group: str \| None` (None removes), `track: int = 1` | `{group, items}` | Group not found |
+| `apply_arri_cdl_lut` | `items: list[int]`, `track: int = 1` | `{applied}` | Clip has no ARRI metadata |
+| `color_cache` | `items: list[int]`, `enabled: bool = True`, `track: int = 1` | `{items, color_cache}` | — |
+| `gallery_albums` | — | `{still_albums, powergrade_albums}` with still labels | — |
+| `import_stills` | `paths: list[str]` (.drx/.dpx/…), `album: str \| None`, `powergrade: bool = False` | `{album, imported}` | File or album not found |
+| `validate_dctl` | `source: str` | `{valid, diagnostic}` | Resolve older than 21.1 |
+
+Notes:
+
+- `set_node_enabled` cannot be read back: Resolve has no getter for a node's bypass state.
+- `validate_dctl` misreads DCTL written on a single line; keep the normal multi-line layout.
+- `powergrade=True` without `album` creates a new PowerGrade album; PowerGrades are shared across projects.
 
 ### Color management and HDR
 
@@ -390,6 +417,7 @@ set_fusion_input(item=1, node="Push", input="Size", keyframes={"0": 1.0, "120": 
 |---|---|---|
 | `RESOLVE_SCRIPT_API` | platform default | Resolve `Developer/Scripting` directory |
 | `RESOLVE_SCRIPT_LIB` | platform default | Path to `fusionscript.so` / `fusionscript.dll` |
+| `RESOLVE_LUT_DIR` | platform master LUT folder | Where outside LUTs are installed for `apply_lut` / `set_node_lut` |
 | `DAVINCI_MCP_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 
 ## Logging

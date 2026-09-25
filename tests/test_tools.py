@@ -96,7 +96,8 @@ def test_append_whole_clips(project):
 def test_append_subclips(project):
     d.append_clips(["a.mov"], start_frame=10, end_frame=19, track=1)
     (entry,) = project.pool.appended[-1]
-    assert (entry["startFrame"], entry["endFrame"]) == (10, 19)
+    assert (entry["startFrame"], entry["endFrame"]) == (10, 20)  # end_frame inclusive, Resolve's endFrame exclusive
+    assert d.list_items()[0]["duration"] == 10
     assert "trackIndex" not in entry  # the form Blackmagic's example uses, which renders
 
 
@@ -109,7 +110,7 @@ def test_append_subclips_other_track(project):
 def test_append_subclip_defaults_end_to_last_frame(project):
     d.append_clips(["b.mov"], start_frame=5)
     (entry,) = project.pool.appended[-1]
-    assert (entry["startFrame"], entry["endFrame"]) == (5, 49)
+    assert (entry["startFrame"], entry["endFrame"]) == (5, 50)  # through the last frame (49) of a 50-frame clip
 
 
 def test_append_unknown_clip(project):
@@ -199,6 +200,9 @@ def test_all_tools_registered():
         "auto_align_clips", "smart_switch", "flatten_multicam", "generate_voiceover", "classify_audio",
         "find_audio", "generate_sound", "detect_beats", "mark_beats", "list_transitions", "transition_all_cuts",
         "remove_transitions", "letterbox", "picture_in_picture", "split_screen", "vignette", "camera_shake",
+        "node_graph", "set_node_lut", "set_node_enabled", "reset_grade", "apply_drx_to", "color_groups",
+        "create_color_group", "delete_color_group", "assign_color_group", "apply_arri_cdl_lut", "color_cache",
+        "gallery_albums", "import_stills", "validate_dctl",
     }
 
 
@@ -718,7 +722,9 @@ def test_view_frame_through_mcp_is_image_content(project):
 
 def test_add_transition(project):
     a, b = _two_items(project)
-    assert d.add_transition(1, duration=24) == {"name": "Cross Dissolve", "start": 86488, "end": 86512, "duration": 24}
+    # timing comes from the track, not from the object AddTransition returns
+    assert d.add_transition(1, duration=24) == {"name": "Cross Dissolve", "index": 2, "start": 86488, "end": 86512,
+                                                "duration": 24}
     assert a.transition_options == {"type": "Cross Dissolve", "category": "simple", "position": "end",
                                     "alignment": "center", "duration": 24}
     assert [i["name"] for i in d.list_items()] == ["a.mov", "Cross Dissolve", "b.mov"]
@@ -1245,7 +1251,7 @@ def test_relink_proxy_replace(project, tmp_path):
 
 def test_export_metadata(project, tmp_path):
     out = tmp_path / "meta.csv"
-    assert d.export_metadata(str(out)) == f"metadata of all clip(s) written to {out}"
+    assert d.export_metadata(str(out)) == f"metadata of 2 clip(s) written to {out}"  # never an empty list
     assert out.read_text().split("\n") == ["a.mov", "b.mov"]
     d.export_metadata(str(out), ["b.mov"])
     assert out.read_text() == "b.mov"
@@ -2170,3 +2176,193 @@ def test_camera_shake_keeps_animated_zoom(project):
     out = d.camera_shake(1, amount=0.02)
     assert out["zoom"].startswith("left as animated")
     assert a.comps[0].FindTool("Motion").inputs["Size"].keys == {0: 1.0, 99: 1.2}
+
+
+# --- advanced grading ---
+
+
+def test_grade_writes_switch_to_color_page(project, resolve, tmp_path):
+    a, b = _two_items(project)
+    resolve.OpenPage("edit")
+    d.set_cdl(1, slope=[1.1, 1, 1])
+    d.copy_grade(1, [2])
+    d.add_color_version(1, "Look B")
+    d.load_color_version(1, "Version 1")
+    drx = tmp_path / "look.drx"
+    drx.write_text("")
+    d.apply_drx(str(drx), [1])
+    assert resolve.page == "edit"  # every write went to the Color page and came back
+    assert resolve.pages_visited.count("color") == 5
+
+
+def test_apply_lut_installs_outside_file(project, resolve, tmp_path, monkeypatch):
+    a, _ = _two_items(project)
+    master = tmp_path / "LUT"
+    master.mkdir()
+    monkeypatch.setenv("RESOLVE_LUT_DIR", str(master))
+    lut = tmp_path / "downloads" / "Teal Orange.cube"
+    lut.parent.mkdir()
+    lut.write_text("LUT_3D_SIZE 2")
+    out = d.apply_lut(1, str(lut), node=2)
+    # An absolute path outside the master folder is refused by Resolve, so it is installed and applied from there.
+    assert out == "LUT on node 2 of 'a.mov': davinci-mcp/Teal Orange.cube"
+    assert (master / "davinci-mcp" / "Teal Orange.cube").read_text() == "LUT_3D_SIZE 2"
+    assert project.luts_refreshed and a.graph.luts[2] == "davinci-mcp/Teal Orange.cube"
+
+
+def test_apply_lut_install_failure_explained(project, tmp_path, monkeypatch):
+    _two_items(project)
+    blocker = tmp_path / "LUT"
+    blocker.write_text("not a folder")  # makedirs fails
+    monkeypatch.setenv("RESOLVE_LUT_DIR", str(blocker))
+    lut = tmp_path / "x.cube"
+    lut.write_text("")
+    with pytest.raises(ToolError, match="copying there failed"):
+        d.apply_lut(1, str(lut))
+    with pytest.raises(ToolError, match="not a LUT Resolve knows"):
+        d.apply_lut(1, "Missing/Look.txt")
+
+
+def test_node_graph_targets(project):
+    a, _ = _two_items(project)
+    g = d.node_graph(item=1)
+    assert g == {"graph": "'a.mov'", "nodes": [
+        {"index": 1, "label": "Primary", "tools": ["Primaries", "Curves"], "lut": None, "cache": 0},
+        {"index": 2, "label": "Look", "tools": ["LUT"], "lut": None, "cache": 0}]}
+    assert d.node_graph(timeline_grade=True)["nodes"][0]["label"] == "Timeline"
+    d.create_color_group("Interview")
+    assert d.node_graph(group="Interview", stage="post")["nodes"][0]["label"] == "Group Post"
+    with pytest.raises(ToolError, match="exactly one of"):
+        d.node_graph(item=1, group="Interview")
+    with pytest.raises(ToolError, match="exactly one of"):
+        d.node_graph()
+    with pytest.raises(ToolError, match="stage must be"):
+        d.node_graph(group="Interview", stage="middle")
+
+
+def test_group_and_timeline_grades(project, tmp_path):
+    _two_items(project)
+    d.create_color_group("Night")
+    assert d.set_node_lut(1, "Film/Kodak.cube", group="Night") == "LUT on node 1 of group 'Night' pre-clip: Film/Kodak.cube"
+    assert project.color_groups[0].pre.luts == {1: "Film/Kodak.cube"}
+    drx = tmp_path / "night.drx"
+    drx.write_text("")
+    assert d.apply_drx_to(str(drx), group="Night", stage="post") == "applied night.drx to group 'Night' post-clip"
+    assert d.apply_drx_to(str(drx), timeline_grade=True, keyframes="start_frames").endswith("timeline 'Main'")
+    assert project.current.timeline_graph.drx == (str(drx), 2)
+    with pytest.raises(ToolError, match="node 2 out of range"):
+        d.set_node_lut(2, "Film/Kodak.cube", group="Night")
+
+
+def test_set_node_enabled_and_reset(project):
+    a, _ = _two_items(project)
+    assert "bypassed (not readable back" in d.set_node_enabled(2, False, item=1)
+    assert a.graph.disabled == {2}
+    assert d.reset_grade(item=1) == "grade of 'a.mov' reset"
+    assert a.graph.reset is True
+
+
+def test_color_groups_workflow(project):
+    a, b = _two_items(project)
+    assert d.create_color_group("Camera A") == "created color group Camera A"
+    with pytest.raises(ToolError, match="already exists"):
+        d.create_color_group("Camera A")
+    assert d.assign_color_group([1, 2], "Camera A") == {"group": "Camera A", "items": ["a.mov", "b.mov"]}
+    assert d.color_groups() == [{"group": "Camera A", "clips": [{"track": 1, "item": 1, "name": "a.mov"},
+                                                                 {"track": 1, "item": 2, "name": "b.mov"}]}]
+    assert d.color_info(1)["color_group"] == "Camera A"
+    d.assign_color_group([2], None)
+    assert [c["name"] for c in d.color_groups()[0]["clips"]] == ["a.mov"]
+    assert d.delete_color_group("Camera A") == "deleted color group Camera A"
+    assert d.color_groups() == [] and a.color_group is None
+    with pytest.raises(ToolError, match="color group not found"):
+        d.assign_color_group([1], "Nope")
+
+
+def test_arri_and_cache(project):
+    a, b = _two_items(project)
+    a.graph.arri = True
+    assert d.apply_arri_cdl_lut([1]) == {"applied": ["a.mov"]}
+    with pytest.raises(ToolError, match="ApplyArriCdlLut failed on b.mov"):
+        d.apply_arri_cdl_lut([2])
+    assert d.color_cache([1, 2]) == {"items": ["a.mov", "b.mov"], "color_cache": True}
+    assert a.color_cache is True
+
+
+def test_gallery_albums_and_import_stills(project, tmp_path):
+    looks = [tmp_path / "warm.drx", tmp_path / "cold.drx"]
+    for f in looks:
+        f.write_text("")
+    assert d.import_stills([str(f) for f in looks]) == {"album": "Stills 1", "imported": 2}
+    assert d.import_stills([str(looks[0])], powergrade=True) == {"album": "PowerGrade 1", "imported": 1}
+    assert d.gallery_albums() == {"still_albums": [{"name": "Stills 1", "stills": ["warm.drx", "cold.drx"]}],
+                                  "powergrade_albums": [{"name": "PowerGrade 1", "stills": ["warm.drx"]}]}
+    assert d.import_stills([str(looks[1])], album="PowerGrade 1")["imported"] == 1
+    with pytest.raises(ToolError, match="album not found"):
+        d.import_stills([str(looks[0])], album="Nope")
+    with pytest.raises(ToolError, match="not found"):
+        d.import_stills([str(tmp_path / "missing.drx")])
+
+
+def test_validate_dctl(resolve):
+    good = "__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)\n{\n    return make_float3(p_R, p_G, p_B);\n}\n"
+    assert d.validate_dctl(good) == {"valid": True, "diagnostic": None}
+    one_line = good.replace("\n", " ")
+    assert d.validate_dctl(one_line) == {"valid": False,
+                                         "diagnostic": "DCTL Error: main DCTL function does not have return value."}
+    assert d.validate_dctl("float x;")["diagnostic"] == "cannot find main DCTL function."
+
+
+# --- fixes from the live check on Resolve Studio 21.1.0.14 ---
+
+
+def test_append_adds_missing_track_and_verifies(project, monkeypatch):
+    d.append_clips(["a.mov"])
+    assert project.current.GetTrackCount("video") == 1
+    d.append_clips(["b.mov"], start_frame=0, end_frame=9, track=3)
+    assert project.current.GetTrackCount("video") == 3
+    assert [i["name"] for i in d.list_items(track=3)] == ["b.mov"]
+    monkeypatch.setattr(project.pool, "AppendToTimeline", lambda clips: True)  # success reported, nothing placed
+    with pytest.raises(ToolError, match="nothing landed on video track 3"):
+        d.append_clips(["a.mov"], start_frame=0, end_frame=9, track=3)
+
+
+def test_keyframes_use_timed_setinput(project):
+    a, _ = _two_items(project)
+    out = d.dynamic_zoom(1, end_zoom=1.3)
+    assert out["frames"] == [0, 99]
+    keys = a.comps[0].FindTool("DynamicZoom").inputs["Size"].keys
+    assert keys == {0: 1.0, 99: 1.3}
+
+
+def test_comp_range_follows_item_length(project):
+    a, _ = _two_items(project)
+    d.insert_fusion_effect(1, "Blur")
+    a.comps[0].attrs["COMPN_RenderEnd"] = 97.0  # live 21.1 reported a range short of the clip
+    out = d.animate_clip(1, zoom={0: 1.0, 99: 1.2})
+    assert out["keyframes"]["zoom"] == [0, 99]
+    with pytest.raises(ToolError, match=r"outside the clip \(0-99\): \[100\]"):
+        d.animate_clip(1, zoom={100: 1.0})
+
+
+def test_view_frame_retries_from_edit_page(project, resolve, monkeypatch, tmp_path):
+    _two_items(project)
+    real = project.ExportCurrentFrameAsStill
+    monkeypatch.setattr(project, "ExportCurrentFrameAsStill",
+                        lambda path: resolve.page == "edit" and real(path))
+    resolve.OpenPage("deliver")
+    out = d.view_frame(save_to=str(tmp_path / "f.png"))
+    assert (tmp_path / "f.png").exists() and resolve.page == "deliver"
+    monkeypatch.setattr(project, "ExportCurrentFrameAsStill", lambda path: False)
+    with pytest.raises(ToolError, match="also from the Edit page"):
+        d.view_frame()
+
+
+def test_set_speed_explains_titles(project):
+    _two_items(project)
+    tl = project.current
+    title = tl.tracks[("video", 1)][0]
+    title.media = None
+    title.SetSpeed = lambda options: False
+    with pytest.raises(ToolError, match="is a title, generator or transition"):
+        d.set_speed(1, 50)

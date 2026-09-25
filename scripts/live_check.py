@@ -210,15 +210,30 @@ def run_checks(args, work, is_211):
     step("color: set_cdl on item 1", lambda: d.set_cdl(1, slope=[1.1, 1.0, 0.9]), needs=have_items)
     step("color: color_info item 1", lambda: d.color_info(1), needs=have_items)
     step("color: export_lut (switches to Color page and back)", lambda: _lut(work), needs=have_items)
-    step("color: set_clip_color_space Rec.709", lambda: d.set_clip_color_space([seq[0]], color_space="Rec.709"),
-         needs=have_media, note="needs a color-managed project; rcm_sdr is")
+    step("color: set_clip_color_space Rec.709 Gamma 2.4", lambda: d.set_clip_color_space(
+        [seq[0]], color_space="Rec.709 Gamma 2.4"), needs=have_media,
+        note="needs a color-managed project; rcm_sdr is. 'Rec.709' alone was refused on 21.1")
+
+    print("\nAdvanced grading")
+    step("grade: node_graph item 1", lambda: d.node_graph(item=1), needs=have_items,
+         note="labels, tools per node, cache mode")
+    step("grade: set_node_lut with a .cube outside the LUT folder (installs to <master>/davinci-mcp)",
+         lambda: d.set_node_lut(1, str(_identity_cube(work)), item=1), needs=have_items)
+    step("grade: set_node_enabled off then on", lambda: (d.set_node_enabled(1, False, item=1),
+                                                         d.set_node_enabled(1, True, item=1)), needs=have_items)
+    step("grade: color group create + assign + list + delete", lambda: _color_group(), needs=have_items)
+    step("grade: timeline graph (21.1)", lambda: d.node_graph(timeline_grade=True),
+         needs=True if is_211 else "needs Resolve 21.1")
+    step("grade: gallery_albums", d.gallery_albums)
+    step("grade: validate_dctl good and broken (21.1)", lambda: _dctl(),
+         needs=True if is_211 else "needs Resolve 21.1")
 
     print("\nFusion")
     step("fusion: insert_fusion_effect Blur", lambda: d.insert_fusion_effect(1, "Blur", {"XBlurSize": 8.0}),
          needs=have_items)
     step("fusion: fusion_nodes", lambda: d.fusion_nodes(1), needs=have_items)
     step("fusion: dynamic_zoom item 2 (comp range on a media clip)", lambda: d.dynamic_zoom(2, end_zoom=1.3),
-         needs=have_items, note="frames should cover the clip: 24 frames")
+         needs=have_items, note="frames should span 24 frames: [first, first + 23]")
     step("fusion: Tracker point input names", lambda: _tracker_inputs(), needs=have_items,
          note="link_mask_to_tracker assumes TrackedCenter1")
     step("fusion: view_frame after effects", lambda: _frame(work / "frame_fusion.png"), needs=have_items)
@@ -256,7 +271,8 @@ def run_checks(args, work, is_211):
     step("21.1: set_fades on item 1", lambda: d.set_fades(1, fade_in=6, track_type="video"), needs=need211)
     step("21.1: letterbox 2.39 on the timeline, frame, then off", lambda: _letterbox(work), needs=need211)
     step("21.1: transition_all_cuts + list + remove", lambda: _all_cuts(), needs=need211)
-    step("21.1: set_speed 50% on last item", lambda: d.set_speed(len(d.list_items()), 50), needs=need211)
+    step("21.1: set_speed 50% on item 1", lambda: d.set_speed(1, 50), needs=need211,
+         note="item 1 is a media clip; titles refuse SetSpeed")
     step("21.1: normalize_audio -16 LKFS", lambda: d.normalize_audio([1], loudness=-16),
          needs=need211 if wav else "no audio item")
     step("21.1: create_multicam from the two sequences + append + flatten", lambda: _multicam(seq),
@@ -322,6 +338,37 @@ def _lut(work):
     expect((work / "grade.cube").exists(), "no .cube written")
     expect(d._resolve().GetCurrentPage() == before, "page not restored")
     return (work / "grade.cube").stat().st_size
+
+
+def _identity_cube(work):
+    path = work / "identity_check.cube"
+    rows = [f"{r} {g} {b}" for b in (0.0, 1.0) for g in (0.0, 1.0) for r in (0.0, 1.0)]
+    path.write_text("LUT_3D_SIZE 2\n" + "\n".join(rows) + "\n")
+    return path
+
+
+def _color_group():
+    name = "Live Check Group"
+    d.create_color_group(name)
+    try:
+        d.assign_color_group([1, 2], name)
+        groups = d.color_groups()
+        g = next((x for x in groups if x["group"] == name), None)
+        expect(g and len(g["clips"]) == 2, f"expected 2 clips in {name}, got {groups}")
+        d.node_graph(group=name, stage="post")
+        return groups
+    finally:
+        d.delete_color_group(name)
+
+
+def _dctl():
+    good = ("__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, "
+            "float p_B)\n{\n    return make_float3(p_R * 0.9f, p_G, p_B);\n}\n")
+    ok = d.validate_dctl(good)
+    expect(ok["valid"], f"valid DCTL rejected: {ok}")
+    bad = d.validate_dctl("float x;")
+    expect(not bad["valid"], "broken DCTL accepted")
+    return {"good": ok, "bad": bad}
 
 
 def _pip(seq):

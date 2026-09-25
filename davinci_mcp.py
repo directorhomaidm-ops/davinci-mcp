@@ -55,7 +55,8 @@ mcp = MCPServer(
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
     "clip properties, transitions, titles, markers, color grading and management, HDR, Fusion compositing, audio, "
     "media management, projects and review notes, transcripts, subtitle files and titles, keyframes, multicam, "
-    "sound effects and music (voiceover, test tones, beat detection), visual effects and transitions, "
+    "sound effects and music (voiceover, test tones, beat detection), visual effects and transitions, node graphs, "
+    "color groups, PowerGrades and DCTL, "
     "interchange export and rendering. "
     "Start with timeline_overview to see the edit and view_frame to see the picture. "
     "Frames are absolute timeline frames.",
@@ -240,6 +241,35 @@ def _in_bin(pool, folder):
             pool.SetCurrentFolder(prev)
 
 
+MASTER_LUT_DIRS = {
+    "darwin": "/Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT",
+    "win32": r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\LUT",
+    "linux": "/opt/resolve/LUT",
+}
+
+
+def _set_lut(proj, graph, node, lut_path):
+    """SetLUT, installing an outside file into the master LUT folder when Resolve cannot resolve it."""
+    if graph.SetLUT(node, lut_path):
+        return lut_path
+    if not (os.path.isabs(lut_path) and os.path.isfile(lut_path)):
+        raise ToolError(f"SetLUT failed for {lut_path}: not a LUT Resolve knows (give a path relative to its LUT "
+                        "folders, or an absolute path to the file)")
+    master = os.environ.get("RESOLVE_LUT_DIR") or MASTER_LUT_DIRS.get(sys.platform, MASTER_LUT_DIRS["linux"])
+    dest = os.path.join(master, "davinci-mcp")
+    try:
+        os.makedirs(dest, exist_ok=True)
+        shutil.copy2(lut_path, os.path.join(dest, os.path.basename(lut_path)))
+    except OSError as e:
+        raise ToolError(f"Resolve only reads LUTs from its master LUT folder, and copying there failed ({e}); copy "
+                        f"the file into {dest} yourself or set RESOLVE_LUT_DIR") from e
+    proj.RefreshLUTList()
+    rel = f"davinci-mcp/{os.path.basename(lut_path)}"
+    if not graph.SetLUT(node, rel):
+        raise ToolError(f"SetLUT failed even after installing the LUT as {rel} (not a valid LUT file?)")
+    return rel
+
+
 def _check_node(it, node):
     count = int(_graph(it).GetNumNodes() or 0)
     if not 1 <= node <= count:
@@ -365,14 +395,19 @@ def append_clips(
     if missing:
         raise ToolError(f"clips not in media pool: {', '.join(missing)} (see list_clips)")
     clips = [by_name[n] for n in names]
+    while track > int(tl.GetTrackCount("video") or 0):  # appending to a missing track lands the clips elsewhere
+        if not tl.AddTrack("video"):
+            raise ToolError(f"could not add video track {track}")
+    before = len(tl.GetItemListInTrack("video", track) or [])
     if start_frame is None and end_frame is None:
         ok = pool.AppendToTimeline(clips)
     else:
+        # endFrame is exclusive: live Resolve 21.1 made 23-frame items from startFrame 0, endFrame 23.
         infos = [
             {
                 "mediaPoolItem": c,
                 "startFrame": start_frame or 0,
-                "endFrame": end_frame if end_frame is not None else int(float(c.GetClipProperty("Frames") or 0)) - 1,
+                "endFrame": end_frame + 1 if end_frame is not None else int(float(c.GetClipProperty("Frames") or 0)),
             }
             for c in clips
         ]
@@ -384,6 +419,8 @@ def append_clips(
         ok = pool.AppendToTimeline(infos)
     if not ok:
         raise ToolError("append failed")
+    if track != 1 and len(tl.GetItemListInTrack("video", track) or []) == before:
+        raise ToolError(f"Resolve reported success but nothing landed on video track {track}")
     return f"appended {len(clips)} clip(s) to '{tl.GetName()}'"
 
 
@@ -693,14 +730,16 @@ def color_info(item: int | None = None, track: int = 1) -> dict:
 
 @_tool
 def apply_lut(item: int, lut_path: str, node: int = 1, track: int = 1) -> str:
-    """Set a LUT on a node (1-based) of a video item. lut_path is absolute, or relative to Resolve's LUT folders;
-    Resolve only accepts LUTs it has already discovered (Project Settings → Color Management → Update Lists)."""
-    _, tl = _timeline()
+    """Set a LUT on a node (1-based) of a video item. lut_path is relative to Resolve's LUT folders (e.g.
+    "Blackmagic Design/Rec709 ..."), or any absolute path to a .cube/.dat file: Resolve only resolves LUTs in its master
+    LUT folder, so a file elsewhere is copied into its "davinci-mcp" subfolder and the LUT list refreshed."""
+    resolve = _resolve()
+    proj, tl = _timeline()
     it = _item(tl, item, track)
     _check_node(it, node)
-    if not _graph(it).SetLUT(node, lut_path):
-        raise ToolError(f"SetLUT failed for {lut_path} (unknown to Resolve?)")
-    return f"LUT on node {node} of '{it.GetName()}': {lut_path}"
+    with _on_page(resolve, "color"):
+        used = _set_lut(proj, _graph(it), node, lut_path)
+    return f"LUT on node {node} of '{it.GetName()}': {used}"
 
 
 def _rgb(name, v):
@@ -730,7 +769,9 @@ def set_cdl(
         "Power": _rgb("power", power),
         "Saturation": str(float(saturation)),
     }
-    if not it.SetCDL(cdl):
+    with _on_page(_resolve(), "color"):
+        ok = it.SetCDL(cdl)
+    if not ok:
         raise ToolError("SetCDL failed")
     return {"item": it.GetName(), "cdl": cdl}
 
@@ -743,7 +784,9 @@ def copy_grade(source: int, targets: list[int], track: int = 1) -> str:
     dst = [_item(tl, t, track) for t in targets]
     if not dst:
         raise ToolError("no targets given")
-    if not src.CopyGrades(dst):
+    with _on_page(_resolve(), "color"):
+        ok = src.CopyGrades(dst)
+    if not ok:
         raise ToolError("CopyGrades failed")
     return f"copied grade of '{src.GetName()}' to {len(dst)} item(s)"
 
@@ -764,7 +807,9 @@ def apply_drx(path: str, items: list[int], keyframes: str = "none", track: int =
     targets = [_item(tl, i, track) for i in items]
     if not targets:
         raise ToolError("no items given")
-    if not tl.ApplyGradeFromDRX(path, DRX_MODES[keyframes], targets):
+    with _on_page(_resolve(), "color"):
+        ok = tl.ApplyGradeFromDRX(path, DRX_MODES[keyframes], targets)
+    if not ok:
         raise ToolError("ApplyGradeFromDRX failed")
     return f"applied {os.path.basename(path)} to {len(targets)} item(s)"
 
@@ -774,7 +819,9 @@ def add_color_version(item: int, name: str, remote: bool = False, track: int = 1
     """Add a named color version to a video item (local by default) and make it current."""
     _, tl = _timeline()
     it = _item(tl, item, track)
-    if not it.AddVersion(name, int(remote)):
+    with _on_page(_resolve(), "color"):
+        ok = it.AddVersion(name, int(remote))
+    if not ok:
         raise ToolError(f"cannot add version (name taken?): {name}")
     return f"added {'remote' if remote else 'local'} version '{name}' to '{it.GetName()}'"
 
@@ -784,7 +831,9 @@ def load_color_version(item: int, name: str, remote: bool = False, track: int = 
     """Make a named color version of a video item current."""
     _, tl = _timeline()
     it = _item(tl, item, track)
-    if not it.LoadVersionByName(name, int(remote)):
+    with _on_page(_resolve(), "color"):
+        ok = it.LoadVersionByName(name, int(remote))
+    if not ok:
         raise ToolError(f"version not found: {name} (see color_info)")
     return f"loaded version '{name}' on '{it.GetName()}'"
 
@@ -1135,7 +1184,9 @@ def _set_input(c, tool, node, input, value=None, keyframes=None):
             if _source(tool[input])[1] not in ANIMATION_MODIFIERS:
                 raise ToolError(f"{node}.{input} ({kind or 'unknown type'}) cannot be animated")
         for frame, v in sorted(keyframes.items()):
-            _write(lambda x, f=frame: tool[input].__setitem__(f, x), v, point)
+            # SetInput with a time keys an animated input. Not tool[input].__setitem__: the Resolve bridge
+            # returns None for attributes it does not know ('NoneType' object is not callable on live 21.1).
+            _write(lambda x, f=frame: tool.SetInput(input, x, f), v, point)
     frames = sorted(float(f) for f in (tool[input].GetKeyFrames() or {}).values())
     return {"node": node, "input": input, "keyframes": frames}
 
@@ -1249,7 +1300,11 @@ def view_frame(timecode: str | None = None, frame: int | None = None, save_to: s
     path = os.path.abspath(save_to) if save_to else os.path.join(tmp, "frame.png")
     try:
         if not proj.ExportCurrentFrameAsStill(path) or not os.path.exists(path):
-            raise ToolError("ExportCurrentFrameAsStill failed (is a page with a viewer open?)")
+            # Refused on some pages (live 21.1: after a render); the Edit page's viewer always works.
+            with _on_page(_resolve(), "edit"):
+                ok = proj.ExportCurrentFrameAsStill(path) and os.path.exists(path)
+            if not ok:
+                raise ToolError("ExportCurrentFrameAsStill failed, also from the Edit page")
         ext = os.path.splitext(path)[1].lower()
         note = f"frame at {_opt(tl, 'GetCurrentTimecode') or tc}" + (f", saved to {path}" if save_to else "")
         if ext not in (".png", ".jpg", ".jpeg"):
@@ -1296,13 +1351,21 @@ def add_transition(
     options = {"type": type, "category": category, "position": position, "alignment": alignment}
     if duration is not None:
         options["duration"] = duration
+    cut = it.GetEnd() if position == "end" else it.GetStart()
     tr = _method(it, "AddTransition", "21.1")(options)
     if not tr:
         raise ToolError(
             f"no transition created — check the name matches an installed {category} transition and that "
             "both clips have handles (unused media) past the cut"
         )
-    return {"name": tr.GetName(), "start": tr.GetStart(), "end": tr.GetEnd(), "duration": tr.GetDuration()}
+    # The returned object's timing is not the transition's (live 21.1: start 24, end 22), so read the track.
+    items = tl.GetItemListInTrack(track_type, track) or []
+    placed = next((x for i, x in enumerate(items) if _is_transition(items, i) and x.GetStart() <= cut <= x.GetEnd()),
+                  None)
+    if placed is None:
+        return {"name": tr.GetName(), "note": "added, but not found on the track to report its timing"}
+    return {"name": placed.GetName(), "index": items.index(placed) + 1, "start": placed.GetStart(),
+            "end": placed.GetEnd(), "duration": placed.GetDuration()}
 
 
 @_tool
@@ -1385,9 +1448,7 @@ def dynamic_zoom(
     if c.FindTool("DynamicZoom"):
         raise ToolError("clip already has a DynamicZoom node; delete_fusion_node it first")
     tool = _insert_before_output(c, "Transform", "DynamicZoom")
-    attrs = c.GetAttrs() or {}
-    first = int(attrs.get("COMPN_RenderStart", 0))
-    last = int(attrs.get("COMPN_RenderEnd", first + int(it.GetDuration()) - 1))
+    first, last = _comp_range(c, it)
     _set_input(c, tool, "DynamicZoom", "Size", keyframes={first: start_zoom, last: end_zoom})
     if list(start_center) != list(end_center) or list(start_center) != [0.5, 0.5]:
         _set_input(c, tool, "DynamicZoom", "Center", keyframes={first: start_center, last: end_center})
@@ -1647,7 +1708,8 @@ def set_speed(
     if stretch_keyframes is not None:
         options["StretchKeyframesToFit"] = stretch_keyframes
     if not _method(it, "SetSpeed", "21.1")(options):
-        raise ToolError("SetSpeed failed")
+        why = "" if _opt(it, "GetMediaPoolItem") else f" ('{it.GetName()}' is a title, generator or transition)"
+        raise ToolError("SetSpeed failed" + why)
     return {"item": it.GetName(), "speed": _opt(it, "GetSpeed"), "duration": it.GetDuration()}
 
 
@@ -2003,10 +2065,13 @@ def export_metadata(path: str, clips: list[str] | None = None) -> str:
     """Write clip metadata to a CSV file: the given clips, or the whole media pool."""
     _, proj = _project()
     path = os.path.abspath(path)
-    targets = _pool_clips(proj, clips) if clips else []
+    # An empty list means "nothing" to live Resolve 21.1 (the export fails), so the whole pool is listed.
+    targets = _pool_clips(proj, clips) if clips else [c for _, c in _walk(proj.GetMediaPool().GetRootFolder())]
+    if not targets:
+        raise ToolError("the media pool is empty")
     if not proj.GetMediaPool().ExportMetadata(path, targets) or not os.path.exists(path):
         raise ToolError(f"ExportMetadata failed: {path}")
-    return f"metadata of {len(targets) or 'all'} clip(s) written to {path}"
+    return f"metadata of {len(targets)} clip(s) written to {path}"
 
 
 # --- Interchange and project ---
@@ -2919,10 +2984,10 @@ MOTION_INPUTS = {"zoom": "Size", "position": "Center", "rotation": "Angle"}
 
 
 def _comp_range(c, it):
-    attrs = c.GetAttrs() or {}
-    first = int(attrs.get("COMPN_RenderStart", 0))
-    last = int(attrs.get("COMPN_RenderEnd", first + int(it.GetDuration()) - 1))
-    return first, last
+    """(first, last) comp frames of the clip. The length comes from the timeline item: live Resolve 21.1 reported
+    a render range one frame short (0-21 on a 23-frame clip), which would refuse keyframes on the last frame."""
+    first = int((c.GetAttrs() or {}).get("COMPN_RenderStart", 0))
+    return first, first + int(it.GetDuration()) - 1
 
 
 @_tool
@@ -3749,6 +3814,248 @@ def camera_shake(item: int, amount: float = 0.01, every: int = 2, seed: int = 1,
     else:
         out["zoom"] = _set_input(c, tool, "Motion", "Size", value=1 + 2 * amount)["value"]
     return out
+
+
+
+# --- Advanced grading: node graphs, color groups, PowerGrades, DCTL ---
+#
+# Grade writes run on the Color page (measured: ApplyGradeFromDRX and AddVersion return False for every clip from
+# the Edit page), switching there and back. The API cannot add, connect or tune nodes (lift/gamma/gain, curves,
+# qualifiers, windows): grades are shaped with CDL, LUTs and .drx stills, and organised with groups and versions.
+
+GROUP_STAGES = ("pre", "post")
+
+
+def _find_group(proj, name):
+    for g in proj.GetColorGroupsList() or []:
+        if g.GetName() == name:
+            return g
+    raise ToolError(f"color group not found: {name} (see color_groups)")
+
+
+def _graph_target(item, track, layer, group, stage, timeline_grade):
+    """(graph, label) for a clip's layer, a color group's pre/post-clip grade, or the timeline grade."""
+    if sum(x is not None and x is not False for x in (item, group, timeline_grade or None)) != 1:
+        raise ToolError("give exactly one of item, group or timeline_grade=True")
+    proj, tl = _timeline()
+    if item is not None:
+        it = _item(tl, item, track)
+        graph = it.GetNodeGraph(layer) if layer != 1 else _graph(it)
+        if not graph:
+            raise ToolError(f"'{it.GetName()}' has no node layer {layer}")
+        return graph, f"'{it.GetName()}'" + (f" layer {layer}" if layer != 1 else "")
+    if group is not None:
+        if stage not in GROUP_STAGES:
+            raise ToolError("stage must be pre or post")
+        g = _find_group(proj, group)
+        graph = (g.GetPreClipNodeGraph if stage == "pre" else g.GetPostClipNodeGraph)()
+        return graph, f"group '{group}' {stage}-clip"
+    return _method(tl, "GetNodeGraph", "21.1")(), f"timeline '{tl.GetName()}'"
+
+
+def _node_in(graph, node, label):
+    count = int(graph.GetNumNodes() or 0)
+    if not 1 <= node <= count:
+        raise ToolError(f"node {node} out of range ({label} has {count} node(s))")
+
+
+@_tool
+def node_graph(item: int | None = None, group: str | None = None, stage: str = "pre", timeline_grade: bool = False,
+               layer: int = 1, track: int = 1) -> dict:
+    """The nodes of a grade: for a clip (item, node-stack layer), a color group (group, stage pre or post-clip), or the
+    whole timeline (timeline_grade=True, Resolve 21.1+). Each node: index, label, the tools used in it (e.g.
+    Primaries, Curves, Qualifier, Window), its LUT and cache mode."""
+    graph, label = _graph_target(item, track, layer, group, stage, timeline_grade)
+    nodes = []
+    for n in range(1, int(graph.GetNumNodes() or 0) + 1):
+        nodes.append({"index": n, "label": graph.GetNodeLabel(n) or "", "tools": list(_opt(graph, "GetToolsInNode", n) or []),
+                      "lut": graph.GetLUT(n) or None, "cache": _opt(graph, "GetNodeCacheMode", n)})
+    return {"graph": label, "nodes": nodes}
+
+
+@_tool
+def set_node_lut(node: int, lut_path: str, item: int | None = None, group: str | None = None, stage: str = "pre",
+                 timeline_grade: bool = False, layer: int = 1, track: int = 1) -> str:
+    """Put a LUT on a node of a clip, color group (pre/post-clip) or timeline grade. lut_path as in apply_lut: relative
+    to Resolve's LUT folders, or an absolute file that gets installed into the master LUT folder."""
+    graph, label = _graph_target(item, track, layer, group, stage, timeline_grade)
+    _node_in(graph, node, label)
+    with _on_page(_resolve(), "color"):
+        used = _set_lut(_project()[1], graph, node, lut_path)
+    return f"LUT on node {node} of {label}: {used}"
+
+
+@_tool
+def set_node_enabled(node: int, enabled: bool, item: int | None = None, group: str | None = None, stage: str = "pre",
+                     timeline_grade: bool = False, layer: int = 1, track: int = 1) -> str:
+    """Bypass (enabled=False) or re-enable one node of a clip, color group or timeline grade, e.g. to compare with and
+    without a look. Resolve has no way to read a node's enabled state back; check with view_frame."""
+    graph, label = _graph_target(item, track, layer, group, stage, timeline_grade)
+    _node_in(graph, node, label)
+    with _on_page(_resolve(), "color"):
+        ok = graph.SetNodeEnabled(node, enabled)
+    if not ok:
+        raise ToolError(f"SetNodeEnabled failed on node {node} of {label}")
+    return f"node {node} of {label} {'enabled' if enabled else 'bypassed'} (not readable back; verify with view_frame)"
+
+
+@_tool
+def reset_grade(item: int | None = None, group: str | None = None, stage: str = "pre", timeline_grade: bool = False,
+                layer: int = 1, track: int = 1) -> str:
+    """Reset every node of a clip's, color group's or timeline's grade to neutral. Save a version first
+    (add_color_version) to be able to go back."""
+    graph, label = _graph_target(item, track, layer, group, stage, timeline_grade)
+    with _on_page(_resolve(), "color"):
+        ok = graph.ResetAllGrades()
+    if not ok:
+        raise ToolError(f"ResetAllGrades failed on {label}")
+    return f"grade of {label} reset"
+
+
+@_tool
+def apply_drx_to(path: str, group: str | None = None, stage: str = "pre", timeline_grade: bool = False,
+                 keyframes: str = "none") -> str:
+    """Apply a .drx grade still to a color group's pre/post-clip grade or to the timeline grade (for clips use
+    apply_drx). keyframes: none, source_timecode or start_frames."""
+    if keyframes not in DRX_MODES:
+        raise ToolError(f"unknown keyframes mode: {keyframes} (one of {', '.join(DRX_MODES)})")
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        raise ToolError(f"file not found: {path}")
+    graph, label = _graph_target(None, 1, 1, group, stage, timeline_grade)
+    with _on_page(_resolve(), "color"):
+        ok = graph.ApplyGradeFromDRX(path, DRX_MODES[keyframes])
+    if not ok:
+        raise ToolError(f"ApplyGradeFromDRX failed on {label}")
+    return f"applied {os.path.basename(path)} to {label}"
+
+
+@_tool
+def color_groups() -> list[dict]:
+    """The project's color groups and, for each, its clips on the current timeline (video track and index)."""
+    proj, tl = _timeline()
+    where = {}
+    for n in range(1, int(tl.GetTrackCount("video") or 0) + 1):
+        for i, it in enumerate(tl.GetItemListInTrack("video", n) or [], 1):
+            where[id(it)] = (n, i)
+    out = []
+    for g in proj.GetColorGroupsList() or []:
+        clips = [{"track": where.get(id(c), (None, None))[0], "item": where.get(id(c), (None, None))[1],
+                  "name": c.GetName()} for c in g.GetClipsInTimeline(tl) or []]
+        out.append({"group": g.GetName(), "clips": clips})
+    return out
+
+
+@_tool
+def create_color_group(name: str) -> str:
+    """Create a color group: clips in it share a pre-clip and post-clip grade (grade a scene or camera once)."""
+    _, proj = _project()
+    if any(g.GetName() == name for g in proj.GetColorGroupsList() or []):
+        raise ToolError(f"a color group named {name} already exists")
+    if not proj.AddColorGroup(name):
+        raise ToolError(f"could not create color group {name}")
+    return f"created color group {name}"
+
+
+@_tool
+def delete_color_group(name: str) -> str:
+    """Delete a color group; its clips become ungrouped and keep their own clip grades."""
+    _, proj = _project()
+    if not proj.DeleteColorGroup(_find_group(proj, name)):
+        raise ToolError(f"could not delete color group {name}")
+    return f"deleted color group {name}"
+
+
+@_tool
+def assign_color_group(items: list[int], group: str | None, track: int = 1) -> dict:
+    """Put video items (1-based indexes) into a color group, or take them out of theirs (group=None)."""
+    proj, tl = _timeline()
+    targets = [_item(tl, i, track) for i in items]
+    if not targets:
+        raise ToolError("no items given")
+    g = _find_group(proj, group) if group is not None else None
+    with _on_page(_resolve(), "color"):
+        failed = [t.GetName() for t in targets if not (t.AssignToColorGroup(g) if g else t.RemoveFromColorGroup())]
+    if failed:
+        raise ToolError(f"could not {'assign' if g else 'ungroup'}: {', '.join(failed)}")
+    return {"group": group, "items": [t.GetName() for t in targets]}
+
+
+@_tool
+def apply_arri_cdl_lut(items: list[int], track: int = 1) -> dict:
+    """Apply the ARRI look embedded in ARRI camera clips (their CDL and LUT metadata) to their grades."""
+    _, tl = _timeline()
+    targets = [_item(tl, i, track) for i in items]
+    if not targets:
+        raise ToolError("no items given")
+    with _on_page(_resolve(), "color"):
+        failed = [t.GetName() for t in targets if not _graph(t).ApplyArriCdlLut()]
+    if failed:
+        raise ToolError(f"ApplyArriCdlLut failed on {', '.join(failed)} (ARRI clips with look metadata only)")
+    return {"applied": [t.GetName() for t in targets]}
+
+
+@_tool
+def color_cache(items: list[int], enabled: bool = True, track: int = 1) -> dict:
+    """Render-cache the color output of video items (Resolve's 'Render Cache Color Output'), for smooth playback of
+    heavy grades; enabled=False turns it off."""
+    _, tl = _timeline()
+    targets = [_item(tl, i, track) for i in items]
+    failed = [t.GetName() for t in targets if not t.SetColorOutputCache(enabled)]
+    if failed:
+        raise ToolError(f"SetColorOutputCache failed on {', '.join(failed)}")
+    return {"items": [t.GetName() for t in targets], "color_cache": enabled}
+
+
+@_tool
+def gallery_albums() -> dict:
+    """Gallery albums: still albums and PowerGrade albums (grades shared across projects), with the labels of their
+    stills."""
+    _, proj = _project()
+    gallery = proj.GetGallery()
+
+    def rows(albums):
+        return [{"name": gallery.GetAlbumName(a), "stills": [a.GetLabel(st) for st in a.GetStills() or []]}
+                for a in albums or []]
+
+    return {"still_albums": rows(gallery.GetGalleryStillAlbums()),
+            "powergrade_albums": rows(_opt(gallery, "GetGalleryPowerGradeAlbums"))}
+
+
+@_tool
+def import_stills(paths: list[str], album: str | None = None, powergrade: bool = False) -> dict:
+    """Import grade stills (.drx, or .dpx with its .drx) into a gallery album, by name, or into a new PowerGrade
+    album (powergrade=True with no album), to reuse looks across projects."""
+    paths = [os.path.abspath(x) for x in paths]
+    missing = [x for x in paths if not os.path.exists(x)]
+    if missing or not paths:
+        raise ToolError(f"file(s) not found: {', '.join(missing) or 'none given'}")
+    _, proj = _project()
+    gallery = proj.GetGallery()
+    albums = list(gallery.GetGalleryStillAlbums() or []) + list(_opt(gallery, "GetGalleryPowerGradeAlbums") or [])
+    if album is not None:
+        target = next((a for a in albums if gallery.GetAlbumName(a) == album), None)
+        if target is None:
+            raise ToolError(f"album not found: {album} (see gallery_albums)")
+    elif powergrade:
+        target = _method(gallery, "CreateGalleryPowerGradeAlbum", "18")()
+    else:
+        target = gallery.GetCurrentStillAlbum()
+    before = len(target.GetStills() or [])
+    if not _method(target, "ImportStills", "18")(paths):
+        raise ToolError("ImportStills failed")
+    return {"album": gallery.GetAlbumName(target), "imported": len(target.GetStills() or []) - before}
+
+
+@_tool
+def validate_dctl(source: str) -> dict:
+    """Check a DCTL shader's source with Resolve's own compiler front-end (Resolve 21.1+). Returns valid and
+    Resolve's diagnostic verbatim. Keep the usual multi-line layout: the validator was measured to misread a whole
+    function written on one line. Validation is not a rendered test."""
+    result = _method(_resolve(), "ValidateDCTL", "21.1")(source)
+    if result is not None and not isinstance(result, str):
+        raise ToolError(f"unexpected ValidateDCTL result: {result!r}")
+    return {"valid": result is None, "diagnostic": result}
 
 
 if __name__ == "__main__":
