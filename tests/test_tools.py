@@ -108,13 +108,21 @@ def test_append_subclips(project):
 def test_append_subclips_other_track(project):
     d.append_clips(["a.mov"], start_frame=0, end_frame=9, track=2)
     (entry,) = project.pool.appended[-1]
-    assert entry["trackIndex"] == 2
+    assert (entry["trackIndex"], entry["mediaType"]) == (2, 1)  # without mediaType the item renders black
 
 
 def test_append_subclip_defaults_end_to_last_frame(project):
     d.append_clips(["b.mov"], start_frame=5)
     (entry,) = project.pool.appended[-1]
     assert (entry["startFrame"], entry["endFrame"]) == (5, 50)  # through the last frame (49) of a 50-frame clip
+
+
+def test_append_subclip_counts_from_the_clips_first_frame(project):
+    project.pool.root.clips[0].props["Start"] = "1"  # image sequences number their frames from 1
+    d.append_clips(["a.mov"], start_frame=0, end_frame=23)
+    (entry,) = project.pool.appended[-1]
+    assert (entry["startFrame"], entry["endFrame"]) == (1, 25)
+    assert d.list_items()[0]["duration"] == 24
 
 
 def test_append_unknown_clip(project):
@@ -490,8 +498,9 @@ def test_fusion_comps_add_import_export(project, tmp_path):
     assert d.add_fusion_comp(1) == {"item": "a.mov", "comp": 1, "comps": ["Composition 1"]}
     tpl = tmp_path / "glow_template.comp"
     tpl.write_text("")
-    assert d.add_fusion_comp(1, import_path=str(tpl))["comps"] == ["Composition 1", "glow_template"]
-    assert d.fusion_comps(1) == ["Composition 1", "glow_template"]
+    # live 21.1 imports into the active comp, keeping its name; a comp of its own keeps Composition 1 intact
+    assert d.add_fusion_comp(1, import_path=str(tpl))["comps"] == ["Composition 1", "Composition 2"]
+    assert d.fusion_comps(1) == ["Composition 1", "Composition 2"]
     with pytest.raises(ToolError, match="file not found"):
         d.add_fusion_comp(1, import_path=str(tmp_path / "missing.comp"))
 
@@ -2135,22 +2144,61 @@ def test_picture_in_picture(project):
     item.SetProperty = lambda k, v: item.props.__setitem__(k, v) or True
     d.picture_in_picture(1, scale=0.25, corner="bottom_left", margin=0.05)
     # x: 1920 * 0.75 / 2 - 96 = 624 to the left; y: 1080 * 0.75 / 2 - 54 = 351 down
-    assert item.props == {"ZoomX": 0.25, "ZoomY": 0.25, "Pan": -624.0, "Tilt": -351.0}
+    assert item.props == {"Scaling": 2, "ZoomX": 0.25, "ZoomY": 0.25, "Pan": -624.0, "Tilt": -351.0}
     with pytest.raises(ToolError, match="corner must be"):
         d.picture_in_picture(1, corner="middle")
 
 
-def test_split_screen(project):
+def test_picture_in_picture_16x9_clip_in_a_vertical_timeline(project):
+    # measured on live 21.1: a 640x360 clip fitted into 1080x1920 is placed 1080x607.5, and Tilt moves it
+    # 607.5/1920 px per unit, so the corner offset in Tilt units is the pixel offset divided by that
+    tl = project.current
+    tl.settings.update(timelineResolutionWidth="1080", timelineResolutionHeight="1920")
+    d.append_clips(["a.mov"], track=2, start_frame=0, end_frame=49)
+    item = tl.tracks[("video", 2)][0]
+    item.media.props["Resolution"] = "640x360"
+    item.SetProperty = lambda k, v: item.props.__setitem__(k, v) or True
+    d.picture_in_picture(1, scale=0.3, corner="bottom_right")
+    # 324 x 182 px; right edge 43 px in, bottom edge 77 px up: 792 px down = 2503 Tilt units
+    assert item.props == {"Scaling": 2, "ZoomX": 0.3, "ZoomY": 0.3, "Pan": 334.8, "Tilt": -2503.3}
+
+
+def _split_items(project):
     d.append_clips(["a.mov"], track=2, start_frame=0, end_frame=49)
     d.append_clips(["b.mov"], start_frame=0, end_frame=49)
     left = project.current.tracks[("video", 2)][0]
     right = project.current.tracks[("video", 1)][0]
     for it in (left, right):
         it.SetProperty = (lambda i: lambda k, v: i.props.__setitem__(k, v) or True)(it)
+    return left, right
+
+
+def test_split_screen(project):
+    left, right = _split_items(project)
     d.split_screen(1, 1, gap=0.02)
-    # each clip keeps the middle half minus half the gap: crop 480 + 19.2 px per side, moved a quarter frame
-    assert left.props == {"CropLeft": 499.2, "CropRight": 499.2, "Pan": -480.0}
-    assert right.props == {"CropLeft": 499.2, "CropRight": 499.2, "Pan": 480.0}
+    # each clip keeps the middle 940.8 px of its 1920 px picture, centered on its half; 38.4 px gap in the middle
+    same = {"Scaling": 2, "ZoomX": 1.0, "ZoomY": 1.0, "CropLeft": 489.6, "CropRight": 489.6, "CropTop": 0.0,
+            "CropBottom": 0.0, "Tilt": 0.0}
+    assert left.props == {**same, "Pan": -489.6}
+    assert right.props == {**same, "Pan": 489.6}
+
+
+def test_split_screen_16x9_clips_in_a_vertical_timeline(project):
+    # measured on live 21.1: fitted 1080x607.5, zoomed 3.16 to cover a 540x1920 half. A timeline on project settings
+    # in a vertical project fills, so Crop counts pixels of the filled 3413x1920 picture: 3.16x the fitted ones
+    project.current.settings.update(timelineResolutionWidth="1080", timelineResolutionHeight="1920")
+    left, right = _split_items(project)
+    for it in (left, right):
+        it.media.props["Resolution"] = "640x360"
+    d.split_screen(1, 1)
+    same = {"Scaling": 2, "ZoomX": 3.1605, "ZoomY": 3.1605, "CropLeft": 1436.7, "CropRight": 1436.7, "CropTop": 0.0,
+            "CropBottom": 0.0, "Tilt": 0.0}
+    assert left.props == {**same, "Pan": -270.0}
+    assert right.props == {**same, "Pan": 270.0}
+    # with its own settings the timeline follows its mode (fit here), and Crop counts fitted pixels
+    project.current.settings.update(useCustomSettings="1", timelineInputResMismatchBehavior="scaleToFit")
+    d.split_screen(1, 1)
+    assert (left.props["CropLeft"], right.props["CropRight"]) == (454.6, 454.6)
 
 
 def test_vignette(project):
@@ -2724,7 +2772,7 @@ def test_save_list_apply_template(project, templates):
     out = d.apply_template("Episode Card", text="Episode 2")
     assert (out["item"], out["text"]) == (2, "Episode 2")
     new = project.current.tracks[("video", 1)][1]
-    assert [c.name for c in new.comps] == ["Episode Card"] and new.active_comp == "Episode Card"  # the default is gone
+    assert [c.name for c in new.comps] == ["Composition 1"]  # the title's own comp, replaced by the template
     assert d.list_titles()[1]["texts"] == {"Template": "Episode 2"}
 
 
@@ -2732,11 +2780,14 @@ def test_apply_template_to_clip(project, templates):
     a, b = _two_items(project)
     d.insert_fusion_effect(1, "Blur")
     d.save_template(1, "Soft")
+    d.insert_fusion_effect(2, "Blur")
     out = d.apply_template("Soft", item=2)
-    assert out["item"] == 2 and [c.name for c in b.comps] == ["Soft"] and b.active_comp == "Soft"
+    # a new comp holds the template and is active; the clip's own comp and its Blur are kept
+    assert out["item"] == 2 and [c.name for c in b.comps] == ["Composition 1", "Composition 2"]
+    assert b.active_comp == "Composition 2" and b.comps[0].FindTool("Blur1")
     with pytest.raises(ToolError, match="no Text\\+ node"):
         d.apply_template("Soft", item=2, text="x")
-    assert b.active_comp == "Soft 2"  # the second import, made active
+    assert b.active_comp == "Composition 3"  # the second import, in a comp of its own
     with pytest.raises(ToolError, match="template not found"):
         d.apply_template("Nope")
 
@@ -2756,27 +2807,6 @@ def test_batch_titles(project, templates):
 def test_animation_length_capped_at_a_third(project):
     out = d.animated_title("Long", animation="zoom", exit="none", speed=100)
     assert out["animation_frames"] == 40  # 120-frame title
-
-
-def test_apply_template_same_comp_name(project, templates, monkeypatch):
-    a, b = _two_items(project)
-    d.insert_fusion_effect(1, "Blur")
-    d.save_template(1, "Soft")
-    d.apply_template("Soft", item=2)
-    Item = type(b)
-    real = Item.ImportFusionComp
-
-    def same_name(self, path):  # a build that repeats the name instead of numbering it
-        comp = real(self, path)
-        comp.name = "Soft"
-        return comp
-
-    monkeypatch.setattr(Item, "ImportFusionComp", same_name)
-    loaded = []
-    monkeypatch.setattr(Item, "LoadFusionCompByName", lambda self, n: loaded.append(n) or True)
-    d.apply_template("Soft", item=2)
-    assert loaded == ["Soft"] and [c.name for c in b.comps][-1] == "Soft"
-
 
 
 # --- automatic color correction ---
@@ -2838,6 +2868,15 @@ def test_auto_color_converges(project, resolve, gamma):
     assert row["error"] < 0.02 and row["iterations"] <= 4
     assert "warm cast" in row["before"]["verdict"] and row["after"]["verdict"] == ["balanced"]
     assert a.cdl["NodeIndex"] == "1" and resolve.page == "edit"
+
+
+def test_solve_channel_too_flat_to_stretch_fully():
+    # live 21.1, red of a flat warm frame: reaching 0.03-0.94 needs slope 5. With slope capped at 4, an offset solved
+    # for the uncapped slope and clamped on its own mapped the black point to 0.992: the channel turned inside out
+    lb, lw = 0.3686, 0.549
+    s, o, p = d._solve_channel(lb, lw, 0.3818, 0.03, 0.94, 0.42, 1.0)
+    black, white = d._cdl_apply(lb, s, o, p), d._cdl_apply(lw, s, o, p)
+    assert black < lb and white > lw  # stretched both ways, as far as the limits allow
 
 
 def test_auto_color_strength_and_parts(project):
@@ -3062,3 +3101,24 @@ def test_clean_bins_keeps_the_bin_itself(project):
     project.pool.root.subfolders.append(Folder("Empty"))
     assert d.clean_bins("Empty") == {"deleted": []}
     assert "Empty" in [f.name for f in project.pool.root.subfolders]
+
+
+def test_linsolve():
+    assert d._linsolve([[2, 1, 0], [1, 3, 1], [0, 1, 4]], [3, 5, 5]) == pytest.approx([1, 1, 1])
+    assert d._linsolve([[1, 2], [2, 4]], [1, 2]) is None  # singular
+
+
+def test_levenberg_sees_through_a_channel_mixing_display():
+    # a display that mixes channels (as color management does): each output channel takes 20% of the others, which
+    # the per-channel model cannot describe; the model-free refinement must still reach the goal
+    def display(cdl):
+        levels = {}
+        for key, scene in (("black", 0.2), ("white", 0.8), ("neutral", 0.5)):  # a goal within the CDL limits
+            raw = [min(1.0, max(0.0, scene * cdl[0][c] + cdl[1][c])) ** cdl[2][c] for c in range(3)]
+            levels[key] = [0.6 * raw[c] + 0.2 * raw[(c + 1) % 3] + 0.2 * raw[(c + 2) % 3] for c in range(3)]
+        return {**levels, "crushed_share": [0.0] * 3, "clipped_share": [0.0] * 3}
+
+    goal = {"black": [0.05] * 3, "white": [0.9] * 3, "neutral": [0.4, 0.42, 0.44], "mid": None, "cast": None}
+    identity = ([1.0] * 3, [0.0] * 3, [1.0] * 3)
+    (cdl, st), used = d._levenberg(display, identity, display(identity), goal, budget=48)
+    assert d._error(st, goal) < 0.015 and used <= 48

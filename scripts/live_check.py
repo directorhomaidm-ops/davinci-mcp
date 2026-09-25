@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=2"]
+# dependencies = ["mcp>=2", "pillow"]
 # ///
 """Check davinci-mcp's tools against a running DaVinci Resolve and write a report.
 
@@ -10,7 +10,8 @@ Run from the repository root, with Resolve open:
 
 What it touches:
 - The project open in Resolve is SAVED (as the server does before switching projects), then left alone.
-- A scratch project "davinci-mcp live check <time>" is created, used, and deleted at the end.
+- A scratch project "davinci-mcp live check <time>" is created and used. Resolve will not delete a project opened
+  since it was launched, so delete it by hand after restarting Resolve.
 - Test media (PNG image sequences and a WAV tone, generated here) and all outputs go to a new folder,
   printed at the start and kept, with report.md / report.json inside.
 Studio-only calls (stabilize, voice isolation, Dolby Vision, Super Scale, Speed Warp, transcription) run on
@@ -170,7 +171,13 @@ def main():
         print("\nCleaning up")
         if original and original != d.UNTITLED:
             step("cleanup: reopen your project", lambda: d.open_project(original))
-            step("cleanup: delete the scratch project", lambda: d.delete_project(scratch))
+            try:
+                d.delete_project(scratch)
+                RESULTS.append({"check": "cleanup", "status": "PASS", "detail": f"deleted {scratch}"})
+            except d.ToolError:  # Resolve keeps every project opened this session; not a davinci-mcp failure
+                RESULTS.append({"check": "cleanup", "status": "SKIP",
+                                "detail": f"Resolve will not delete {scratch!r} until it is restarted; delete it then"})
+                print(f"  SKIP  cleanup: delete {scratch!r} by hand after restarting Resolve")
         else:
             RESULTS.append({"check": "cleanup", "status": "SKIP",
                             "detail": f"no named project was open before; delete {scratch!r} by hand"})
@@ -195,8 +202,8 @@ def run_checks(args, work, is_211):
 
     print("\nEdit")
     step("edit: create_timeline", lambda: d.create_timeline("Check"))
-    appended = step("edit: append_clips subclips 0-23 (leaves handles)",
-                    lambda: d.append_clips(seq, start_frame=0, end_frame=23), needs=have_media)
+    appended = step("edit: append_clips subclips 12-35 (handles on both sides for transitions)",
+                    lambda: d.append_clips(seq, start_frame=12, end_frame=35), needs=have_media)
     if wav:
         step("edit: append wav", lambda: d.append_clips([wav]))
     ov = step("edit: timeline_overview", d.timeline_overview)
@@ -279,9 +286,12 @@ def run_checks(args, work, is_211):
          note="confirms EllipseMask Width/Height/SoftEdge/Invert and BrightnessContrast Gain")
     step("vfx: camera_shake on item 2", lambda: d.camera_shake(2, amount=0.01), needs=have_items)
     step("vfx: view_frame after vignette + shake", lambda: _frame(work / "frame_vfx.png"), needs=have_items)
-    step("vfx: picture_in_picture (clip on V2, bottom right)", lambda: (_pip(seq), _frame(work / "frame_pip.png"))[0],
+    step("vfx: picture_in_picture (clip on V2, bottom right)", lambda: _pip(seq, work),
          needs=have_media,
          note="check frame_pip.png: the small picture must sit bottom right (confirms the Tilt direction)")
+
+    step("vfx: split_screen red left, blue right, 2% gap", lambda: _split(seq, work),
+         needs=have_media, note="each clip must fill its half of the frame, whatever the clip's shape")
 
     print("\nTitles and subtitles")
     step("titles: insert Text+ and set_title_text (text, font, style, size, color)", lambda: _title(),
@@ -363,8 +373,11 @@ def run_checks(args, work, is_211):
     step("color auto: analyze_color sees the warm flat picture", lambda: _expect_verdict(1, "warm cast"),
          needs=need_ramps)
     step("color auto: auto_color item 1", lambda: _auto_color(work), needs=need_ramps,
-         note="display_exponent shows the curve color management adds; error under 0.03 is a pass")
+         note="on a YRGB timeline; error under 0.03 is a pass")
     step("color auto: shot_match item 2 to item 1", lambda: _shot_match(), needs=need_ramps)
+    step("color auto: probe: auto_color and shot_match under automatic color management", lambda: _color_managed(),
+         needs=need_ramps, note="informational: improves but may not reach 0.03 (CDL on log values, channels mixed "
+         "and saturated colors gamut-clipped by the output transform); tracks the error")
 
     print("\nMedia organization")
     step("organize: Type strings Resolve reports", lambda: _types(), note="the type grouping reads these")
@@ -465,6 +478,10 @@ def _color_check_timeline(work):
     d.create_timeline("Color Check")
     d.switch_timeline("Color Check")
     d.append_clips([n for n in names if n.startswith("warmflat")] + [n for n in names if n.startswith("cooldark")])
+    for i in (1, 2):  # the whole ramp in any frame shape: a vertical project fills and shows only its middle sixth
+        d.set_item_properties(i, {"Scaling": "stretch"})
+    # not color managed: the CDL loop's model holds there (the managed case is probed separately below)
+    d.apply_color_preset("yrgb", timeline=True)
     return names
 
 
@@ -481,6 +498,18 @@ def _auto_color(work):
     d.view_frame(frame=row["frame"], save_to=str(work / "frame_auto_color.png"))
     expect(row["error"] < 0.03, f"did not converge: {row}")
     return row
+
+
+def _color_managed():
+    d.switch_timeline("Color Check")
+    d.apply_color_preset("rcm_sdr", timeline=True)
+    try:
+        auto = d.auto_color([1])[0]
+        match = d.shot_match(1, [2])["matched"][0]
+    finally:
+        d.apply_color_preset("yrgb", timeline=True)
+    return {"auto_color_error": auto["error"], "shot_match_error": match["error"],
+            "auto_after": auto["after"]["verdict"], "match_after": match["after"]["verdict"]}
 
 
 def _shot_match():
@@ -542,10 +571,53 @@ def _transcript_cut(clip):
     return {"first_words": t["segments"][0].get("words", [])[:4], "cut": out}
 
 
-def _pip(seq):
-    d.append_clips([seq[0]], track=2, start_frame=0, end_frame=23)
+def _pip(seq, work):
+    d.append_clips([seq[1]], track=2, start_frame=0, end_frame=23)  # red over the blue clip on V1
     out = d.picture_in_picture(1, scale=0.3, corner="bottom_right", track=2)
-    return out
+    # look at the frame under the new clip, not wherever the playhead is
+    d.view_frame(frame=d.list_items(track=2)[0]["start"] + 12, save_to=str(work / "frame_pip.png"))
+    (w, h), box = _still_box(work / "frame_pip.png", RED)
+    expect(box, "no red picture-in-picture visible in frame_pip.png")
+    expect(box[0] > w / 2 and box[2] > h / 2 and box[1] < w and box[3] < h,
+           f"picture-in-picture not inside the bottom-right quarter of {w}x{h}: x {box[:2]}, y {box[2:]}")
+    return {**out, "red_box": box}
+
+
+RED = lambda p: p[0] > 150 and p[2] < 120  # noqa: E731 - the test media's red (200, 30, 30)
+BLUE = lambda p: p[2] > 150 and p[0] < 120  # noqa: E731 - and blue (30, 60, 200), as graded
+
+
+def _still_box(path, match):
+    """Re-export the current frame after a pause (the first still after a playhead move can be stale) and return
+    ((width, height), (x0, x1, y0, y1)) of the pixels `match` accepts, or None for the box."""
+    time.sleep(2)
+    d.view_frame(save_to=str(path))
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
+    w, h = im.size
+    px = im.load()
+    pts = [(x, y) for x in range(0, w, 4) for y in range(0, h, 4) if match(px[x, y])]
+    if not pts:
+        return (w, h), None
+    return (w, h), (min(x for x, _ in pts), max(x for x, _ in pts) + 4, min(y for _, y in pts), max(y for _, y in pts) + 4)
+
+
+def _split(seq, work):
+    """Red (V2) left, blue (V1) right, on a fresh timeline so earlier checks' effects do not interfere."""
+    d.create_timeline("Split")
+    d.append_clips([seq[0]], start_frame=0, end_frame=23)  # blue on V1
+    d.append_clips([seq[1]], track=2, start_frame=0, end_frame=23)  # red on V2
+    out = d.split_screen(1, 1, gap=0.02)
+    d.view_frame(frame=d.list_items()[0]["start"] + 12, save_to=str(work / "frame_split.png"))
+    (w, h), red = _still_box(work / "frame_split.png", RED)
+    _, blue = _still_box(work / "frame_split.png", BLUE)
+    d.switch_timeline("Check")
+    cell = w * 0.98 / 2
+    expect(red and blue, f"a half is missing: red {red}, blue {blue}")
+    for name, box, x0 in (("red", red, 0), ("blue", blue, w - cell)):
+        expect(abs(box[0] - x0) <= 8 and abs(box[1] - (x0 + cell)) <= 8 and box[2] <= 8 and box[3] >= h - 8,
+               f"{name} half is at x {box[:2]}, y {box[2:]}; wanted x ({x0:.0f}, {x0 + cell:.0f}), full height {h}")
+    return {"half_width": out["half_width"], "red": red, "blue": blue}
 
 
 def _letterbox(work):

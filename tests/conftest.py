@@ -437,17 +437,17 @@ class Item:
     def AddFusionComp(self):
         comp = FuComp(f"Composition {len(self.comps) + 1}")
         self.comps.append(comp)
+        self.active_comp = comp.name  # measured: the new comp becomes the active one
         return comp
 
     def ImportFusionComp(self, path):
-        if not path.endswith(".comp") or not Path(path).exists():
+        # measured on live 21.1: replaces the active comp's contents, keeping its name, and adds no comp
+        if not path.endswith(".comp") or not Path(path).exists() or not self.comps:
             return None
-        name = Path(path).stem
-        taken = [c.name for c in self.comps]
-        name = name if name not in taken else f"{name} {len(taken) + 1}"  # assumed: Resolve keeps names unique
-        comp = FuComp(name, template="TextPlus" in Path(path).read_text())
-        self.comps.append(comp)
-        return comp
+        active = getattr(self, "active_comp", None)
+        i = next((i for i, c in enumerate(self.comps) if c.name == active), len(self.comps) - 1)
+        self.comps[i] = FuComp(self.comps[i].name, template="TextPlus" in Path(path).read_text())
+        return self.comps[i]
 
     def ExportFusionComp(self, path, index):
         self.exported_comp = (path, index)

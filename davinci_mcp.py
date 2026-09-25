@@ -389,7 +389,8 @@ def append_clips(
     names: list[str], start_frame: int | None = None, end_frame: int | None = None, track: int = 1
 ) -> str:
     """Append media-pool clips (by name, in order) to the end of the current timeline.
-    start_frame/end_frame (clip-relative, both inclusive) make a subclip of each clip."""
+    start_frame/end_frame (counted from the clip's first frame, both inclusive) make a subclip of each clip.
+    On a track other than 1 only the video is placed."""
     proj, tl = _timeline()
     pool = proj.GetMediaPool()
     by_name = _clips_by_name(proj)
@@ -404,20 +405,19 @@ def append_clips(
     if start_frame is None and end_frame is None:
         ok = pool.AppendToTimeline(clips)
     else:
-        # endFrame is exclusive: live Resolve 21.1 made 23-frame items from startFrame 0, endFrame 23.
-        infos = [
-            {
-                "mediaPoolItem": c,
-                "startFrame": start_frame or 0,
-                "endFrame": end_frame + 1 if end_frame is not None else int(float(c.GetClipProperty("Frames") or 0)),
-            }
-            for c in clips
-        ]
-        # Only pass trackIndex when asked: appends carrying it were measured to read back fine but render almost
-        # nothing on live Resolve 21.0.4, while Blackmagic's own example (no trackIndex) renders normally.
+        # Resolve counts startFrame/endFrame in the clip's own frame numbers (image sequences start at 1, so
+        # startFrame 0 adds a blank frame) and endFrame is exclusive (live 21.1).
+        def info(c):
+            first = int(float(c.GetClipProperty("Start") or 0))
+            last = end_frame if end_frame is not None else int(float(c.GetClipProperty("Frames") or 0)) - 1
+            return {"mediaPoolItem": c, "startFrame": first + (start_frame or 0), "endFrame": first + last + 1}
+
+        infos = [info(c) for c in clips]
+        # Only pass trackIndex when asked, and then with mediaType 1 (video only): a trackIndex append without it
+        # reads back fine but renders black (live 21.0.4 and 21.1), while Blackmagic's example (neither) renders.
         if track != 1:
-            for info in infos:
-                info["trackIndex"] = track
+            for entry in infos:
+                entry.update(trackIndex=track, mediaType=1)
         ok = pool.AppendToTimeline(infos)
     if not ok:
         raise ToolError("append failed")
@@ -992,14 +992,15 @@ def fusion_comps(item: int, track: int = 1) -> list[str]:
 
 @_tool
 def add_fusion_comp(item: int, import_path: str | None = None, track: int = 1) -> dict:
-    """Add a Fusion composition to a video item: empty (MediaIn → MediaOut), or imported from a .comp file."""
+    """Add a Fusion composition to a video item: empty (MediaIn → MediaOut), or imported from a .comp file. The new
+    comp becomes the active one; existing comps are kept."""
     _, tl = _timeline()
     it = _item(tl, item, track)
     if import_path:
         import_path = os.path.abspath(import_path)
         if not os.path.exists(import_path):
             raise ToolError(f"file not found: {import_path}")
-        comp = it.ImportFusionComp(import_path)
+        comp = _apply_comp(it, import_path, fresh=False)
     else:
         comp = it.AddFusionComp()
     if not comp:
@@ -2474,7 +2475,8 @@ def delete_project(name: str) -> str:
         raise ToolError(f"project not found in the current folder: {name} (see project_browser)")
     # The first attempt is flaky on live Resolve; one retry.
     if not (pm.DeleteProject(name) or pm.DeleteProject(name)):
-        raise ToolError(f"Resolve refused to delete {name} (it may still be held from being open earlier)")
+        raise ToolError(f"Resolve refused to delete {name}: it will not delete a project opened since it was launched; "
+                        "restart Resolve and delete it then")
     return f"deleted project {name}"
 
 
@@ -3739,11 +3741,38 @@ PIP_CORNERS = {"top_right": (1, 1), "top_left": (-1, 1), "bottom_right": (1, -1)
                "center": (0, 0)}
 
 
+def _placed_size(it, w, h, mode="scaleToFit"):
+    """Size in timeline pixels at which Resolve places an item's source for an input-mismatch `mode`, before Zoom.
+    Measured on live 21.1: Zoom scales the size the item's own Scaling gives, Pan/Tilt move the picture (that width /
+    timeline width) and (that height / timeline height) pixels per unit, and Crop counts pixels of the picture as the
+    timeline's own mode places it (see _timeline_mode)."""
+    try:
+        sw, sh = (int(v) for v in str(it.GetMediaPoolItem().GetClipProperty("Resolution")).split("x"))
+    except (AttributeError, TypeError, ValueError):
+        return w, h  # ponytail: no readable source size (titles, generators); treat it as frame-sized
+    if mode == "stretch":
+        return w, h
+    if mode == "centerCrop":
+        return sw, sh
+    fit = (max if mode == "scaleToCrop" else min)(w / sw, h / sh)
+    return sw * fit, sh * fit
+
+
+def _timeline_mode(proj, tl, w, h):
+    """The input-mismatch mode Resolve actually uses on a timeline. Live 21.1: a timeline on project settings in a
+    vertical project fills (scaleToCrop) whatever timelineInputResMismatchBehavior says; landscape projects and
+    timelines with their own settings follow the setting."""
+    if str(tl.GetSetting("useCustomSettings")) != "1" and h > w:
+        return "scaleToCrop"  # ponytail: measured on 21.1 only; re-measure if Resolve fixes the vertical case
+    return tl.GetSetting("timelineInputResMismatchBehavior") or proj.GetSetting("timelineInputResMismatchBehavior")
+
+
 @_tool
 def picture_in_picture(item: int, scale: float = 0.35, corner: str = "top_right", margin: float = 0.04,
                        track: int = 2) -> dict:
-    """Shrink a clip on an upper track into a corner over the picture below: scale 0.05-1 of full frame, corner
-    top_right, top_left, bottom_right, bottom_left or center, margin as a fraction of the frame. Uses the clip's
+    """Shrink a clip on an upper track into a corner over the picture below: the whole clip fits in `scale` (0.05-1)
+    of the frame, corner top_right, top_left, bottom_right, bottom_left or center, margin as a fraction of the frame.
+    Works when the clip's shape differs from the timeline's (e.g. 16:9 in a vertical timeline). Uses the clip's
     Edit-page Zoom and Position, so it can be adjusted in the Inspector afterwards."""
     if not 0.05 <= scale <= 1:
         raise ToolError("scale must be 0.05-1")
@@ -3754,31 +3783,44 @@ def picture_in_picture(item: int, scale: float = 0.35, corner: str = "top_right"
         raise ToolError(f"corner must be one of: {', '.join(PIP_CORNERS)}")
     _, tl = _timeline()
     w, h = _resolution(tl)
-    pan = sx * (w * (1 - scale) / 2 - margin * w)
-    tilt = sy * (h * (1 - scale) / 2 - margin * h)
-    props = {"ZoomX": scale, "ZoomY": scale, "Pan": round(pan, 1), "Tilt": round(tilt, 1)}
+    # The clip's own Scaling is set to fit: a timeline on project settings can fill even when its mismatch setting
+    # reads scaleToFit (live 21.1), so the placed size is only known once the clip says fit.
+    pw, ph = _placed_size(_item(tl, item, track), w, h)
+    zoom = scale * min(w / pw, h / ph)  # the whole picture inside scale x the frame
+    x = sx * (w / 2 - pw * zoom / 2 - margin * w)  # screen pixels from the center, up positive
+    y = sy * (h / 2 - ph * zoom / 2 - margin * h)
+    props = {"Scaling": "fit", "ZoomX": round(zoom, 4), "ZoomY": round(zoom, 4), "Pan": round(x * w / pw, 1),
+             "Tilt": round(y * h / ph, 1)}
     return set_item_properties(item, props, track=track)
 
 
 @_tool
 def split_screen(left: int, right: int, left_track: int = 2, right_track: int = 1, gap: float = 0.0) -> dict:
-    """Show two clips side by side: `left` (on left_track) and `right` (on right_track), each cropped to half the
-    frame width and moved to its half, with an optional `gap` (fraction of the frame width) between them. Put the two
-    clips on different tracks at the same time. Uses Edit-page Crop and Position."""
+    """Show two clips side by side: `left` (on left_track) and `right` (on right_track), each filling its half of the
+    frame (zoomed to cover it and cropped around the picture's center), with an optional `gap` (fraction of the frame
+    width) between them. Works when a clip's shape differs from the timeline's. Put the two clips on different tracks
+    at the same time. Uses Edit-page Scaling, Zoom, Crop and Position."""
     if not 0 <= gap < 0.5:
         raise ToolError("gap must be 0-0.5")
-    _, tl = _timeline()
-    w, _ = _resolution(tl)
-    half = w / 2
-    crop = w / 4 + gap * w / 2  # a quarter of the picture off each side, plus half the gap on each clip
-    shift = round(w / 4, 1)
-    out = {
-        "left": set_item_properties(left, {"CropLeft": round(crop, 1), "CropRight": round(crop, 1), "Pan": -shift},
-                                    track=left_track),
-        "right": set_item_properties(right, {"CropLeft": round(crop, 1), "CropRight": round(crop, 1), "Pan": shift},
-                                     track=right_track),
-    }
-    return {"half_width": half, **out}
+    proj, tl = _timeline()
+    w, h = _resolution(tl)
+    cell = w * (1 - gap) / 2  # each clip's width on screen
+    mode = _timeline_mode(proj, tl, w, h)
+
+    def place(index, track, side):
+        it = _item(tl, index, track)
+        pw, ph = _placed_size(it, w, h)  # the clip is set to fit
+        tw, th = _placed_size(it, w, h, mode)  # what Crop counts in
+        zoom = max(cell / pw, h / ph)  # cover the cell
+        crop_x = max(0.0, (pw * zoom - cell) / 2 / zoom * tw / pw)
+        crop_y = max(0.0, (ph * zoom - h) / 2 / zoom * th / ph)
+        props = {"Scaling": "fit", "ZoomX": round(zoom, 4), "ZoomY": round(zoom, 4),
+                 "CropLeft": round(crop_x, 1), "CropRight": round(crop_x, 1),
+                 "CropTop": round(crop_y, 1), "CropBottom": round(crop_y, 1),
+                 "Pan": round(side * (w - cell) / 2 * w / pw, 1), "Tilt": 0.0}
+        return set_item_properties(index, props, track=track)
+
+    return {"half_width": round(cell, 1), "left": place(left, left_track, -1), "right": place(right, right_track, 1)}
 
 
 @_tool
@@ -4703,21 +4745,15 @@ def list_templates() -> dict:
 
 
 def _apply_comp(it, path, fresh):
-    """Import a template comp into an item and make it the active one; on a fresh title, drop the default comp so
-    the template is comp 1. Returns the imported comp."""
-    before = list(it.GetFusionCompNameList() or [])
+    """Import a template comp into an item as its active composition. Returns the imported comp. Live 21.1:
+    ImportFusionComp replaces the ACTIVE comp's contents (keeping its name) and adds no comp, so a fresh title's own
+    comp is simply replaced, while an item first gets a new comp (AddFusionComp makes it active) to keep its current
+    one and its effects."""
+    if not fresh and not it.AddFusionComp():
+        raise ToolError(f"could not add a Fusion composition to '{it.GetName()}'")
     comp = it.ImportFusionComp(path)
     if not comp:
         raise ToolError(f"ImportFusionComp failed for {path}")
-    after = list(it.GetFusionCompNameList() or [])
-    if len(after) <= len(before):
-        raise ToolError(f"ImportFusionComp reported success but {it.GetName()} has no new composition")
-    new = [c for c in after if c not in before] or after[-1:]  # a repeated name: the newest comp is last
-    if not it.LoadFusionCompByName(new[0]):
-        raise ToolError(f"imported {os.path.basename(path)} but could not make it the active composition")
-    if fresh:
-        for old in before:
-            it.DeleteFusionCompByName(old)
     return comp
 
 
@@ -4852,10 +4888,20 @@ def _pct(values, q):
 
 def _frame_stats(px):
     n = len(px)
-    chans = [sorted(p[c] for p in px) for c in range(3)]
+    # Black and white points ignore colored clips (one channel clipped while another is clearly not): those are out
+    # of the display's gamut, not levels. Under color management a saturated area clips that way (live 21.1: a
+    # quarter of a frame at G = B = 0), which pinned the per-channel black points at 0 whatever the CDL did.
+    levels = [p for p in px if not (min(p) <= 0.005 < 0.1 <= max(p) or max(p) >= 0.995 > 0.9 >= min(p))]
+    levels = levels if len(levels) >= n // 2 else px
+    chans = [sorted(p[c] for p in levels) for c in range(3)]
     luma = [0.2126 * r + 0.7152 * g + 0.0722 * b for r, g, b in px]
-    neutral = [p for p, y in zip(px, luma) if max(p) - min(p) < 0.12 and 0.15 < y < 0.85]
-    ref = neutral if len(neutral) >= max(50, n // 50) else px
+    # Neutral areas as a weighted mean: full weight below 0.06 saturation fading to none at 0.24, and away from the
+    # luma extremes. A hard cut let pixels jump in and out as a correction changed them, so the measurement jumped
+    # too and the refinement's Jacobian described nothing (live 21.1).
+    weights = [max(0.0, min(1.0, (0.24 - (max(p) - min(p))) / 0.18)) * max(0.0, min(1.0, (y - 0.1) / 0.1,
+               (0.9 - y) / 0.1)) for p, y in zip(px, luma)]
+    total = math.fsum(weights)
+    neutral_ok = total >= max(50, n // 50) / 2
     ys = sorted(luma)
     r4 = lambda v: round(v, 4)  # noqa: E731
     return {
@@ -4864,11 +4910,15 @@ def _frame_stats(px):
         "mean": [r4(math.fsum(c) / n) for c in chans],
         "luma": {"p1": r4(_pct(ys, 0.01)), "median": r4(_pct(ys, 0.5)), "p99": r4(_pct(ys, 0.99)),
                  "mean": r4(math.fsum(ys) / n)},
-        "neutral": [r4(math.fsum(p[c] for p in ref) / len(ref)) for c in range(3)],
-        "neutral_from": "neutral areas" if ref is neutral else "whole frame",
+        "neutral": [r4(math.fsum(w * p[c] for w, p in zip(weights, px)) / total if neutral_ok
+                       else math.fsum(p[c] for p in px) / n) for c in range(3)],
+        "neutral_from": "neutral areas" if neutral_ok else "whole frame",
         "saturation": r4(math.fsum(max(p) - min(p) for p in px) / n),
         "clipped_pct": round(100 * sum(max(p) >= 0.995 for p in px) / n, 2),
         "crushed_pct": round(100 * sum(min(p) <= 0.005 for p in px) / n, 2),
+        # per channel, among the pixels the black and white points come from: how many sit at 0 and at 1
+        "crushed_share": [r4(sum(p[c] <= 0.005 for p in levels) / len(levels)) for c in range(3)],
+        "clipped_share": [r4(sum(p[c] >= 0.995 for p in levels) / len(levels)) for c in range(3)],
         "pixels_sampled": n,
     }
 
@@ -4939,8 +4989,10 @@ def _solve_channel(lb, lw, ln, tb, tw, tn, g):
         a, b = max(0.0, tb) ** (g / p), max(0.0, tw) ** (g / p)
         if lw - lb < 1e-3:
             return 1.0, 0.0
-        s_ = (b - a) / (lw - lb)
-        return s_, a - lb * s_
+        # Beyond the slope limit, stretch as far as allowed around the middle of the range: an offset solved for
+        # the unclamped slope (and clamped on its own) sent a flat picture's black point to white (live 21.1).
+        s_ = _clampv("slope", (b - a) / (lw - lb))
+        return s_, _clampv("offset", (a + b) / 2 - s_ * (lb + lw) / 2)
 
     def resid(p):
         s_, o_ = lin_for(p)
@@ -4961,7 +5013,7 @@ def _solve_channel(lb, lw, ln, tb, tw, tn, g):
             p = (p0 + p1) / 2
             break
     s_, o_ = lin_for(p)
-    return _clampv("slope", s_), _clampv("offset", o_), p
+    return s_, o_, p
 
 
 def _fit_display(base, hist):
@@ -5000,47 +5052,155 @@ def _refine(base, tn, goal, g):
     return out
 
 
-def _error(st, goal):
-    errs = [abs(st["black"][c] - goal["black"][c]) for c in range(3)]
-    errs += [abs(st["white"][c] - goal["white"][c]) for c in range(3)]
+def _residuals(st, goal):
+    """Signed misses of a measurement against the goal: black and white points, then the neutral color (shot match)
+    or the brightness and the cast still allowed (auto)."""
+    # A clipped black or white point reads 0 or 1 however far past it the picture is, which gives the refinement
+    # nothing to follow (live 21.1: S-Log3-decoded frames clipped a third of their pixels). When the goal is not
+    # clipped itself, the share of pixels at the clip is added to the miss: it shrinks as the level comes back.
+    res = [st["black"][c] - goal["black"][c]
+           - (st["crushed_share"][c] if st["black"][c] <= 0.005 < goal["black"][c] else 0.0) for c in range(3)]
+    res += [st["white"][c] - goal["white"][c]
+            + (st["clipped_share"][c] if st["white"][c] >= 0.995 > goal["white"][c] else 0.0) for c in range(3)]
     if goal["neutral"] is not None:
-        errs += [abs(st["neutral"][c] - goal["neutral"][c]) for c in range(3)]
+        res += [st["neutral"][c] - goal["neutral"][c] for c in range(3)]
     else:
-        errs.append(abs(st["luma"]["mean"] - goal["mid"]))
+        res.append(st["luma"]["mean"] - goal["mid"])
         if goal["cast"] is not None:
             gray = sum(st["neutral"]) / 3
-            errs += [abs((st["neutral"][c] - gray) - goal["cast"][c]) for c in range(3)]
-    return max(errs)
+            res += [(st["neutral"][c] - gray) - goal["cast"][c] for c in range(3)]
+    return res
+
+
+def _error(st, goal):
+    return max(abs(r) for r in _residuals(st, goal))
+
+
+def _linsolve(a, b):
+    """x with a x = b for a small square system (Gaussian elimination, partial pivoting); None if singular."""
+    n = len(b)
+    m = [list(row) + [v] for row, v in zip(a, b)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(m[r][col]))
+        if abs(m[piv][col]) < 1e-12:
+            return None
+        m[col], m[piv] = m[piv], m[col]
+        for r in range(col + 1, n):
+            f = m[r][col] / m[col][col]
+            for k in range(col, n + 1):
+                m[r][k] -= f * m[col][k]
+    x = [0.0] * n
+    for r in range(n - 1, -1, -1):
+        x[r] = (m[r][n] - sum(m[r][k] * x[k] for k in range(r + 1, n))) / m[r][r]
+    return x
+
+
+CDL_KINDS = ("slope",) * 3 + ("offset",) * 3 + ("power",) * 3
+CDL_STEPS = (0.1,) * 3 + (0.03,) * 3 + (0.1,) * 3  # finite-difference steps: several 8-bit code values of change
+
+
+def _levenberg(try_cdl, cdl, st, goal, budget):
+    """Model-free refinement for when the display transform defeats the model (color management: the CDL acts on
+    log values and the output transform mixes channels). Levenberg-Marquardt over the 9 CDL values on the measured
+    misses: a finite-difference Jacobian (9 measurements), Broyden updates after accepted steps, more damping and a
+    retry after a worse one. try_cdl(cdl) applies and measures. Returns the (cdl, stats) with the
+    smallest largest miss measured, and the measurements used."""
+    x = list(cdl[0]) + list(cdl[1]) + list(cdl[2])
+    r = _residuals(st, goal)
+    best = (max(abs(e) for e in r), cdl, st)
+    clamp = lambda v: [_clampv(k, xi) for k, xi in zip(CDL_KINDS, v)]  # noqa: E731
+    as_cdl = lambda v: (v[0:3], v[3:6], v[6:9])  # noqa: E731
+    sq = lambda v: math.fsum(e * e for e in v)  # noqa: E731
+    jac, lam, used = None, 0.1, 0
+    while used < budget and max(abs(e) for e in r) >= 0.015:
+        if jac is None:
+            if used + len(x) > budget:
+                break
+            cols = []
+            for i, h in enumerate(CDL_STEPS):
+                xp = list(x)
+                xp[i] = x[i] + h if _clampv(CDL_KINDS[i], x[i] + h) == x[i] + h else x[i] - h
+                rp = _residuals(try_cdl(as_cdl(xp)), goal)
+                used += 1
+                cols.append([(a - b) / (xp[i] - x[i]) for a, b in zip(rp, r)])
+            jac = [[cols[j][i] for j in range(len(x))] for i in range(len(r))]  # rows: misses, columns: CDL values
+        jtj = [[math.fsum(jac[k][i] * jac[k][j] for k in range(len(r))) for j in range(len(x))] for i in range(len(x))]
+        jtr = [math.fsum(jac[k][i] * r[k] for k in range(len(r))) for i in range(len(x))]
+        for i in range(len(x)):
+            jtj[i][i] += lam * (jtj[i][i] + 1e-6)
+        step = _linsolve(jtj, [-v for v in jtr])
+        if step is None:
+            break
+        xn = clamp([a + b for a, b in zip(x, step)])
+        stn = try_cdl(as_cdl(xn))
+        used += 1
+        rn = _residuals(stn, goal)
+        if max(abs(e) for e in rn) < best[0]:  # judged, like the result, by the largest miss
+            best = (max(abs(e) for e in rn), as_cdl(xn), stn)
+        if sq(rn) < sq(r):
+            dx = [a - b for a, b in zip(xn, x)]
+            dd = math.fsum(v * v for v in dx)
+            if dd > 1e-12:  # Broyden: make the Jacobian explain the step just taken
+                pred = [math.fsum(jac[k][j] * dx[j] for j in range(len(x))) for k in range(len(r))]
+                for k in range(len(r)):
+                    u = (rn[k] - r[k] - pred[k]) / dd
+                    for j in range(len(x)):
+                        jac[k][j] += u * dx[j]
+            x, r, st, lam = xn, rn, stn, max(1e-4, lam / 3)
+        else:
+            lam *= 4
+            if lam > 1e2:  # the Jacobian no longer describes this spot: measure it again
+                jac, lam = None, 0.1
+    return best[1:], used
 
 
 def _correct(proj, tl, index, it, node, goal_of, iterations, track):
     """Closed loop on one item: reset the node's CDL, measure, then solve, apply and re-measure until the goal is
     met or iterations run out, refitting the display response from every measurement. goal_of(first_stats) gives
-    the absolute targets. Returns the report row."""
+    the absolute targets. The fitted model is exact for a gamma-like display and converges in about two steps; when
+    it has not met the goal (color management, live 21.1), _levenberg continues from the best result. The best
+    measured CDL is the one left on the node. Returns the report row."""
     identity = ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
     set_cdl(index, *identity, node=node, track=track)
     frame = _mid_frame(it)
     before = _measure(proj, tl, frame)
     goal = goal_of(before)
+
+    def try_cdl(c):
+        set_cdl(index, *c, node=node, track=track)
+        return _measure(proj, tl, frame)
+
     cdl, st, hist, g, steps = identity, before, [], 1.0, 0
+    best = (identity, before)
     tn = _neutral_goal(before, goal)
     for steps in range(1, iterations + 1):
         if hist:  # integral feedback: move the model's neutral target by what the measurement still misses
             want = _neutral_goal(st, goal)
             tn = [min(0.97, max(0.03, t + w - n)) for t, w, n in zip(tn, want, st["neutral"])]
         cdl = _refine(before, tn, goal, g)
-        set_cdl(index, *cdl, node=node, track=track)
-        st = _measure(proj, tl, frame)
+        st = try_cdl(cdl)
         hist.append((cdl, st))
+        if _error(st, goal) < _error(best[1], goal):
+            best = (cdl, st)
+        elif not _error(st, goal) < 0.015:  # worse than before: the model does not describe this display
+            break
         if _error(st, goal) < 0.015:  # about 4 code values of 8-bit
             break
         g = _fit_display(before, hist)
+    refined = 0
+    if _error(best[1], goal) >= 0.015:
+        # ponytail: fixed budget of 48 measurements (~25 s on live 21.1); raise it if hard frames need more
+        best, refined = _levenberg(try_cdl, *best, goal, budget=48)
+    cdl, st = best
+    if refined or hist[-1][0] is not cdl:
+        set_cdl(index, *cdl, node=node, track=track)  # leave the best measured CDL on the node
     warnings = []
     if before["neutral_from"] != "neutral areas" and goal["neutral"] is None and goal["cast"] is not None:
         warnings.append("no neutral areas in the frame: balance assumed the whole frame averages to gray (wrong "
                         "for a frame dominated by one color; use balance=False or shot_match)")
     return {"item": index, "name": it.GetName(), "frame": frame, "node": node, "iterations": steps,
-            "error": round(_error(st, goal), 4), "display_exponent": round(g, 3), "warnings": warnings,
+            "refine_measurements": refined, "error": round(_error(st, goal), 4), "display_exponent": round(g, 3),
+            "warnings": warnings,
             "cdl": {"slope": [round(v, 4) for v in cdl[0]], "offset": [round(v, 4) for v in cdl[1]],
                     "power": [round(v, 4) for v in cdl[2]]},
             "before": {"verdict": _verdict(before), "black": before["black"], "white": before["white"],
