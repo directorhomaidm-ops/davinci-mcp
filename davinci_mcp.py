@@ -4327,6 +4327,166 @@ def cut_by_transcript(clip: str, remove_fillers: bool = True, fillers: list[str]
     _cut_timeline(proj, c, frames, name)
     return {**_cut_report(name, frames, fps, total), "removed": dropped}
 
+
+# --- Social media delivery ---
+#
+# One timeline per shape: a platform variant is a duplicate of the edit with the platform's resolution, so the
+# source edit is never reframed in place and each variant can be adjusted by hand (reframing, titles) before it is
+# rendered. Bitrates are H.264 defaults that survive the platforms' re-encoding well; override with bitrate=.
+
+SOCIAL_PLATFORMS = {
+    "youtube": ("YouTube", 1920, 1080, 16000),
+    "youtube_4k": ("YouTube 4K", 3840, 2160, 45000),
+    "youtube_shorts": ("YouTube Shorts", 1080, 1920, 12000),
+    "tiktok": ("TikTok", 1080, 1920, 12000),
+    "instagram_reels": ("Instagram Reels", 1080, 1920, 12000),
+    "instagram_feed": ("Instagram Feed", 1080, 1350, 10000),
+    "instagram_square": ("Instagram Square", 1080, 1080, 10000),
+    "facebook": ("Facebook", 1920, 1080, 12000),
+    "x": ("X", 1920, 1080, 12000),
+    "linkedin": ("LinkedIn", 1920, 1080, 12000),
+}
+# fit -> Resolve's "Mismatched resolution files" setting for the variant timeline.
+SOCIAL_FIT = {"fill": "scaleToFill", "fit": "scaleToFit", "crop": "centerCrop", "stretch": "stretch"}
+
+
+def _platform(platform):
+    if platform not in SOCIAL_PLATFORMS:
+        raise ToolError(f"unknown platform: {platform} (one of {', '.join(SOCIAL_PLATFORMS)})")
+    return SOCIAL_PLATFORMS[platform]
+
+
+def _timeline_named(proj, name):
+    for i in range(1, int(proj.GetTimelineCount()) + 1):
+        tl = proj.GetTimelineByIndex(i)
+        if tl.GetName() == name:
+            return tl
+    return None
+
+
+@_tool
+def social_platforms() -> list[dict]:
+    """The platforms social_timeline / social_render / social_export know: id, name, resolution, aspect and the
+    default H.264 bitrate (kbps)."""
+    return [{"platform": k, "name": n, "resolution": [w, h], "aspect": f"{w // math.gcd(w, h)}:{h // math.gcd(w, h)}",
+             "bitrate_kbps": b} for k, (n, w, h, b) in SOCIAL_PLATFORMS.items()]
+
+
+@_tool
+def social_timeline(platform: str, timeline: str | None = None, name: str | None = None, fit: str = "fill",
+                    reframe: bool = False, loudness: float | None = None) -> dict:
+    """Make a platform version of a timeline (default: the current one): a copy named "<timeline> - <Platform>"
+    set to the platform's resolution, which becomes current. fit: fill (scale and crop to fill the frame, the usual
+    choice for 16:9 to 9:16), fit (whole picture with bars), crop (center crop, no scaling) or stretch.
+    reframe=True runs Smart Reframe on every video clip so the subject stays in frame (Studio). loudness (LUFS,
+    e.g. -14) normalizes each audio track of the copy (Resolve 21.1+). The source timeline is not changed."""
+    label, w, h, _ = _platform(platform)
+    if fit not in SOCIAL_FIT:
+        raise ToolError(f"fit must be one of: {', '.join(SOCIAL_FIT)}")
+    proj, cur = _timeline()
+    source = _find_timeline(proj, timeline) if timeline else cur
+    name = name or f"{source.GetName()} - {label}"
+    if _timeline_named(proj, name):
+        raise ToolError(f"a timeline named {name} already exists (render it with social_render, or pass name=)")
+    copy = source.DuplicateTimeline(name)
+    if not copy:
+        raise ToolError("DuplicateTimeline failed")
+    proj.SetCurrentTimeline(copy)
+    wanted = [("useCustomSettings", "1"), ("timelineResolutionWidth", str(w)), ("timelineResolutionHeight", str(h))]
+    for key, value in wanted:
+        copy.SetSetting(key, value)
+    wrong = {k: copy.GetSetting(k) for k, v in wanted if str(copy.GetSetting(k)) != v}
+    if wrong:
+        raise ToolError(f"created {name} but Resolve kept {wrong} instead of {w}x{h}; set the resolution in its "
+                        "Timeline Settings (the copy is current)")
+    out = {"timeline": name, "platform": label, "resolution": [w, h], "fit": fit, "warnings": []}
+    mode = SOCIAL_FIT[fit]
+    if not copy.SetSetting("timelineInputResMismatchBehavior", mode) or \
+            copy.GetSetting("timelineInputResMismatchBehavior") != mode:
+        out["warnings"].append(f"fit {fit!r} not applied (Resolve reads "
+                               f"{copy.GetSetting('timelineInputResMismatchBehavior')!r}); set Mismatched resolution "
+                               "in the copy's Timeline Settings")
+    if reframe:
+        reframed, failed = 0, []
+        for n in range(1, int(copy.GetTrackCount("video") or 0) + 1):
+            for it in copy.GetItemListInTrack("video", n) or []:
+                if not _opt(it, "GetMediaPoolItem"):
+                    continue  # titles and generators have no subject to follow
+                if _method(it, "SmartReframe", "18")():
+                    reframed += 1
+                else:
+                    failed.append(it.GetName())
+        out["reframed"] = reframed
+        if failed:
+            out["warnings"].append(f"Smart Reframe failed on {', '.join(failed)} (Studio only)")
+    if loudness is not None:
+        tracks = [n for n in range(1, int(copy.GetTrackCount("audio") or 0) + 1)
+                  if copy.GetItemListInTrack("audio", n)]
+        for n in tracks:
+            normalize_audio(list(range(1, len(copy.GetItemListInTrack("audio", n)) + 1)), loudness=loudness, track=n)
+        out["loudness"] = {"lufs": loudness, "audio_tracks": tracks}
+    return out
+
+
+@_tool
+def social_render(platform: str, target_dir: str, file_name: str | None = None, bitrate: int | None = None,
+                  codec: str = "H264", subtitles: str | None = None, start: bool = True) -> dict:
+    """Render the current timeline for a platform: MP4 at the platform's resolution and bitrate (kbps, default per
+    platform; see social_platforms), audio and video. The timeline must already have the platform's shape: use
+    social_timeline first for another aspect ratio. codec: H264 or another MP4 codec id from list_render_formats
+    (e.g. H265). subtitles: burn_in, separate_file or embedded (Resolve 21+)."""
+    label, w, h, default_rate = _platform(platform)
+    _, tl = _timeline()
+    tw, th = _resolution(tl)
+    if abs(tw / th - w / h) > 0.01:
+        raise ToolError(f"'{tl.GetName()}' is {tw}x{th}, not {label}'s {w}x{h} shape; run "
+                        f"social_timeline('{platform}') first")
+    if bitrate is not None and not 500 <= bitrate <= 200000:
+        raise ToolError("bitrate is in kbps: between 500 and 200000")
+    base = tl.GetName()
+    default_name = base if base.endswith(f" - {label}") else f"{base} - {label}"  # a social_timeline copy
+    out = render(target_dir, file_name=file_name or default_name, format="mp4", codec=codec,
+                 width=w, height=h, quality=int(bitrate or default_rate), video=True, audio=True,
+                 subtitles=subtitles, start=start)
+    return {**out, "platform": label, "timeline": tl.GetName(), "resolution": [w, h],
+            "bitrate_kbps": int(bitrate or default_rate)}
+
+
+@_tool
+def social_export(platforms: list[str], target_dir: str, timeline: str | None = None, fit: str = "fill",
+                  reframe: bool = False, loudness: float | None = None, subtitles: str | None = None,
+                  start: bool = True) -> dict:
+    """Deliver one edit to several platforms in one go: for each platform, use its "<timeline> - <Platform>"
+    version if it exists (keeping any hand adjustments), otherwise make it with social_timeline (fit, reframe,
+    loudness), then queue its render. All jobs start together (start=False only queues them). Platforms with the
+    same shape still get their own timeline and file. The timeline that was current stays current."""
+    if not platforms:
+        raise ToolError("give at least one platform (see social_platforms)")
+    for p in platforms:
+        _platform(p)
+    if len(set(platforms)) != len(platforms):
+        raise ToolError("a platform is listed twice")
+    proj, cur = _timeline()
+    source = _find_timeline(proj, timeline) if timeline else cur
+    jobs = []
+    try:
+        for p in platforms:
+            name = f"{source.GetName()} - {SOCIAL_PLATFORMS[p][0]}"
+            variant = _timeline_named(proj, name)
+            if variant:
+                proj.SetCurrentTimeline(variant)
+                made = "reused"
+            else:
+                social_timeline(p, timeline=source.GetName(), fit=fit, reframe=reframe, loudness=loudness)
+                made = "created"
+            r = social_render(p, target_dir, subtitles=subtitles, start=False)
+            jobs.append({"platform": p, "timeline": name, "timeline_was": made, "job": r["job"]})
+    finally:
+        proj.SetCurrentTimeline(cur)
+    if start and not proj.StartRendering([j["job"] for j in jobs], isInteractiveMode=False):
+        raise ToolError(f"{len(jobs)} job(s) queued but rendering did not start (see render_queue)")
+    return {"target_dir": os.path.abspath(target_dir), "jobs": jobs, "started": start}
+
 if __name__ == "__main__":
     _setup_logging()
     log.info("starting", extra={"fields": {"platform": sys.platform, "pid": os.getpid()}})

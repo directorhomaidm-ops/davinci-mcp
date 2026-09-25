@@ -411,6 +411,24 @@ set_fusion_input(item=1, node="Blur1", input="XBlurSize", value=8)
 set_fusion_input(item=1, node="Push", input="Size", keyframes={"0": 1.0, "120": 1.15})
 ```
 
+### Social media delivery
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `social_platforms` | — | `[{platform, name, resolution, aspect, bitrate_kbps}]` | — |
+| `social_timeline` | `platform: str`, `timeline: str \| None` (default current), `name`, `fit: "fill" \| "fit" \| "crop" \| "stretch" = "fill"`, `reframe = False`, `loudness: float \| None` | `{timeline, platform, resolution, fit, warnings, reframed?, loudness?}` | Name taken; resolution refused |
+| `social_render` | `platform: str`, `target_dir: str`, `file_name`, `bitrate` (kbps), `codec = "H264"`, `subtitles`, `start = True` | `render` result + platform, resolution, bitrate | Timeline not in the platform's shape |
+| `social_export` | `platforms: list[str]`, `target_dir: str`, `timeline`, `fit`, `reframe`, `loudness`, `subtitles`, `start = True` | `{target_dir, jobs: [{platform, timeline, timeline_was, job}], started}` | Unknown or repeated platform |
+
+Platforms: `youtube` (1920x1080), `youtube_4k` (3840x2160), `youtube_shorts`, `tiktok`, `instagram_reels` (1080x1920), `instagram_feed` (1080x1350, 4:5), `instagram_square` (1080x1080), `facebook`, `x`, `linkedin` (1920x1080).
+
+Notes:
+
+- `social_timeline` never reframes your edit: it copies the timeline as `<timeline> - <Platform>` at the platform's resolution and makes the copy current. Adjust it by hand (reframing, title positions), then render. `fit="fill"` scales and crops to fill the frame, the usual choice from 16:9 to 9:16. `reframe=True` adds Smart Reframe on every clip (Studio).
+- `social_export` reuses an existing `<timeline> - <Platform>` copy, so hand adjustments survive re-exports. All jobs start together and the timeline that was current stays current.
+- `loudness=-14` normalizes each audio track of the copy for streaming platforms (Resolve 21.1+).
+- Bitrates are H.264 defaults (16 Mbps for 1080p YouTube, 12 Mbps for vertical, 45 Mbps for 4K); pass `bitrate` to change.
+
 ### AI editing
 
 Resolve's AI features already covered elsewhere: `magic_mask`, `smart_reframe`, `stabilize`, `detect_scene_cuts`, `voice_isolation`, `transcribe_audio`, `create_subtitles`, `classify_audio`, `generate_voiceover`, `smart_switch`, `analyze_dolby_vision`.
