@@ -373,8 +373,11 @@ def run_checks(args, work, is_211):
     step("color auto: analyze_color sees the warm flat picture", lambda: _expect_verdict(1, "warm cast"),
          needs=need_ramps)
     step("color auto: auto_color item 1", lambda: _auto_color(work), needs=need_ramps,
-         note="display_exponent shows the curve color management adds; error under 0.03 is a pass")
+         note="on a YRGB timeline; error under 0.03 is a pass")
     step("color auto: shot_match item 2 to item 1", lambda: _shot_match(), needs=need_ramps)
+    step("color auto: probe: auto_color and shot_match under automatic color management", lambda: _color_managed(),
+         needs=need_ramps, note="informational: does not converge yet (CDL on log values, channels mixed by the "
+         "output transform); tracks the error")
 
     print("\nMedia organization")
     step("organize: Type strings Resolve reports", lambda: _types(), note="the type grouping reads these")
@@ -475,6 +478,10 @@ def _color_check_timeline(work):
     d.create_timeline("Color Check")
     d.switch_timeline("Color Check")
     d.append_clips([n for n in names if n.startswith("warmflat")] + [n for n in names if n.startswith("cooldark")])
+    for i in (1, 2):  # the whole ramp in any frame shape: a vertical project fills and shows only its middle sixth
+        d.set_item_properties(i, {"Scaling": "stretch"})
+    # not color managed: the CDL loop's model holds there (the managed case is probed separately below)
+    d.apply_color_preset("yrgb", timeline=True)
     return names
 
 
@@ -491,6 +498,18 @@ def _auto_color(work):
     d.view_frame(frame=row["frame"], save_to=str(work / "frame_auto_color.png"))
     expect(row["error"] < 0.03, f"did not converge: {row}")
     return row
+
+
+def _color_managed():
+    d.switch_timeline("Color Check")
+    d.apply_color_preset("rcm_sdr", timeline=True)
+    try:
+        auto = d.auto_color([1])[0]
+        match = d.shot_match(1, [2])["matched"][0]
+    finally:
+        d.apply_color_preset("yrgb", timeline=True)
+    return {"auto_color_error": auto["error"], "shot_match_error": match["error"],
+            "auto_after": auto["after"]["verdict"], "match_after": match["after"]["verdict"]}
 
 
 def _shot_match():

@@ -4975,8 +4975,10 @@ def _solve_channel(lb, lw, ln, tb, tw, tn, g):
         a, b = max(0.0, tb) ** (g / p), max(0.0, tw) ** (g / p)
         if lw - lb < 1e-3:
             return 1.0, 0.0
-        s_ = (b - a) / (lw - lb)
-        return s_, a - lb * s_
+        # Beyond the slope limit, stretch as far as allowed around the middle of the range: an offset solved for
+        # the unclamped slope (and clamped on its own) sent a flat picture's black point to white (live 21.1).
+        s_ = _clampv("slope", (b - a) / (lw - lb))
+        return s_, _clampv("offset", (a + b) / 2 - s_ * (lb + lw) / 2)
 
     def resid(p):
         s_, o_ = lin_for(p)
@@ -4997,7 +4999,7 @@ def _solve_channel(lb, lw, ln, tb, tw, tn, g):
             p = (p0 + p1) / 2
             break
     s_, o_ = lin_for(p)
-    return _clampv("slope", s_), _clampv("offset", o_), p
+    return s_, o_, p
 
 
 def _fit_display(base, hist):

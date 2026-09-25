@@ -2870,6 +2870,15 @@ def test_auto_color_converges(project, resolve, gamma):
     assert a.cdl["NodeIndex"] == "1" and resolve.page == "edit"
 
 
+def test_solve_channel_too_flat_to_stretch_fully():
+    # live 21.1, red of a flat warm frame: reaching 0.03-0.94 needs slope 5. With slope capped at 4, an offset solved
+    # for the uncapped slope and clamped on its own mapped the black point to 0.992: the channel turned inside out
+    lb, lw = 0.3686, 0.549
+    s, o, p = d._solve_channel(lb, lw, 0.3818, 0.03, 0.94, 0.42, 1.0)
+    black, white = d._cdl_apply(lb, s, o, p), d._cdl_apply(lw, s, o, p)
+    assert black < lb and white > lw  # stretched both ways, as far as the limits allow
+
+
 def test_auto_color_strength_and_parts(project):
     a, b = _looks(project, {"lo": 0.15, "hi": 0.65, "cast": (1.15, 1.0, 0.8)})
     half, = d.auto_color([1], strength=0.5)

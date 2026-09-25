@@ -440,7 +440,7 @@ Notes:
 Notes:
 
 - Resolve's API has no Auto Color or Shot Match, so the picture is measured here: the frame is exported as PNG (what the viewer shows, graded and color managed) and decoded in pure Python. Each clip is measured at its middle frame; the playhead is put back afterwards.
-- The correction is an ASC CDL on `node` (it replaces that node's CDL), found in a closed loop: solve, apply, export, measure. The loop fits how the display curve (color management, later nodes) bends the CDL's output from the measured black and white points, so it converges on log/RCM projects too; `display_exponent` reports that fit (1.0 = the CDL alone).
+- The correction is an ASC CDL on `node` (it replaces that node's CDL), found in a closed loop: solve, apply, export, measure. The loop fits how a gamma-like display curve (later nodes, a display LUT) bends the CDL's output from the measured black and white points; `display_exponent` reports that fit (1.0 = the CDL alone). **Color-managed timelines do not converge yet** (live 21.1, automatic SDR: the CDL acts on log values and the output transform mixes channels and gamut-maps saturated colors, which the model cannot represent); check `error` in the result. On an unmanaged YRGB timeline it converges in about two steps.
 - `levels` sets each channel's black and white points (0.03 / 0.94), `balance` makes neutral areas gray, `exposure` brings the mean brightness to 0.42. `strength` scales all three.
 - Balance needs neutral areas (low-saturation midtones). Without them it assumes the frame averages to gray and says so in `warnings`; use `balance=False` or `shot_match` for frames dominated by one color.
 
