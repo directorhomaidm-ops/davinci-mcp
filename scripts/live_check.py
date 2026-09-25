@@ -222,6 +222,11 @@ def run_checks(args, work, is_211):
     step("fusion: Tracker point input names", lambda: _tracker_inputs(), needs=have_items,
          note="link_mask_to_tracker assumes TrackedCenter1")
     step("fusion: view_frame after effects", lambda: _frame(work / "frame_fusion.png"), needs=have_items)
+    step("keyframes: animate_clip zoom/position/rotation on item 1", lambda: d.animate_clip(
+        1, zoom={0: 1.0, 23: 1.25}, position={0: [0.45, 0.5], 23: [0.55, 0.5]}, rotation={0: 0, 23: 5}),
+        needs=have_items, note="confirms Transform's Angle input and the comp frame offset")
+    step("keyframes: list_keyframes item 1", lambda: d.list_keyframes(1), needs=have_items)
+    step("keyframes: view_frame mid-animation", lambda: _frame(work / "frame_anim.png"), needs=have_items)
 
     print("\nTitles and subtitles")
     step("titles: insert Text+ and set_title_text (text, font, style, size, color)", lambda: _title(),
@@ -243,6 +248,8 @@ def run_checks(args, work, is_211):
     step("21.1: set_speed 50% on last item", lambda: d.set_speed(len(d.list_items()), 50), needs=need211)
     step("21.1: normalize_audio -16 LKFS", lambda: d.normalize_audio([1], loudness=-16),
          needs=need211 if wav else "no audio item")
+    step("21.1: create_multicam from the two sequences + append + flatten", lambda: _multicam(seq),
+         needs=need211 if have_media is True else have_media)
 
     print("\nAudio")
     step("audio: fairlight_info", d.fairlight_info)
@@ -291,6 +298,15 @@ def _lut(work):
     expect((work / "grade.cube").exists(), "no .cube written")
     expect(d._resolve().GetCurrentPage() == before, "page not restored")
     return (work / "grade.cube").stat().st_size
+
+
+def _multicam(seq):
+    names = d.create_multicam(seq, name="Multicam Check", sync="in", create_bin=False)
+    d.create_timeline("Multicam")
+    d.append_clips(names[:1])
+    out = d.flatten_multicam(1)
+    d.switch_timeline("Check")
+    return {"created": names, "flatten": out}
 
 
 def _tracker_inputs():

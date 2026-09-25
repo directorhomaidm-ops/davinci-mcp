@@ -49,7 +49,7 @@ mcp = MCPServer(
     "davinci",
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
     "clip properties, transitions, titles, markers, color grading and management, HDR, Fusion compositing, audio, "
-    "media management, projects and review notes, transcripts, subtitle files and titles, "
+    "media management, projects and review notes, transcripts, subtitle files and titles, keyframes, multicam, "
     "interchange export and rendering. "
     "Start with timeline_overview to see the edit and view_frame to see the picture. "
     "Frames are absolute timeline frames.",
@@ -2900,6 +2900,285 @@ def set_title_text(
         raise ToolError("nothing to change")
     applied = {k: _set_input(comp, tool, name, k, value=v)["value"] for k, v in values.items()}
     return {"item": it.GetName(), "node": name, "set": applied}
+
+
+
+# --- Keyframes ---
+#
+# Clip animation goes through the clip's Fusion comp (a Transform node), the route measured to render on live
+# Resolve; the Edit-page keyframe methods are not in Resolve's current API reference. Frames here are relative to
+# the clip's first frame and converted to the comp's own frame numbers.
+
+MOTION_INPUTS = {"zoom": "Size", "position": "Center", "rotation": "Angle"}
+
+
+def _comp_range(c, it):
+    attrs = c.GetAttrs() or {}
+    first = int(attrs.get("COMPN_RenderStart", 0))
+    last = int(attrs.get("COMPN_RenderEnd", first + int(it.GetDuration()) - 1))
+    return first, last
+
+
+@_tool
+def animate_clip(
+    item: int,
+    zoom: dict[int, float] | None = None,
+    position: dict[int, list[float]] | None = None,
+    rotation: dict[int, float] | None = None,
+    track: int = 1,
+) -> dict:
+    """Keyframe a video clip's motion: zoom (1.0 = full frame), position ([x, y], 0-1, frame center 0.5, 0.5) and
+    rotation (degrees, counter-clockwise), each as {frame: value} with frames counted from the clip's first frame
+    (0). Built on a Fusion Transform node named Motion in the clip's comp (created if needed); calling again adds or
+    replaces keyframes. Refine with set_fusion_input(node="Motion"), inspect with list_keyframes."""
+    moves = {k: v for k, v in (("zoom", zoom), ("position", position), ("rotation", rotation)) if v}
+    if not moves:
+        raise ToolError("give zoom, position and/or rotation keyframes")
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    c = _clip_comp(it)
+    first, last = _comp_range(c, it)
+    for name, keys in moves.items():
+        bad = [f for f in keys if not 0 <= int(f) <= last - first]
+        if bad:
+            raise ToolError(f"{name} keyframes outside the clip (0-{last - first}): {bad}")
+        if name == "zoom" and any(v <= 0 for v in keys.values()):
+            raise ToolError("zoom must be positive")
+    tool = c.FindTool("Motion") or _insert_before_output(c, "Transform", "Motion")
+    out = {}
+    for name, keys in moves.items():
+        comp_keys = {first + int(f): v for f, v in keys.items()}
+        frames = _set_input(c, tool, "Motion", MOTION_INPUTS[name], keyframes=comp_keys)["keyframes"]
+        out[name] = [int(f) - first for f in frames]
+    return {"item": it.GetName(), "node": "Motion", "keyframes": out}
+
+
+@_tool
+def list_keyframes(item: int, comp: int = 1, track: int = 1) -> list[dict]:
+    """Every animated input in a clip's Fusion comp with its keyframes: [{node, input, keyframes: [{frame, value}]}],
+    frames counted from the clip's first frame."""
+    _, c = _comp(item, comp, track)
+    _, tl = _timeline()
+    first, _ = _comp_range(c, _item(tl, item, track))
+    out = []
+    for tool in (c.GetToolList(False) or {}).values():
+        name, kind = _tool_attrs(tool)
+        if kind in ANIMATION_MODIFIERS:
+            continue
+        for inp in (tool.GetInputList() or {}).values():
+            if _source(inp)[1] not in ANIMATION_MODIFIERS:
+                continue
+            inp_id = (inp.GetAttrs() or {}).get("INPS_ID", "")
+            frames = sorted(float(f) for f in (tool[inp_id].GetKeyFrames() or {}).values())
+            out.append({"node": name, "input": inp_id,
+                        "keyframes": [{"frame": int(f) - first, "value": _plain(tool.GetInput(inp_id, f))} for f in frames]})
+    return out
+
+
+@_tool
+def clear_keyframes(item: int, node: str, input: str, comp: int = 1, track: int = 1) -> dict:
+    """Remove the animation from one Fusion input (e.g. node="Motion", input="Size"); it keeps a single static value."""
+    _, c = _comp(item, comp, track)
+    tool = _node(c, node)
+    inp = tool[input]
+    if not inp:
+        raise ToolError(f"{node} has no input {input} (see fusion_inputs)")
+    if _source(inp)[1] not in ANIMATION_MODIFIERS:
+        raise ToolError(f"{node}.{input} is not animated")
+    with _locked(c):
+        tool.ConnectInput(input, None)
+    if _source(tool[input])[1] in ANIMATION_MODIFIERS:
+        raise ToolError(f"could not remove the animation from {node}.{input}")
+    return {"node": node, "input": input, "value": _plain(tool.GetInput(input))}
+
+
+KEYFRAME_MODES = {"all": "KEYFRAME_MODE_ALL", "color": "KEYFRAME_MODE_COLOR", "sizing": "KEYFRAME_MODE_SIZING"}
+
+
+@_tool
+def set_color_keyframe_mode(mode: str) -> str:
+    """Color page keyframe mode: which parameters a keyframe in the Color page's keyframe editor records: all,
+    color (grade only) or sizing (sizing only)."""
+    if mode not in KEYFRAME_MODES:
+        raise ToolError(f"mode must be one of: {', '.join(KEYFRAME_MODES)}")
+    resolve = _resolve()
+    value = _constant(resolve, KEYFRAME_MODES[mode])
+    with _on_page(resolve, "color"):
+        ok = _method(resolve, "SetKeyframeMode", "18")(value)
+    if not ok:
+        raise ToolError("SetKeyframeMode failed")
+    return f"color keyframe mode: {mode}"
+
+
+# --- Multicam (Resolve 21.1) ---
+
+MULTICAM_SYNC = {"timecode": "TIMECODE", "in": "IN", "out": "OUT", "audio": "AUDIO", "marker": "MARKER"}
+MULTICAM_AUDIO = {"source": "SOURCE", "adaptive": "ADAPTIVE", "reference": "REFERENCE", "all": "ALL"}
+MULTICAM_NAMES = {"sequential": "SEQUENTIAL", "angle": "ANGLE", "camera": "CAMERA", "clip": "CLIP", "file": "FILE"}
+MULTICAM_DETECT = {"none": "MULTICAM_DETECT_NONE", "camera_number": "MULTICAM_DETECT_BY_CAMERA_NUMBER",
+                   "angle": "MULTICAM_DETECT_BY_ANGLE", "reel_number": "MULTICAM_DETECT_BY_REEL_NUMBER",
+                   "reel_name": "MULTICAM_DETECT_BY_REEL_NAME", "roll_card": "MULTICAM_DETECT_BY_ROLL_CARD"}
+
+
+def _choice(value, table, what):
+    if value not in table:
+        raise ToolError(f"{what} must be one of: {', '.join(table)}")
+    return table[value]
+
+
+@_tool
+def create_multicam(
+    clips: list[str],
+    name: str | None = None,
+    sync: str = "timecode",
+    audio_mode: str = "source",
+    angle_names: str = "sequential",
+    audio_channel: int | str | None = None,
+    split_at_gaps: bool | None = None,
+    use_full_extents: bool | None = None,
+    create_bin: bool | None = None,
+    same_camera: str | None = None,
+    start_timecode: str | None = None,
+    frame_rate: float | None = None,
+) -> list[str]:
+    """Build a multicam clip from media-pool clips (by name), one angle per camera (Resolve 21.1+).
+    sync: timecode, in, out, audio (waveform) or marker. audio_mode: source, adaptive, reference or all.
+    angle_names: sequential, angle, camera, clip or file. audio_channel (sync=audio): 1-8, "auto" or "mix".
+    same_camera groups clips from one camera into one angle: none, camera_number, angle, reel_number, reel_name,
+    roll_card. Resolve moves the source clips into a new bin unless create_bin=False. Append the result with
+    append_clips, then smart_switch or cut angles in the UI."""
+    resolve = _resolve()
+    _, proj = _project()
+    sources = _pool_clips(proj, clips)
+    if len(sources) < 2:
+        raise ToolError("a multicam clip needs at least two clips")
+    opts = {
+        "angleSyncMode": _constant(resolve, "MULTICAM_ANGLE_SYNC_" + _choice(sync, MULTICAM_SYNC, "sync")),
+        "multicamAudioMode": _constant(resolve, "MULTICAM_AUDIO_" + _choice(audio_mode, MULTICAM_AUDIO, "audio_mode")),
+        "angleNameMode": _constant(resolve, "MULTICAM_ANGLE_NAME_" + _choice(angle_names, MULTICAM_NAMES, "angle_names")),
+    }
+    if audio_channel is not None:
+        if sync != "audio":
+            raise ToolError("audio_channel only applies to sync=audio")
+        if isinstance(audio_channel, str):
+            audio_channel = _constant(resolve, _choice(audio_channel, SYNC_CHANNELS, "audio_channel"))
+        elif not 1 <= audio_channel <= 8:
+            raise ToolError("audio_channel must be 1-8, auto or mix")
+        opts["channelConfig"] = audio_channel
+    if split_at_gaps is not None:
+        if sync != "audio":
+            raise ToolError("split_at_gaps only applies to sync=audio")
+        opts["splitAtGaps"] = split_at_gaps
+    for key, value in (("useFullClipExtents", use_full_extents), ("createBinForSourceClips", create_bin),
+                       ("name", name), ("startTimecode", start_timecode), ("frameRate", frame_rate)):
+        if value is not None:
+            opts[key] = value
+    if same_camera is not None:
+        opts["detectSameCameraClipsMode"] = _constant(resolve, _choice(same_camera, MULTICAM_DETECT, "same_camera"))
+    created = _method(proj.GetMediaPool(), "CreateMulticamClip", "21.1")(sources, opts)
+    if not created:
+        raise ToolError("CreateMulticamClip made nothing (do the clips overlap in the chosen sync?)")
+    return [c.GetName() for c in created]
+
+
+@_tool
+def auto_align_clips(
+    video_items: list[int] | None = None,
+    audio_items: list[int] | None = None,
+    sync: str = "timecode",
+    waveform_track: int | str | None = None,
+    video_track: int = 1,
+    audio_track: int = 1,
+) -> str:
+    """Line up timeline clips from different cameras/recorders by timecode or audio waveform (Resolve 21.1+). Items
+    are 1-based indexes on video_track / audio_track. Include the linked audio of every video clip: Resolve moves only
+    what is selected, and waveform alignment of video items alone fails. waveform_track: the audio track to compare,
+    or "mix" / "auto"."""
+    if sync not in ("timecode", "waveform"):
+        raise ToolError("sync must be timecode or waveform")
+    if sync == "waveform" and not audio_items:
+        raise ToolError("waveform alignment needs the audio items (with their linked video items)")
+    resolve = _resolve()
+    _, tl = _timeline()
+    items = [_pick(tl, i, video_track, "video") for i in video_items or []]
+    items += [_pick(tl, i, audio_track, "audio") for i in audio_items or []]
+    if len(items) < 2:
+        raise ToolError("give at least two items to align")
+    opts = {"SyncUsing": _constant(resolve, "AUTO_ALIGN_CLIPS_USING_" + sync.upper())}
+    if waveform_track is not None:
+        if sync != "waveform":
+            raise ToolError("waveform_track only applies to sync=waveform")
+        if isinstance(waveform_track, str):
+            named = {"mix": "AUTO_ALIGN_CLIPS_WAVEFORM_TRACK_MIX", "auto": "AUTO_ALIGN_CLIPS_WAVEFORM_TRACK_AUTOMATIC"}
+            waveform_track = _constant(resolve, _choice(waveform_track, named, "waveform_track"))
+        opts["UseTrack"] = waveform_track
+    if not _method(tl, "AutoAlignClips", "21.1")(items, opts):
+        raise ToolError("AutoAlignClips failed (include linked video and audio; clips must share timecode or sound)")
+    return f"aligned {len(items)} item(s) by {sync}"
+
+
+SS_FREQ = {"low": "LOW", "medium": "MEDIUM", "high": "HIGH"}
+SS_ANALYSIS = {"none": "NONE", "detect_wide_angle": "DETECT_WIDE_ANGLE", "audio_only": "AUDIO_ONLY"}
+
+
+@_tool
+def smart_switch(
+    item: int,
+    min_edit_seconds: float = 1.0,
+    change_delay_seconds: float = 0.3,
+    wide_angle: str | None = "auto",
+    wide_frequency: str = "medium",
+    wide_for_intro_outro: bool = True,
+    wide_for_silence: bool = True,
+    video_only: bool = False,
+    quality: str = "better",
+    analysis: str | None = None,
+    track: int = 1,
+) -> str:
+    """Let Resolve cut a multicam clip on the timeline automatically, switching to whoever is speaking (Resolve 21.1+,
+    Studio). wide_angle: "auto" to detect the wide shot, an angle name, or None for no wide shot; wide_frequency low,
+    medium or high; analysis (overrides auto wide detection): none, detect_wide_angle or audio_only.
+    min_edit_seconds 0.5-10, change_delay_seconds 0-2. Experimental: not yet validated on a live Resolve.
+    Check the result with timeline_overview / view_frame."""
+    if not 0.5 <= min_edit_seconds <= 10:
+        raise ToolError("min_edit_seconds must be 0.5-10")
+    if not 0 <= change_delay_seconds <= 2:
+        raise ToolError("change_delay_seconds must be 0-2")
+    resolve = _resolve()
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    settings = {
+        "minEditDuration": float(min_edit_seconds),
+        "editChangeDelay": float(change_delay_seconds),
+        "wideAngleFrequency": _constant(resolve, "SMART_SWITCH_WIDE_ANGLE_FREQ_" + _choice(wide_frequency, SS_FREQ, "wide_frequency")),
+        "isUseWideAngleForIntroOutro": wide_for_intro_outro,
+        "isUseWideAngleForSilence": wide_for_silence,
+        "switchOnVideoOnly": video_only,
+        "quality": _constant(resolve, "SMART_SWITCH_QUALITY_" + _choice(quality, {"better": "BETTER", "faster": "FASTER"}, "quality")),
+    }
+    if wide_angle == "auto":
+        settings["isAutoDetectWideAngle"] = True
+    else:
+        settings.update(isAutoDetectWideAngle=False, wideAngleID=wide_angle or "None")
+    if analysis is not None:
+        settings["analysisMode"] = _constant(resolve, "SMART_SWITCH_ANALYSIS_MODE_" + _choice(analysis, SS_ANALYSIS, "analysis"))
+    if not _method(it, "PerformMulticamSmartSwitch", "21.1")(settings):
+        raise ToolError(f"Smart Switch failed on '{it.GetName()}' (a multicam clip with speech is needed; Studio only)")
+    return f"Smart Switch cut '{it.GetName()}'"
+
+
+@_tool
+def flatten_multicam(item: int, grade: str = "copy", track: int = 1) -> str:
+    """Replace a multicam clip on the timeline with its active angle's source clip (Resolve 21.1+). grade: copy (keep
+    the multicam clip's grade) or angle (keep the grade of the angle's own clip). Item indexes may change after."""
+    options = {"copy": "FLATTEN_MULTICAM_COPY_GRADE", "angle": "FLATTEN_MULTICAM_RETAIN_GRADE_FROM_ANGLE"}
+    resolve = _resolve()
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    name = it.GetName()  # the item is replaced by the flatten, so read it first
+    if not _method(it, "FlattenMulticam", "21.1")(_constant(resolve, _choice(grade, options, "grade"))):
+        raise ToolError(f"FlattenMulticam failed on '{name}' (is it a multicam clip?)")
+    return f"flattened '{name}'"
 
 
 if __name__ == "__main__":

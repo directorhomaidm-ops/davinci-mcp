@@ -216,6 +216,16 @@ class Item:
     def RegenerateMagicMask(self):
         return getattr(self, "magic_mask", None) is not None
 
+    def PerformMulticamSmartSwitch(self, settings):
+        self.smart_switch = settings
+        return self.name.startswith("Multicam")
+
+    def FlattenMulticam(self, grade):
+        if not self.name.startswith("Multicam"):
+            return False
+        self.flattened, self.name = grade, self.name.replace("Multicam", "Angle 1")
+        return True
+
     def SmartReframe(self):
         self.reframed = True
         return True
@@ -321,7 +331,7 @@ TOOL_INPUTS = {
     "MediaIn": {},
     "MediaOut": {"Input": "Image"},
     "Blur": {"Input": "Image", "XBlurSize": "Number", "EffectMask": "Mask"},
-    "Transform": {"Input": "Image", "Size": "Number", "Center": "Point"},
+    "Transform": {"Input": "Image", "Size": "Number", "Center": "Point", "Angle": "Number"},
     "Merge": {"Background": "Image", "Foreground": "Image", "Blend": "Number"},
     "TextPlus": {"StyledText": "Text", "Font": "Text", "Style": "Text", "Size": "Number", "Center": "Point",
                  "Red1": "Number", "Green1": "Number", "Blue1": "Number"},
@@ -401,7 +411,10 @@ class FuTool:
         inp.value = inp._store(value)
 
     def GetInput(self, inp_id, time=None):
-        return self.inputs[inp_id].value
+        inp = self.inputs[inp_id]
+        if time is not None and inp.keys:
+            return inp.keys.get(int(time), inp.keys.get(time, inp.value))
+        return inp.value
 
     def AddModifier(self, inp_id, modifier):
         inp = self.inputs.get(inp_id)
@@ -415,6 +428,11 @@ class FuTool:
     def ConnectInput(self, inp_id, src):
         self.comp.structural()
         inp = self.inputs.get(inp_id)
+        if inp and src is None:  # disconnects anything, including an animation spline
+            if inp.animated() and inp.keys:
+                inp.value = inp.keys[max(inp.keys)]
+            inp.source, inp.keys = None, {}
+            return True
         if not inp or inp.kind not in ("Image", "Mask"):
             return False
         inp.source = src.output if src else None
@@ -622,6 +640,10 @@ class Timeline:
                     track.remove(it)
         return True
 
+    def AutoAlignClips(self, items, options):
+        self.aligned = (items, options)
+        return True
+
     def DetectSceneCuts(self):
         self.scene_cuts = True
         return True
@@ -719,6 +741,12 @@ class MediaPool:
         if self.project.current in timelines:
             self.project.current = self.project.timelines[0] if self.project.timelines else None
         return True
+
+    def CreateMulticamClip(self, clips, options):
+        self.multicam = (clips, options)
+        mc = Clip(options.get("name") or f"Multicam {clips[0].name}")
+        self.GetCurrentFolder().clips.append(mc)
+        return [mc]
 
     def RefreshFolders(self):
         for f in self._folders():
@@ -1094,6 +1122,25 @@ class Resolve:
     AUTO_CAPTION_SUBTITLE_DEFAULT, AUTO_CAPTION_TELETEXT, AUTO_CAPTION_NETFLIX = 200, 201, 202
     AUTO_CAPTION_LINE_SINGLE, AUTO_CAPTION_LINE_DOUBLE = 300, 301
     DLB_BLEND_SHOTS = 400
+    KEYFRAME_MODE_ALL, KEYFRAME_MODE_COLOR, KEYFRAME_MODE_SIZING = 0, 1, 2
+    MULTICAM_ANGLE_SYNC_IN, MULTICAM_ANGLE_SYNC_OUT, MULTICAM_ANGLE_SYNC_TIMECODE = 600, 601, 602
+    MULTICAM_ANGLE_SYNC_AUDIO, MULTICAM_ANGLE_SYNC_MARKER = 603, 604
+    MULTICAM_AUDIO_ADAPTIVE, MULTICAM_AUDIO_SOURCE, MULTICAM_AUDIO_REFERENCE, MULTICAM_AUDIO_ALL = 610, 611, 612, 613
+    MULTICAM_ANGLE_NAME_SEQUENTIAL, MULTICAM_ANGLE_NAME_ANGLE, MULTICAM_ANGLE_NAME_CAMERA = 620, 621, 622
+    MULTICAM_ANGLE_NAME_CLIP, MULTICAM_ANGLE_NAME_FILE = 623, 624
+    MULTICAM_DETECT_NONE, MULTICAM_DETECT_BY_CAMERA_NUMBER, MULTICAM_DETECT_BY_ANGLE = 630, 631, 632
+    MULTICAM_DETECT_BY_REEL_NUMBER, MULTICAM_DETECT_BY_REEL_NAME, MULTICAM_DETECT_BY_ROLL_CARD = 633, 634, 635
+    AUTO_ALIGN_CLIPS_USING_TIMECODE, AUTO_ALIGN_CLIPS_USING_WAVEFORM = 640, 641
+    AUTO_ALIGN_CLIPS_WAVEFORM_TRACK_MIX, AUTO_ALIGN_CLIPS_WAVEFORM_TRACK_AUTOMATIC = -2, -1
+    SMART_SWITCH_WIDE_ANGLE_FREQ_LOW, SMART_SWITCH_WIDE_ANGLE_FREQ_MEDIUM, SMART_SWITCH_WIDE_ANGLE_FREQ_HIGH = 650, 651, 652
+    SMART_SWITCH_QUALITY_FASTER, SMART_SWITCH_QUALITY_BETTER = 660, 661
+    SMART_SWITCH_ANALYSIS_MODE_NONE, SMART_SWITCH_ANALYSIS_MODE_DETECT_WIDE_ANGLE = 670, 671
+    SMART_SWITCH_ANALYSIS_MODE_AUDIO_ONLY = 672
+    FLATTEN_MULTICAM_COPY_GRADE, FLATTEN_MULTICAM_RETAIN_GRADE_FROM_ANGLE = 680, 681
+
+    def SetKeyframeMode(self, mode):
+        self.keyframe_mode = (mode, UI["page"])
+        return True
     CLOUD_SETTING_PROJECT_NAME, CLOUD_SETTING_PROJECT_MEDIA_PATH = "cloud_name", "cloud_media"
     CLOUD_SETTING_IS_COLLAB, CLOUD_SETTING_SYNC_MODE, CLOUD_SETTING_IS_CAMERA_ACCESS = "cloud_collab", "cloud_sync", "cloud_cam"
     CLOUD_SYNC_NONE, CLOUD_SYNC_PROXY_ONLY, CLOUD_SYNC_PROXY_AND_ORIG = 500, 501, 502

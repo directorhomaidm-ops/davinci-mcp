@@ -195,6 +195,8 @@ def test_all_tools_registered():
         "load_cloud_project", "refresh_collaboration", "duplicate_timeline", "rename_timeline", "delete_timelines",
         "review_notes", "add_review_note", "resolve_review_note", "delete_markers", "export_review_notes",
         "get_transcript", "export_transcript", "write_subtitles", "list_titles", "set_title_text",
+        "animate_clip", "list_keyframes", "clear_keyframes", "set_color_keyframe_mode", "create_multicam",
+        "auto_align_clips", "smart_switch", "flatten_multicam",
     }
 
 
@@ -1717,3 +1719,135 @@ def test_render_subtitles_needs_21(project, tmp_path, resolve, monkeypatch):
     assert (project.render_settings["ExportSubtitle"], project.render_settings["SubtitleFormat"]) == (True, "SeparateFile")
     with pytest.raises(ToolError, match="subtitles must be"):
         d.render(str(tmp_path), subtitles="srt")
+
+
+# --- keyframes ---
+
+
+def test_animate_clip(project):
+    a, _ = _two_items(project)
+    a.comps.append(__import__("conftest").FuComp("Composition 1"))
+    a.comps[0].attrs = {"COMPN_RenderStart": 1000.0, "COMPN_RenderEnd": 1099.0}  # comps number their own frames
+    out = d.animate_clip(1, zoom={0: 1.0, 99: 1.2}, position={0: [0.4, 0.5], 99: [0.6, 0.5]}, rotation={50: 0, 99: 15})
+    assert out == {"item": "a.mov", "node": "Motion",
+                   "keyframes": {"zoom": [0, 99], "position": [0, 99], "rotation": [50, 99]}}
+    motion = a.comps[0].FindTool("Motion")
+    assert motion.inputs["Size"].keys == {1000: 1.0, 1099: 1.2}
+    assert motion.inputs["Center"].keys == {1000: {1: 0.4, 2: 0.5}, 1099: {1: 0.6, 2: 0.5}}
+    nodes = {n["name"]: n for n in d.fusion_nodes(1)}
+    assert nodes["MediaOut1"]["inputs"] == {"Input": "Motion"}
+    # Calling again adds keys to the same node and spline.
+    d.animate_clip(1, zoom={50: 1.5})
+    assert motion.inputs["Size"].keys == {1000: 1.0, 1050: 1.5, 1099: 1.2}
+    assert sum(t.name.startswith("Motion") for t in a.comps[0].tools) == 1
+    _assert_lock_rules(a.comps[0])
+
+
+def test_animate_clip_errors(project):
+    _two_items(project)
+    with pytest.raises(ToolError, match="give zoom"):
+        d.animate_clip(1)
+    with pytest.raises(ToolError, match=r"zoom keyframes outside the clip \(0-99\): \[100\]"):
+        d.animate_clip(1, zoom={0: 1, 100: 2})
+    with pytest.raises(ToolError, match="zoom must be positive"):
+        d.animate_clip(1, zoom={0: 0})
+
+
+def test_list_and_clear_keyframes(project):
+    _two_items(project)
+    d.animate_clip(1, zoom={0: 1.0, 48: 1.3})
+    assert d.list_keyframes(1) == [{"node": "Motion", "input": "Size",
+                                    "keyframes": [{"frame": 0, "value": 1.0}, {"frame": 48, "value": 1.3}]}]
+    assert d.clear_keyframes(1, "Motion", "Size") == {"node": "Motion", "input": "Size", "value": 1.3}
+    assert d.list_keyframes(1) == []
+    _assert_lock_rules(project.current.tracks[("video", 1)][0].comps[0])  # the disconnect is structural: locked
+    with pytest.raises(ToolError, match="is not animated"):
+        d.clear_keyframes(1, "Motion", "Size")
+    with pytest.raises(ToolError, match="has no input Zoom"):
+        d.clear_keyframes(1, "Motion", "Zoom")
+
+
+def test_set_color_keyframe_mode(project, resolve):
+    assert d.set_color_keyframe_mode("sizing") == "color keyframe mode: sizing"
+    assert resolve.keyframe_mode == (resolve.KEYFRAME_MODE_SIZING, "color")  # set on the Color page
+    assert resolve.page == "edit"  # and back
+    with pytest.raises(ToolError, match="mode must be"):
+        d.set_color_keyframe_mode("position")
+
+
+# --- multicam ---
+
+
+def test_create_multicam(project):
+    names = d.create_multicam(["a.mov", "b.mov"], name="Interview", sync="audio", audio_channel="mix",
+                              angle_names="clip", split_at_gaps=True, create_bin=False, same_camera="reel_name")
+    assert names == ["Interview"]
+    clips, opts = project.pool.multicam
+    assert [c.name for c in clips] == ["a.mov", "b.mov"]
+    assert opts == {"angleSyncMode": 603, "multicamAudioMode": 611, "angleNameMode": 623, "channelConfig": -2,
+                    "splitAtGaps": True, "createBinForSourceClips": False, "name": "Interview",
+                    "detectSameCameraClipsMode": 634}
+    assert "Interview" in [c["name"] for c in d.list_clips()]
+
+
+def test_create_multicam_errors(project, monkeypatch):
+    for kwargs, msg in [({"clips": ["a.mov"]}, "at least two"), ({"sync": "gps"}, "sync must be"),
+                        ({"audio_channel": 2}, "only applies to sync=audio"),
+                        ({"sync": "audio", "audio_channel": 9}, "1-8"),
+                        ({"split_at_gaps": True}, "only applies to sync=audio")]:
+        with pytest.raises(ToolError, match=msg):
+            d.create_multicam(**{"clips": ["a.mov", "b.mov"], **kwargs})
+    monkeypatch.delattr(type(project.pool), "CreateMulticamClip")
+    with pytest.raises(ToolError, match="CreateMulticamClip needs DaVinci Resolve 21.1"):
+        d.create_multicam(["a.mov", "b.mov"])
+
+
+def test_auto_align_clips(project, audio):
+    a, b = _two_items(project)
+    assert d.auto_align_clips(video_items=[1, 2], audio_items=[1, 2], sync="waveform", waveform_track="mix") == \
+        "aligned 4 item(s) by waveform"
+    items, opts = project.current.aligned
+    assert items == [a, b] + audio
+    assert opts == {"SyncUsing": 641, "UseTrack": -2}
+    d.auto_align_clips(video_items=[1, 2])
+    assert project.current.aligned[1] == {"SyncUsing": 640}
+
+
+def test_auto_align_errors(project, audio):
+    _two_items(project)
+    with pytest.raises(ToolError, match="waveform alignment needs the audio items"):
+        d.auto_align_clips(video_items=[1, 2], sync="waveform")
+    with pytest.raises(ToolError, match="at least two"):
+        d.auto_align_clips(video_items=[1])
+    with pytest.raises(ToolError, match="only applies to sync=waveform"):
+        d.auto_align_clips(video_items=[1, 2], waveform_track=2)
+
+
+def test_smart_switch_and_flatten(project):
+    d.create_multicam(["a.mov", "b.mov"], name="Multicam Interview")
+    d.append_clips(["Multicam Interview"])
+    item = project.current.tracks[("video", 1)][0]
+    assert d.smart_switch(1, wide_angle="Angle 1", wide_frequency="low", analysis="audio_only") == \
+        "Smart Switch cut 'Multicam Interview'"
+    assert item.smart_switch == {"minEditDuration": 1.0, "editChangeDelay": 0.3, "wideAngleFrequency": 650,
+                                 "isUseWideAngleForIntroOutro": True, "isUseWideAngleForSilence": True,
+                                 "switchOnVideoOnly": False, "quality": 661, "isAutoDetectWideAngle": False,
+                                 "wideAngleID": "Angle 1", "analysisMode": 672}
+    d.smart_switch(1, wide_angle=None)
+    assert (item.smart_switch["isAutoDetectWideAngle"], item.smart_switch["wideAngleID"]) == (False, "None")
+    assert d.flatten_multicam(1, grade="angle") == "flattened 'Multicam Interview'"
+    assert item.flattened == 681
+
+
+def test_smart_switch_errors(project):
+    _two_items(project)
+    with pytest.raises(ToolError, match="min_edit_seconds"):
+        d.smart_switch(1, min_edit_seconds=0.1)
+    with pytest.raises(ToolError, match="change_delay_seconds"):
+        d.smart_switch(1, change_delay_seconds=3)
+    with pytest.raises(ToolError, match="Smart Switch failed on 'a.mov'"):
+        d.smart_switch(1)
+    with pytest.raises(ToolError, match="is it a multicam clip"):
+        d.flatten_multicam(1)
+    with pytest.raises(ToolError, match="grade must be"):
+        d.flatten_multicam(1, grade="none")
