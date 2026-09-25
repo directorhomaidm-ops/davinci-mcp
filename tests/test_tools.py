@@ -196,7 +196,8 @@ def test_all_tools_registered():
         "review_notes", "add_review_note", "resolve_review_note", "delete_markers", "export_review_notes",
         "get_transcript", "export_transcript", "write_subtitles", "list_titles", "set_title_text",
         "animate_clip", "list_keyframes", "clear_keyframes", "set_color_keyframe_mode", "create_multicam",
-        "auto_align_clips", "smart_switch", "flatten_multicam",
+        "auto_align_clips", "smart_switch", "flatten_multicam", "generate_voiceover", "classify_audio",
+        "find_audio", "generate_sound", "detect_beats", "mark_beats",
     }
 
 
@@ -1851,3 +1852,186 @@ def test_smart_switch_errors(project):
         d.flatten_multicam(1)
     with pytest.raises(ToolError, match="grade must be"):
         d.flatten_multicam(1, grade="none")
+
+
+# --- sound effects and music ---
+
+import math as _math
+import random as _random
+import wave as _wave
+
+
+def click_track(path, bpm, seconds, offset=0.25, rate=48000, width=3, channels=2):
+    """A drum-like click on every beat, over light noise."""
+    rnd = _random.Random(1)
+    period, out = 60 / bpm, bytearray()
+    top = 2 ** (8 * width - 1) - 1
+    for i in range(int(seconds * rate)):
+        t = i / rate
+        k = (t - offset) % period if t >= offset else 1e9
+        v = (0.8 * _math.exp(-k * 60) * _math.sin(2 * _math.pi * 1500 * k) if k < 0.05 else 0.0) + 0.02 * rnd.uniform(-1, 1)
+        out += int(max(-1, min(1, v)) * top).to_bytes(width, "little", signed=True) * channels
+    with _wave.open(str(path), "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(width)
+        w.setframerate(rate)
+        w.writeframes(bytes(out))
+    return path
+
+
+def read_wav(path):
+    with _wave.open(str(path), "rb") as w:
+        ch, width, rate, raw = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.readframes(w.getnframes())
+    vals = [int.from_bytes(raw[i:i + width], "little", signed=True) / (2 ** (8 * width - 1) - 1)
+            for i in range(0, len(raw), width * ch)]
+    return vals, rate, ch, width
+
+
+def dbfs(x):
+    return 20 * _math.log10(x)
+
+
+@pytest.mark.parametrize("bpm,width", [(120, 3), (95, 2), (140, 4)])
+def test_detect_beats_click_tracks(tmp_path, bpm, width):
+    path = click_track(tmp_path / f"c{bpm}.wav", bpm, 12, width=width)
+    r = d.detect_beats(path=str(path))
+    assert abs(r["bpm"] - bpm) < 0.1
+    true = [0.25 + k * 60 / bpm for k in range(len(r["beats"]))]
+    assert max(abs(a - b) for a, b in zip(r["beats"], true)) < 0.006  # within 6 ms on every beat
+    assert len(r["hits"]) >= len(r["beats"]) - 2
+
+
+def test_detect_beats_errors(tmp_path):
+    with pytest.raises(ToolError, match="give clip or path"):
+        d.detect_beats()
+    (tmp_path / "x.mp3").write_bytes(b"ID3 not a wav")
+    with pytest.raises(ToolError, match="not a PCM WAV file"):
+        d.detect_beats(path=str(tmp_path / "x.mp3"))
+    short = click_track(tmp_path / "short.wav", 120, 1)
+    with pytest.raises(ToolError, match="too short"):
+        d.detect_beats(path=str(short))
+    with pytest.raises(ToolError, match="min_bpm"):
+        d.detect_beats(path=str(short), min_bpm=200, max_bpm=100)
+
+
+def test_generate_sound_tone_level(project, tmp_path):
+    out = d.generate_sound("tone", str(tmp_path / "tone.wav"), seconds=0.5, level_db=-20)
+    vals, rate, ch, width = read_wav(tmp_path / "tone.wav")
+    assert (rate, ch, width, len(vals)) == (48000, 2, 3, 24000)
+    assert abs(dbfs(max(vals)) - -20) < 0.05  # peak at -20 dBFS
+    assert out["seconds"] == 0.5
+
+
+def test_generate_sound_pop_and_beeps(project, tmp_path):
+    d.generate_sound("pop", str(tmp_path / "pop.wav"))  # 24 fps timeline: one frame = 2000 samples
+    assert len(read_wav(tmp_path / "pop.wav")[0]) == 2000
+    d.generate_sound("beeps", str(tmp_path / "beeps.wav"), count=3, fps=25, channels=1)
+    vals, _, ch, _ = read_wav(tmp_path / "beeps.wav")
+    assert (ch, len(vals)) == (1, 3 * 48000)
+    loud = [i for i, v in enumerate(vals) if abs(v) > 0.01]
+    assert {i // 48000 for i in loud} == {0, 1, 2}  # one beep per second
+    assert all(i % 48000 < 1920 for i in loud)  # each one frame at 25 fps
+
+
+def test_generate_sound_noise_and_silence(project, tmp_path):
+    d.generate_sound("noise", str(tmp_path / "n.wav"), seconds=0.5, level_db=-30, channels=1)
+    vals = read_wav(tmp_path / "n.wav")[0]
+    rms = _math.sqrt(sum(v * v for v in vals) / len(vals))
+    assert abs(dbfs(rms) - -30) < 0.5
+    d.generate_sound("silence", str(tmp_path / "s.wav"), seconds=0.1)
+    assert set(read_wav(tmp_path / "s.wav")[0]) == {0.0}
+
+
+def test_generate_sound_imports(project, tmp_path):
+    out = d.generate_sound("tone", str(tmp_path / "bars_tone.wav"), seconds=0.1, bin="/")
+    assert out["clip"] == "bars_tone.wav"
+    assert "bars_tone.wav" in [c["name"] for c in d.list_clips()]
+
+
+def test_generate_sound_errors(project, tmp_path):
+    for kwargs, msg in [({"kind": "laser"}, "kind must be"), ({"kind": "tone", "level_db": 3}, "level_db"),
+                        ({"kind": "tone", "path": str(tmp_path / "a.mp3")}, "must end in .wav"),
+                        ({"kind": "beeps", "count": 0, "fps": 24}, "count")]:
+        with pytest.raises(ToolError, match=msg):
+            d.generate_sound(**{"path": str(tmp_path / "a.wav"), **kwargs})
+
+
+def test_generate_voiceover(project):
+    out = d.generate_voiceover("Welcome back.", voice="Male 1", speed=1.5, file_name="vo_intro.wav",
+                               add_to_timeline=True, audio_track=2)
+    assert out == {"clip": "vo_intro.wav", "voice": "Male 1", "added_to_timeline": True}
+    assert project.speech == {"TextInput": "Welcome back.", "VoiceModel": "Male 1", "Speed": 1.5, "Pitch": 0.0,
+                              "AddToTimeline": True, "AudioTrack": 2, "Filename": "vo_intro.wav"}
+
+
+def test_generate_voiceover_missing_extras_is_an_error(project):
+    project.speech_missing_extras = True
+    with pytest.raises(ToolError, match="AI Speech Generator' is not Installed"):
+        d.generate_voiceover("Hello")
+
+
+def test_generate_voiceover_errors(project, tmp_path):
+    with pytest.raises(ToolError, match="350"):
+        d.generate_voiceover("x" * 351)
+    with pytest.raises(ToolError, match="speed must be"):
+        d.generate_voiceover("Hi", speed=20)
+    with pytest.raises(ToolError, match="custom_voice_file"):
+        d.generate_voiceover("Hi", voice="Custom Voice")
+
+
+def test_classify_and_find_audio(project):
+    from conftest import Clip, Folder
+
+    sfx = Folder("SFX", [Clip("sfx_whoosh.wav"), Clip("music_bed.wav")])
+    project.pool.root.subfolders.append(sfx)
+    assert d.classify_audio(bin="SFX") == [
+        {"clip": "sfx_whoosh.wav", "category": "Effects", "subcategory": "Whoosh"},
+        {"clip": "music_bed.wav", "category": "Music", "subcategory": "Score"},
+    ]
+    assert [r["clip"] for r in d.find_audio(category="music")] == ["music_bed.wav"]
+    assert [r["clip"] for r in d.find_audio(name="WHOOSH")] == ["sfx_whoosh.wav"]
+    assert d.find_audio(category="Music", subcategory="Score")[0]["bin"] == "SFX/"
+    assert d.classify_audio(clips=["a.mov"])[0]["category"] == "Dialogue"
+    with pytest.raises(ToolError, match="give clips or bin"):
+        d.classify_audio()
+
+
+def test_find_audio_treats_uncategorized_as_none(project):
+    clip = project.pool.root.clips[0]
+    clip.props["Category"] = "Uncategorized"  # what ClearAudioClassification leaves
+    assert d.find_audio(name="a.mov")[0]["category"] is None
+
+
+def test_mark_beats(project, tmp_path):
+    from conftest import Clip, Item
+
+    music = Clip("song.wav", path=str(click_track(tmp_path / "song.wav", 120, 12)))
+    project.pool.root.clips.append(music)
+    tl = project.current
+    # On the timeline from frame 24, trimmed to start 2.0 s into the song, 5 s long.
+    item = Item("song.wav", tl.start + 24, tl.start + 24 + 120, media=music, timeline=tl)
+    item.source_start = 2.0
+    tl.tracks[("audio", 1)] = [item]
+    out = d.mark_beats(1)
+    assert (out["bpm"], out["markers"]) == (120.0, 10)  # beats at 2.25, 2.75 ... 6.75 s
+    frames = sorted(tl.markers)
+    assert frames[0] == 24 + 6  # (2.25 - 2.0) s * 24 fps after the clip start
+    assert all(b - a == 12 for a, b in zip(frames, frames[1:]))  # half a second apart
+    assert json.loads(tl.markers[frames[0]]["customData"])["bpm"] == 120.0
+
+    tl.markers.clear()
+    assert d.mark_beats(1, every=4)["markers"] == 3
+    again = d.mark_beats(1, every=4)
+    assert (again["markers"], again["skipped"]) == (0, 3)  # existing markers are kept, not duplicated
+
+
+def test_mark_beats_errors(project):
+    from conftest import Item
+
+    project.current.tracks[("audio", 1)] = [Item("tone", 0, 10, media=None, timeline=project.current)]
+    with pytest.raises(ToolError, match="has no source clip"):
+        d.mark_beats(1)
+    with pytest.raises(ToolError, match="every must be"):
+        d.mark_beats(1, every=0)
+    with pytest.raises(ToolError, match="unknown marker color"):
+        d.mark_beats(1, color="Orange")

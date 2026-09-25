@@ -19,6 +19,11 @@ import functools
 import inspect
 import json
 import logging
+import math
+import random
+import struct
+import wave
+from array import array
 import os
 import shutil
 import sys
@@ -50,6 +55,7 @@ mcp = MCPServer(
     instructions="Controls the running DaVinci Resolve instance: projects, media pool, timelines, "
     "clip properties, transitions, titles, markers, color grading and management, HDR, Fusion compositing, audio, "
     "media management, projects and review notes, transcripts, subtitle files and titles, keyframes, multicam, "
+    "sound effects and music (voiceover, test tones, beat detection), "
     "interchange export and rendering. "
     "Start with timeline_overview to see the edit and view_frame to see the picture. "
     "Frames are absolute timeline frames.",
@@ -3179,6 +3185,335 @@ def flatten_multicam(item: int, grade: str = "copy", track: int = 1) -> str:
     if not _method(it, "FlattenMulticam", "21.1")(_constant(resolve, _choice(grade, options, "grade"))):
         raise ToolError(f"FlattenMulticam failed on '{name}' (is it a multicam clip?)")
     return f"flattened '{name}'"
+
+
+
+# --- Sound effects and music ---
+#
+# Resolve's API has no music generation, beat detection or ducking. It does have AI voiceover (Resolve 21
+# GenerateSpeech) and audio classification. Test/sync sounds are synthesized here as 24-bit WAV, and beats are
+# detected here from WAV audio (pure Python, no dependencies); both are then used through the normal tools.
+
+@_tool
+def generate_voiceover(
+    text: str,
+    voice: str = "Female 1",
+    speed: float = 0.0,
+    pitch: float = 0.0,
+    variation: float | None = None,
+    custom_voice_file: str | None = None,
+    file_name: str | None = None,
+    add_to_timeline: bool = False,
+    audio_track: int = 0,
+) -> dict:
+    """Generate a spoken voiceover clip with Resolve's AI Speech Generator (Resolve 21+, needs the "AI Speech
+    Generator" Extras package). text up to 350 characters (split longer scripts into several clips); voice e.g.
+    "Female 1", "Male 1", or "Custom Voice" with custom_voice_file; speed -10..10, pitch -2..2, variation 0..1.
+    add_to_timeline places it at the playhead on audio_track (0 = a new track)."""
+    if not text.strip():
+        raise ToolError("no text")
+    if len(text) > 350:
+        raise ToolError(f"text is {len(text)} characters; Resolve accepts up to 350 per clip")
+    if not -10 <= speed <= 10 or not -2 <= pitch <= 2 or (variation is not None and not 0 <= variation <= 1):
+        raise ToolError("speed must be -10..10, pitch -2..2, variation 0..1")
+    settings = {"TextInput": text, "VoiceModel": voice, "Speed": float(speed), "Pitch": float(pitch),
+                "AddToTimeline": add_to_timeline, "AudioTrack": audio_track}
+    if voice == "Custom Voice":
+        if not custom_voice_file or not os.path.exists(custom_voice_file):
+            raise ToolError("Custom Voice needs an existing custom_voice_file")
+        settings["CustomVoiceFile"] = os.path.abspath(custom_voice_file)
+    if variation is not None:
+        settings["Variation"] = float(variation)
+    if file_name:
+        settings["Filename"] = file_name
+    _, proj = _project()
+    result = _method(proj, "GenerateSpeech", "21")(settings)
+    # With the Extras package missing Resolve returns an explanatory STRING, which is truthy.
+    if isinstance(result, str):
+        raise ToolError(f"GenerateSpeech: {result}")
+    if not result:
+        raise ToolError("GenerateSpeech failed")
+    return {"clip": result.GetName(), "voice": voice, "added_to_timeline": add_to_timeline}
+
+
+UNCLASSIFIED = ("", "Uncategorized")
+
+
+def _audio_class(c):
+    cat = c.GetClipProperty("Category") or ""
+    return {"clip": c.GetName(), "category": None if cat in UNCLASSIFIED else cat,
+            "subcategory": (c.GetMetadata("Subcategory") or None) if cat not in UNCLASSIFIED else None}
+
+
+@_tool
+def classify_audio(clips: list[str] | None = None, bin: str | None = None) -> list[dict]:
+    """Let Resolve analyze and label audio clips by category (e.g. Dialogue, Music, Effects) and subcategory, for the
+    given clips or every clip in a bin (and its sub-bins). Resolve 21+."""
+    if (clips is None) == (bin is None):
+        raise ToolError("give clips or bin")
+    _, proj = _project()
+    if clips is not None:
+        targets = _pool_clips(proj, clips)
+        failed = [c.GetName() for c in targets if not _method(c, "PerformAudioClassification", "21")()]
+        if failed:
+            raise ToolError(f"classification failed for {', '.join(failed)}")
+    else:
+        folder = _bin(proj, bin)
+        if not _method(folder, "PerformAudioClassification", "21")():
+            raise ToolError(f"classification failed for bin {bin}")
+        targets = [c for _, c in _walk(folder)]
+    return [_audio_class(c) for c in targets]
+
+
+@_tool
+def find_audio(category: str | None = None, subcategory: str | None = None, name: str | None = None,
+               bin: str | None = None) -> list[dict]:
+    """Search the media pool (or a bin) for audio by the category/subcategory classify_audio assigned and/or a name
+    fragment (case-insensitive), e.g. category="Music" or name="whoosh"."""
+    _, proj = _project()
+    folder = _bin(proj, bin) if bin else proj.GetMediaPool().GetRootFolder()
+    out = []
+    for path, c in _walk(folder):
+        row = _audio_class(c)
+        if category and (row["category"] or "").lower() != category.lower():
+            continue
+        if subcategory and (row["subcategory"] or "").lower() != subcategory.lower():
+            continue
+        if name and name.lower() not in c.GetName().lower():
+            continue
+        out.append({"bin": path or "/", **row})
+    return out
+
+
+SOUND_KINDS = ("tone", "pop", "beeps", "silence", "noise")
+
+
+def _write_wav24(path, samples, rate, channels):
+    frames = bytearray()
+    for v in samples:
+        b = int(max(-1.0, min(1.0, v)) * 8388607).to_bytes(3, "little", signed=True)
+        frames += b * channels
+    with wave.open(path, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(3)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+
+
+@_tool
+def generate_sound(
+    kind: str,
+    path: str,
+    seconds: float = 1.0,
+    level_db: float = -20.0,
+    frequency: float = 1000.0,
+    count: int = 3,
+    fps: float | None = None,
+    channels: int = 2,
+    sample_rate: int = 48000,
+    bin: str | None = None,
+) -> dict:
+    """Synthesize a utility sound as a 24-bit WAV: tone (reference tone, e.g. 1 kHz at -20 dBFS for bars and tone),
+    pop (a 2-pop: one frame of tone, placed 2 s before program start), beeps (a countdown: `count` one-frame beeps a
+    second apart), silence, or noise (white noise at level_db RMS, e.g. a room-tone placeholder). fps sets the frame
+    length for pop/beeps (default: the current timeline's). bin imports the file into that media-pool bin
+    ("/" for the root) and returns the clip name."""
+    if kind not in SOUND_KINDS:
+        raise ToolError(f"kind must be one of: {', '.join(SOUND_KINDS)}")
+    if level_db > 0 or not 20 <= frequency <= sample_rate / 2 or channels not in (1, 2) or seconds <= 0:
+        raise ToolError("level_db must be <= 0, frequency 20 Hz..Nyquist, channels 1 or 2, seconds > 0")
+    path = os.path.abspath(path)
+    if not path.lower().endswith(".wav"):
+        raise ToolError("path must end in .wav")
+    if not os.path.isdir(os.path.dirname(path)):
+        raise ToolError(f"folder not found: {os.path.dirname(path)}")
+    if kind in ("pop", "beeps") and fps is None:
+        fps = float(_timeline()[1].GetSetting("timelineFrameRate") or 24)
+    amp = 10 ** (level_db / 20)
+    tone = lambda i: amp * math.sin(2 * math.pi * frequency * i / sample_rate)  # noqa: E731
+    if kind == "tone":
+        samples = [tone(i) for i in range(int(seconds * sample_rate))]
+    elif kind == "pop":
+        samples = [tone(i) for i in range(round(sample_rate / fps))]
+        seconds = len(samples) / sample_rate
+    elif kind == "beeps":
+        if count < 1:
+            raise ToolError("count must be at least 1")
+        frame = round(sample_rate / fps)
+        samples = [tone(i) if i % sample_rate < frame else 0.0 for i in range(count * sample_rate)]
+        seconds = float(count)
+    elif kind == "silence":
+        samples = [0.0] * int(seconds * sample_rate)
+    else:
+        rnd = random.Random(0)
+        samples = [amp * math.sqrt(3) * rnd.uniform(-1, 1) for _ in range(int(seconds * sample_rate))]
+    _write_wav24(path, samples, sample_rate, channels)
+    out = {"path": path, "kind": kind, "seconds": round(seconds, 4), "level_db": level_db}
+    if bin is not None:
+        out["clip"] = import_media([path], bin=None if bin == "/" else bin)[0]
+    return out
+
+
+def _wav_envelope(path, hop_seconds=0.01):
+    """RMS envelope (one value per hop) of a PCM WAV, via fast 16-bit views of the sample bytes."""
+    try:
+        w = wave.open(path, "rb")
+    except (wave.Error, EOFError) as e:
+        raise ToolError(f"not a PCM WAV file: {os.path.basename(path)} ({e}); render or convert the music to WAV") from e
+    with w:
+        rate, ch, width, n = w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
+        raw = w.readframes(n)
+    if width == 2:
+        pcm = array("h", raw)
+    elif width in (3, 4):  # keep the top two bytes of each sample: same envelope, C-speed slicing
+        hi = bytearray(len(raw) // width * 2)
+        hi[0::2], hi[1::2] = raw[width - 2::width], raw[width - 1::width]
+        pcm = array("h", bytes(hi))
+    else:
+        raise ToolError(f"unsupported WAV sample width: {8 * width}-bit")
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    hop = max(1, int(rate * hop_seconds)) * ch
+    step = max(1, ch * (rate // 8000))  # ~8 kHz is plenty for an energy envelope
+    env = []
+    for i in range(0, len(pcm) - hop + 1, hop):
+        chunk = pcm[i:i + hop:step]
+        env.append(math.sqrt(math.fsum(x * x for x in chunk) / max(1, len(chunk))) / 32768.0)
+    return env, n / rate
+
+
+def _fit_grid(onset, hop, duration, period, phase, floor):
+    """Snap each grid beat to its onset peak (within +-40 ms, sub-hop by parabolic interpolation), then fit a
+    straight line through (beat number, time). Averaging over every beat removes the drift that a 10 ms-resolution
+    period would build up over a long track. Returns the refined (period, phase)."""
+    pts = []
+    for k in range(int((duration - phase) / period) + 1):
+        c = int(round((phase + k * period) / hop))
+        lo, hi = max(1, c - 4), min(len(onset) - 1, c + 5)
+        if lo >= hi:
+            continue
+        i = max(range(lo, hi), key=onset.__getitem__)
+        if onset[i] <= floor:
+            continue
+        a, b, c_ = onset[i - 1], onset[i], onset[i + 1]
+        den = a - 2 * b + c_
+        pts.append((k, (i + (0.5 * (a - c_) / den if den else 0.0)) * hop))
+    if len(pts) < 4:
+        return period, phase
+    n = len(pts)
+    mk, mt = sum(k for k, _ in pts) / n, sum(t for _, t in pts) / n
+    var = sum((k - mk) ** 2 for k, _ in pts)
+    if not var:
+        return period, phase
+    period = sum((k - mk) * (t - mt) for k, t in pts) / var
+    return period, (mt - period * mk) % period
+
+
+def _beats(path, sensitivity=1.4, min_bpm=60.0, max_bpm=200.0):
+    hop = 0.01
+    env, duration = _wav_envelope(path, hop)
+    if len(env) < 200:
+        raise ToolError("audio too short for beat detection (needs at least 2 s)")
+    flux = [0.0] + [max(0.0, b - a) for a, b in zip(env, env[1:])]
+    mean = math.fsum(flux) / len(flux)
+    onset = [max(0.0, f - mean) for f in flux]
+    # Tempo: autocorrelation of the onset curve over the allowed beat periods.
+    lags = range(int(60 / max_bpm / hop), int(60 / min_bpm / hop) + 1)
+    scores = {lag: math.fsum(a * b for a, b in zip(onset, onset[lag:])) / (len(onset) - lag) for lag in lags}
+    lag = max(scores, key=scores.get)
+    if scores[lag] <= 0:
+        raise ToolError("no rhythmic pattern found")
+    # Refine to a fractional period around the best integer lag.
+    period = lag * hop
+    if lag - 1 in scores and lag + 1 in scores:
+        a, b, c = scores[lag - 1], scores[lag], scores[lag + 1]
+        denom = a - 2 * b + c
+        if denom:
+            period = (lag + 0.5 * (a - c) / denom) * hop
+    # Phase: the grid offset that lands on the most onset energy.
+    steps = int(round(period / hop))
+    phase = max(range(steps), key=lambda p: math.fsum(onset[p::steps])) * hop
+    floor = math.fsum(onset) / len(onset)
+    for _ in range(3):  # each pass tightens the grid, so later beats land inside the snapping window
+        period, phase = _fit_grid(onset, hop, duration, period, phase, floor)
+    beats = []
+    t = phase
+    while t < duration:
+        beats.append(round(t, 3))
+        t += period
+    # Strong individual hits (accents, drops): local maxima well above their neighbourhood.
+    w = int(0.5 / hop)
+    hits = [round(i * hop, 3) for i in range(1, len(onset) - 1)
+            if onset[i] > 0 and onset[i] >= onset[i - 1] and onset[i] > onset[i + 1]
+            and onset[i] > sensitivity * math.fsum(onset[max(0, i - w):i + w]) / (2 * w)]
+    return {"bpm": round(60 / period, 2), "beats": beats, "hits": hits, "duration": round(duration, 3)}
+
+
+def _clip_file(proj, clip):
+    (c,) = _pool_clips(proj, [clip])
+    path = c.GetClipProperty("File Path")
+    if not path or not os.path.exists(path):
+        raise ToolError(f"{clip}'s file is not reachable: {path}")
+    return path
+
+
+@_tool
+def detect_beats(clip: str | None = None, path: str | None = None, sensitivity: float = 1.4,
+                 min_bpm: float = 60.0, max_bpm: float = 200.0) -> dict:
+    """Find the tempo and beats of a music track (a media-pool clip, or a WAV path): bpm, a regular beat grid in
+    seconds from the start of the file, and strong hits (accents, drops) above `sensitivity` x their surroundings.
+    WAV (PCM 16/24/32-bit) only; for other formats, render an audio-only WAV first. Detection runs here, not in
+    Resolve."""
+    if (clip is None) == (path is None):
+        raise ToolError("give clip or path")
+    if not 20 <= min_bpm < max_bpm <= 300:
+        raise ToolError("need 20 <= min_bpm < max_bpm <= 300")
+    if clip is not None:
+        path = _clip_file(_project()[1], clip)
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        raise ToolError(f"file not found: {path}")
+    out = _beats(path, sensitivity, min_bpm, max_bpm)
+    return {"file": os.path.basename(path), **out}
+
+
+@_tool
+def mark_beats(item: int, track: int = 1, every: int = 1, color: str = "Yellow", hits: bool = False,
+               sensitivity: float = 1.4, max_markers: int = 500) -> dict:
+    """Put timeline markers on the beats of a music clip that is on the timeline (item: 1-based index on audio
+    `track`), for cutting to the music. every=4 marks every 4th beat (one per bar in 4/4); hits=True marks the strong
+    hits instead of the grid. Markers are placed only where the clip plays, using its trim; frames where a marker
+    already exists are skipped."""
+    if every < 1:
+        raise ToolError("every must be at least 1")
+    if color not in MARKER_COLORS:
+        raise ToolError(f"unknown marker color: {color}")
+    proj, tl = _timeline()
+    it = _pick(tl, item, track, "audio")
+    mpi = _opt(it, "GetMediaPoolItem")
+    if not mpi:
+        raise ToolError(f"'{it.GetName()}' has no source clip")
+    found = _beats(os.path.abspath(_clip_file(proj, mpi.GetName())), sensitivity)
+    fps = float(tl.GetSetting("timelineFrameRate") or 24)
+    src_in = _opt(it, "GetSourceStartTime")  # seconds into the source; audio frame counts are unreliable
+    if src_in is None:
+        src_in = float(_opt(it, "GetLeftOffset") or 0) / fps
+    length = it.GetDuration() / fps
+    times = found["hits"] if hits else found["beats"][::every]
+    base = it.GetStart() - tl.GetStartFrame()
+    placed, skipped = [], 0
+    for n, t in enumerate(times, 1):
+        if not src_in <= t < src_in + length:
+            continue
+        frame = base + round((t - src_in) * fps)
+        if len(placed) >= max_markers:
+            break
+        if tl.AddMarker(frame, color, f"beat {n}", "", 1, json.dumps({"beat": n, "bpm": found["bpm"]})):
+            placed.append(frame)
+        else:
+            skipped += 1
+    return {"item": it.GetName(), "bpm": found["bpm"], "markers": len(placed), "skipped": skipped,
+            "first_frames": placed[:8]}
 
 
 if __name__ == "__main__":

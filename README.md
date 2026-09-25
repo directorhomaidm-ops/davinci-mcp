@@ -181,6 +181,25 @@ Notes:
 - Caption languages are Resolve's: `auto` `danish` `dutch` `english` `french` `german` `italian` `japanese` `korean` `mandarin_simplified` `mandarin_traditional` `norwegian` `portuguese` `russian` `spanish` `swedish`. Arabic is not among them.
 - `voice_isolation`, `transcribe_audio`, `create_subtitles` are Studio features; on the free edition Resolve opens an upgrade dialog that blocks further API calls until it is closed.
 
+### Sound effects and music
+
+| Tool | Parameters | Returns | Errors |
+|---|---|---|---|
+| `generate_voiceover` | `text: str` (≤ 350 chars), `voice: str = "Female 1"`, `speed` (−10…10), `pitch` (−2…2), `variation` (0…1), `custom_voice_file`, `file_name`, `add_to_timeline: bool = False`, `audio_track: int = 0` | `{clip, voice, added_to_timeline}` | Text too long; out-of-range values; Extras package missing; Resolve older than 21 |
+| `classify_audio` | `clips: list[str]` **or** `bin: str` | `[{clip, category, subcategory}]` | Resolve older than 21 |
+| `find_audio` | `category`, `subcategory`, `name`, `bin` (any of them) | `[{bin, clip, category, subcategory}]` | |
+| `generate_sound` | `kind: "tone" \| "pop" \| "beeps" \| "silence" \| "noise"`, `path: str` (.wav), `seconds`, `level_db: float = -20`, `frequency: float = 1000`, `count: int = 3`, `fps`, `channels: 1 \| 2 = 2`, `sample_rate: int = 48000`, `bin: str \| None` | `{path, kind, seconds, level_db, clip?}` | Unknown kind; level above 0 dBFS; not .wav |
+| `detect_beats` | `clip: str` **or** `path: str`, `sensitivity: float = 1.4`, `min_bpm: float = 60`, `max_bpm: float = 200` | `{file, bpm, beats, hits, duration}` (seconds) | Not a PCM WAV; shorter than 2 s; no rhythm found |
+| `mark_beats` | `item: int` (on audio `track`), `track: int = 1`, `every: int = 1`, `color: str = "Yellow"`, `hits: bool = False`, `sensitivity`, `max_markers: int = 500` | `{item, bpm, markers, skipped, first_frames}` | No source clip; unknown color |
+
+Notes:
+
+- Resolve's API has no music generation, beat detection or ducking. Beats are detected by this server from WAV audio (PCM 16/24/32-bit, pure Python): an autocorrelation tempo estimate refined by fitting every detected beat, which on synthetic tracks lands within about 4 ms of each true beat over 3 minutes (1.4 s to analyse). For MP3/AAC/etc. render or export the music as WAV first.
+- `mark_beats` workflow: put the music on an audio track, `mark_beats(item, every=4)` for one marker per bar in 4/4 (or `hits=True` for accents and drops), then cut on the markers. It reads the clip's trim through `GetSourceStartTime` (seconds), since audio items' frame counts follow the WAV's import-time rate.
+- `generate_sound` writes 24-bit WAV: `tone` for bars and tone (1 kHz at −20 dBFS by default), `pop` for a 2-pop (one frame at the timeline rate, placed 2 s before program start), `beeps` for a countdown, `noise` for a room-tone placeholder at `level_db` RMS, `silence`.
+- `generate_voiceover` needs Resolve 21 and the AI Speech Generator Extras package. When the package is missing Resolve returns an explanatory string instead of failing, which the tool reports as the error.
+- `classify_audio` labels clips (e.g. Dialogue, Music, Effects, with subcategories) so `find_audio` can search a sound library; cleared clips read `Uncategorized` and are treated as unclassified.
+
 ### Rendering
 
 | Tool | Parameters | Returns | Errors |

@@ -106,6 +106,12 @@ class Clip:
                 "Proxy Media Path": self.proxy or "", "Reel Name": "", **self.props}
         return allp if key is None else allp.get(key)
 
+    def PerformAudioClassification(self):
+        kind = "Music" if "music" in self.name else "Effects" if "sfx" in self.name else "Dialogue"
+        self.props["Category"] = kind
+        self.metadata["Subcategory"] = {"Music": "Score", "Effects": "Whoosh", "Dialogue": "Interview"}[kind]
+        return True
+
     def TranscribeAudio(self, speaker_detection=None):
         if self.name.endswith(".wav") or self.name.endswith(".mov"):
             self.transcribed_with = speaker_detection
@@ -126,6 +132,13 @@ class Folder:
 
     def GetSubFolderList(self):
         return self.subfolders
+
+    def PerformAudioClassification(self):
+        for c in self.clips:
+            c.PerformAudioClassification()
+        for f in self.subfolders:
+            f.PerformAudioClassification()
+        return True
 
     def GetIsFolderStale(self):
         return getattr(self, "stale", False)
@@ -175,6 +188,9 @@ class Item:
 
     def GetMediaPoolItem(self):
         return self.media
+
+    def GetSourceStartTime(self):
+        return getattr(self, "source_start", 0.0)
 
     def GetClipEnabled(self):
         return self.enabled
@@ -879,6 +895,14 @@ class Project:
     def InsertAudioToCurrentTrackAtPlayhead(self, path, offset, duration):
         self.inserted_audio = (path, offset, duration)
         return True
+
+    def GenerateSpeech(self, settings):
+        self.speech = settings
+        if getattr(self, "speech_missing_extras", False):
+            return "Required Package, 'AI Speech Generator' is not Installed."  # measured: a string, not False
+        clip = Clip(settings.get("Filename") or "Speech 1.wav")
+        self.pool.GetCurrentFolder().clips.append(clip)
+        return clip
 
     def ExportCurrentFrameAsStill(self, path):
         if not Path(path).parent.is_dir():
