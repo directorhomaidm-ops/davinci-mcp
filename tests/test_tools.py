@@ -207,6 +207,7 @@ def test_all_tools_registered():
         "create_color_group", "delete_color_group", "assign_color_group", "apply_arri_cdl_lut", "color_cache",
         "gallery_albums", "import_stills", "validate_dctl", "super_scale", "ai_slow_motion", "remove_silences",
         "cut_by_transcript", "social_platforms", "social_timeline", "social_render", "social_export",
+        "animated_title", "lower_third", "save_template", "list_templates", "apply_template", "batch_titles",
     }
 
 
@@ -2636,3 +2637,139 @@ def test_social_timeline_reframe_skips_titles(project, monkeypatch):
     project.current.tracks[("video", 1)][1].media = None
     out = d.social_timeline("tiktok", reframe=True)
     assert (out["reframed"], out["warnings"]) == (1, [])
+
+
+
+# --- animated titles and templates ---
+
+
+def _keys(comp, node, inp):
+    return comp.FindTool(node).inputs[inp].keys
+
+
+def test_animated_title_pop_and_slide(project):
+    _two_items(project)
+    out = d.animated_title("Chapter 1", animation="pop", exit="slide_left", speed=10, font="Arial", size=0.1,
+                           color=[1, 1, 0], position=[0.5, 0.3])
+    assert (out["track"], out["item"], out["duration"], out["animation_frames"]) == (1, 3, 120, 10)
+    title = project.current.tracks[("video", 1)][2]
+    comp = title.comps[0]
+    assert out["set"]["StyledText"] == "Chapter 1" and out["set"]["Center"] == {"1": 0.5, "2": 0.3}
+    # Template -> TitleMotion -> MediaOut1
+    nodes = {n["name"]: n for n in d.fusion_nodes(3)}
+    assert nodes["TitleMotion"]["inputs"] == {"Input": "Template"} and nodes["MediaOut1"]["inputs"] == {"Input": "TitleMotion"}
+    assert _keys(comp, "TitleMotion", "Size") == {0: 0.0, 7: 1.12, 10: 1.0}
+    # exits continuing leftwards: centre to the left edge side over the last 10 frames (109..119)
+    assert _keys(comp, "TitleMotion", "Center") == {109: {1: 0.5, 2: 0.5}, 119: {1: 0.25, 2: 0.5}}
+    assert not getattr(title, "fades", None)
+    _assert_lock_rules(comp)
+
+
+def test_animated_title_fade_and_typewriter(project):
+    out = d.animated_title("Hello world", animation="typewriter", exit="fade", speed=8)
+    title = project.current.tracks[("video", 1)][0]
+    assert _keys(title.comps[0], "Template", "End") == {0: 0.0, 22: 1.0}  # 2 frames per character
+    assert title.fades["FadeOut"] == 8.0 and title.comps[0].FindTool("TitleMotion") is None
+    assert out["exit"] == "fade"
+    with pytest.raises(ToolError, match="animation must be one of"):
+        d.animated_title("x", animation="explode")
+
+
+def test_title_insert_that_moves_clips_is_refused(project, monkeypatch):
+    a, b = _two_items(project)
+    tl = project.current
+    real = tl.InsertFusionTitleIntoTimeline
+
+    def cutting_insert(name):  # what an insert into V1 mid-clip would do
+        item = real(name)
+        a.end -= 10
+        return item
+
+    monkeypatch.setattr(tl, "InsertFusionTitleIntoTimeline", cutting_insert)
+    with pytest.raises(ToolError, match=r"changed existing clips on video track\(s\) \[1\]"):
+        d.animated_title("x", frame=5)
+    assert tl.playhead == "00:00:00:05"
+
+
+def test_lower_third(project):
+    out = d.lower_third("Sara Ahmed", "Colorist", side="right")
+    assert out["set"]["StyledText"] == "Sara Ahmed\nColorist" and out["set"]["Center"] == {"1": 0.72, "2": 0.16}
+    assert (out["animation"], out["exit"]) == ("slide_left", "fade")
+    comp = project.current.tracks[("video", 1)][0].comps[0]
+    assert _keys(comp, "TitleMotion", "Center")[0] == {1: 0.75, 2: 0.5}  # enters from the right
+    with pytest.raises(ToolError, match="side must be"):
+        d.lower_third("x", side="top")
+
+
+@pytest.fixture
+def templates(tmp_path, monkeypatch):
+    folder = tmp_path / "templates"
+    monkeypatch.setattr(d, "TEMPLATES_DIR", str(folder))
+    return folder
+
+
+def test_save_list_apply_template(project, templates):
+    d.animated_title("Episode 1", animation="pop", exit="none")
+    saved = d.save_template(1, "Episode Card")
+    assert saved["texts"] == {"Template": "Episode 1"} and (templates / "Episode Card.comp").exists()
+    with pytest.raises(ToolError, match="exists"):
+        d.save_template(1, "Episode Card")
+    with pytest.raises(ToolError, match="invalid template name"):
+        d.save_template(1, "../x")
+    listed = d.list_templates()
+    assert [t["template"] for t in listed["saved"]] == ["Episode Card"] and listed["saved"][0]["duration"] == 120
+    out = d.apply_template("Episode Card", text="Episode 2")
+    assert (out["item"], out["text"]) == (2, "Episode 2")
+    new = project.current.tracks[("video", 1)][1]
+    assert [c.name for c in new.comps] == ["Episode Card"] and new.active_comp == "Episode Card"  # the default is gone
+    assert d.list_titles()[1]["texts"] == {"Template": "Episode 2"}
+
+
+def test_apply_template_to_clip(project, templates):
+    a, b = _two_items(project)
+    d.insert_fusion_effect(1, "Blur")
+    d.save_template(1, "Soft")
+    out = d.apply_template("Soft", item=2)
+    assert out["item"] == 2 and [c.name for c in b.comps] == ["Soft"] and b.active_comp == "Soft"
+    with pytest.raises(ToolError, match="no Text\\+ node"):
+        d.apply_template("Soft", item=2, text="x")
+    assert b.active_comp == "Soft 2"  # the second import, made active
+    with pytest.raises(ToolError, match="template not found"):
+        d.apply_template("Nope")
+
+
+def test_batch_titles(project, templates):
+    made = d.batch_titles([{"frame": 200, "text": "Two"}, {"frame": 50, "text": "One"}], animation="zoom")
+    assert [m["set"]["StyledText"] for m in made] == ["One", "Two"]  # in time order
+    d.save_template(1, "Card")
+    made = d.batch_titles([{"frame": 300, "text": "Three"}], template="Card")
+    assert made[0]["text"] == "Three" and made[0]["template"] == "Card"
+    with pytest.raises(ToolError, match="needs a frame and a text"):
+        d.batch_titles([{"frame": 1}])
+    with pytest.raises(ToolError, match="template not found"):
+        d.batch_titles([{"frame": 1, "text": "x"}], template="Missing")
+
+
+def test_animation_length_capped_at_a_third(project):
+    out = d.animated_title("Long", animation="zoom", exit="none", speed=100)
+    assert out["animation_frames"] == 40  # 120-frame title
+
+
+def test_apply_template_same_comp_name(project, templates, monkeypatch):
+    a, b = _two_items(project)
+    d.insert_fusion_effect(1, "Blur")
+    d.save_template(1, "Soft")
+    d.apply_template("Soft", item=2)
+    Item = type(b)
+    real = Item.ImportFusionComp
+
+    def same_name(self, path):  # a build that repeats the name instead of numbering it
+        comp = real(self, path)
+        comp.name = "Soft"
+        return comp
+
+    monkeypatch.setattr(Item, "ImportFusionComp", same_name)
+    loaded = []
+    monkeypatch.setattr(Item, "LoadFusionCompByName", lambda self, n: loaded.append(n) or True)
+    d.apply_template("Soft", item=2)
+    assert loaded == ["Soft"] and [c.name for c in b.comps][-1] == "Soft"

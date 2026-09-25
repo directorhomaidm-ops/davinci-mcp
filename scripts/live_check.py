@@ -329,6 +329,18 @@ def run_checks(args, work, is_211):
     step("social: social_export tiktok + youtube (queued only)", lambda: d.social_export(
         ["tiktok", "youtube"], str(work), timeline="Check", start=False), needs=have_items)
 
+    print("\nAnimated titles and templates")
+    d.TEMPLATES_DIR = str(work / "templates")  # keep the check's templates out of your own folder
+    step("titles: animated_title pop + slide_left exit at the end of 'Check'", lambda: _anim_title(),
+         needs=have_items, note="TitleMotion keyframes; check frame_title.png for the text")
+    step("titles: typewriter title (finds the Text+ write-on input)", lambda: d.animated_title(
+        "typed on", animation="typewriter", exit="fade", frame=_end("Check")), needs=have_items)
+    step("titles: lower_third", lambda: d.lower_third("Sara Ahmed", "Colorist", frame=_end("Check")),
+         needs=have_items)
+    step("titles: save_template + list_templates + apply_template", lambda: _templates(), needs=have_items)
+    step("titles: probe: title inserted over a clip (frame 6 of 'Check')", lambda: _title_over_clip(),
+         needs=have_items, note="informational: where Resolve puts it; a refusal means it cut the clip (undone by hand)")
+
 
 # --- helpers for individual checks ------------------------------------------------------------------------------
 
@@ -396,6 +408,35 @@ def _dctl():
     bad = d.validate_dctl("float x;")
     expect(not bad["valid"], "broken DCTL accepted")
     return {"good": ok, "bad": bad}
+
+
+def _end(name):
+    d.switch_timeline(name)
+    return int(d.timeline_overview()["end_frame"]) + 1
+
+
+def _anim_title():
+    out = d.animated_title("Live check", animation="pop", exit="slide_left", frame=_end("Check"))
+    keys = d.list_keyframes(out["item"], track=out["track"])
+    expect(any(k["node"] == "TitleMotion" for k in keys), f"no TitleMotion keyframes: {keys}")
+    return {"title": out, "keyframes": keys}
+
+
+def _templates():
+    title = d.list_titles()[-1]
+    saved = d.save_template(title["item"], "Live Check Card", track=title["track"], overwrite=True)
+    listed = d.list_templates()
+    applied = d.apply_template("Live Check Card", frame=_end("Check"), text="from template")
+    expect(d.list_titles()[-1]["texts"], "applied template has no text")
+    return {"saved": saved["path"], "installed_titles": len(listed["installed_titles"]), "applied": applied}
+
+
+def _title_over_clip():
+    d.switch_timeline("Check")
+    try:
+        return {"placed": d.animated_title("over a clip", frame=6, exit="none")}
+    except d.ToolError as e:
+        return {"refused": str(e)}
 
 
 def _silence_cut(work):

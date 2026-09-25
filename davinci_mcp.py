@@ -2919,6 +2919,20 @@ def write_subtitles(path: str, captions: list[dict], fps: float | None = None, r
     return {"path": _write_captions(path, rows, rtl), "captions": len(rows)}
 
 
+def _title_values(text=None, font=None, style=None, size=None, color=None, position=None):
+    """Text+ input values for the given title settings (only those given)."""
+    values = {k: v for k, v in (("StyledText", text), ("Font", font), ("Style", style), ("Size", size)) if v is not None}
+    if color is not None:
+        if len(color) != 3 or not all(0 <= float(v) <= 1 for v in color):
+            raise ToolError("color needs [r, g, b] with values 0-1")
+        values.update(Red1=float(color[0]), Green1=float(color[1]), Blue1=float(color[2]))
+    if position is not None:
+        if len(position) != 2 or not all(0 <= float(v) <= 1 for v in position):
+            raise ToolError("position needs [x, y] with values 0-1 (0.5, 0.5 is the frame center, y up)")
+        values["Center"] = [float(position[0]), float(position[1])]
+    return values
+
+
 def _text_nodes(it):
     comp = it.GetFusionCompByIndex(1) if int(_opt(it, "GetFusionCompCount") or 0) else None
     return comp, (list((comp.GetToolList(False, "TextPlus") or {}).values()) if comp else [])
@@ -2967,11 +2981,7 @@ def set_title_text(
                         f"{', '.join(_tool_attrs(t)[0] for t in nodes)}")
     tool = nodes[0]
     name = _tool_attrs(tool)[0]
-    values = {k: v for k, v in (("StyledText", text), ("Font", font), ("Style", style), ("Size", size)) if v is not None}
-    if color is not None:
-        if len(color) != 3 or not all(0 <= float(v) <= 1 for v in color):
-            raise ToolError("color needs [r, g, b] with values 0-1")
-        values.update(Red1=float(color[0]), Green1=float(color[1]), Blue1=float(color[2]))
+    values = _title_values(text, font, style, size, color)
     if not values:
         raise ToolError("nothing to change")
     applied = {k: _set_input(comp, tool, name, k, value=v)["value"] for k, v in values.items()}
@@ -4486,6 +4496,277 @@ def social_export(platforms: list[str], target_dir: str, timeline: str | None = 
     if start and not proj.StartRendering([j["job"] for j in jobs], isInteractiveMode=False):
         raise ToolError(f"{len(jobs)} job(s) queued but rendering did not start (see render_queue)")
     return {"target_dir": os.path.abspath(target_dir), "jobs": jobs, "started": start}
+
+
+# --- Animated titles and templates ---
+#
+# Titles are Fusion Text+ titles. Their animation is keyframed in the title's own comp: motion on a Transform named
+# TitleMotion between the Text+ (Template) and MediaOut1, typing on the Text+ write-on range, and fades as the
+# item's own fades (Resolve 21.1+). Resolve puts an inserted title on a track of its choosing at the playhead, so
+# every insert is checked against the clips that were already on the timeline.
+
+TITLE_ANIMATIONS = ("none", "fade", "pop", "zoom", "slide_up", "slide_down", "slide_left", "slide_right", "typewriter")
+# Where a slide starts from (entrance) in Transform Center units; the exit continues the same way.
+SLIDE_FROM = {"slide_up": (0.5, 0.35), "slide_down": (0.5, 0.65), "slide_left": (0.75, 0.5), "slide_right": (0.25, 0.5)}
+WRITE_ON_INPUTS = ("WriteOnEnd", "End")  # Text+ write-on range end, by the ids Fusion builds have used
+TEMPLATES_DIR = os.path.expanduser(os.environ.get("DAVINCI_MCP_TEMPLATES", "~/Documents/DaVinci MCP Templates"))
+RESOLVE_TITLE_DIRS = {
+    "darwin": "~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Templates/Edit/Titles",
+    "win32": r"%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Templates\Edit\Titles",
+    "linux": "~/.local/share/DaVinciResolve/Fusion/Templates/Edit/Titles",
+}
+
+
+def _video_layout(tl):
+    return {n: [(it.GetStart(), it.GetEnd()) for it in tl.GetItemListInTrack("video", n) or []]
+            for n in range(1, int(tl.GetTrackCount("video") or 0) + 1)}
+
+
+def _title_at(tl, frame=None, name="Text+"):
+    """Insert a Fusion title at `frame` (absolute, as in list_items; default: the playhead). Returns
+    (item, track, index). Refuses to leave the timeline changed if Resolve moved or cut clips to make room."""
+    before = _video_layout(tl)
+    if frame is not None and not tl.SetCurrentTimecode(_timecode(tl, frame)):
+        raise ToolError(f"cannot move the playhead to frame {frame}")
+    it = tl.InsertFusionTitleIntoTimeline(name)
+    if not it:
+        raise ToolError(f"could not insert the Fusion title {name!r} (see list_templates for installed titles)")
+    after, span = _video_layout(tl), (it.GetStart(), it.GetEnd())
+    where, changed = None, []
+    for n, rows in after.items():
+        rest = list(rows)
+        if where is None and span in rest and len(rest) == len(before.get(n, [])) + 1:
+            where = (n, rest.index(span) + 1)
+            rest.remove(span)
+        if rest != before.get(n, []):
+            changed.append(n)
+    if changed or where is None:
+        raise ToolError(f"Resolve inserted the title but changed existing clips on video track(s) {changed or '?'} "
+                        "(it inserts into the targeted track at the playhead). Undo in Resolve (Cmd/Ctrl+Z), then "
+                        "target an empty track above the edit or put the playhead where the track is free.")
+    return it, where[0], where[1]
+
+
+def _motion_keys(kind, n, dur, entering):
+    """(Transform input, {relative frame: value}) for a motion animation over n frames at the start or end."""
+    a, b = (0, n) if entering else (dur - 1 - n, dur - 1)
+    if kind == "pop":
+        inp, path = "Size", [(0, 0.0), (0.7, 1.12), (1, 1.0)]
+    elif kind == "zoom":
+        inp, path = "Size", [(0, 0.6), (1, 1.0)]
+    else:
+        x, y = SLIDE_FROM[kind]
+        inp = "Center"
+        path = [(0, [x, y]), (1, [0.5, 0.5])] if entering else [(0, [0.5, 0.5]), (1, [1 - x, 1 - y])]
+        return inp, {int(round(a + t * (b - a))): v for t, v in path}
+    if not entering:
+        path = [(1 - t, v) for t, v in reversed(path)]
+    return inp, {int(round(a + t * (b - a))): v for t, v in path}
+
+
+def _write_on(tool):
+    for inp in WRITE_ON_INPUTS:
+        if tool[inp]:
+            return inp
+    raise ToolError("this Text+ has no write-on input (" + ", ".join(WRITE_ON_INPUTS) + "); see fusion_inputs")
+
+
+def _style_title(it, text, animation, exit, speed, font, style, size, color, position):
+    """Set a title's text/look and animate it. Returns the report shared by the title tools."""
+    for kind in (animation, exit):
+        if kind not in TITLE_ANIMATIONS:
+            raise ToolError(f"animation must be one of: {', '.join(TITLE_ANIMATIONS)} (got {kind!r})")
+    comp, nodes = _text_nodes(it)
+    if not nodes:
+        raise ToolError(f"'{it.GetName()}' has no Text+ node to set")
+    tool = nodes[0]
+    node = _tool_attrs(tool)[0]
+    applied = {k: _set_input(comp, tool, node, k, value=v)["value"]
+               for k, v in _title_values(text, font, style, size, color, position).items()}
+    dur = int(it.GetDuration())
+    n = max(1, min(int(speed), dur // 3))
+    first, _ = _comp_range(comp, it)
+    fades, motion, typing = {}, {}, {}
+    for kind, entering in ((animation, True), (exit, False)):
+        if kind == "none":
+            continue
+        if kind == "fade":
+            fades["FadeIn" if entering else "FadeOut"] = n
+        elif kind == "typewriter":
+            # type over about 2 frames per character, at least the animation length, at most half the title
+            chars = len((text if text is not None else tool.GetInput("StyledText")) or "")
+            m = max(n, min(dur // 2, 2 * chars))
+            typing.update({0: 0.0, m: 1.0} if entering else {dur - 1 - m: 1.0, dur - 1: 0.0})
+        else:
+            inp, keys = _motion_keys(kind, n, dur, entering)
+            motion.setdefault(inp, {}).update(keys)
+    if motion:
+        mover = comp.FindTool("TitleMotion") or _insert_before_output(comp, "Transform", "TitleMotion")
+        for inp, keys in motion.items():
+            _set_input(comp, mover, "TitleMotion", inp, keyframes={first + f: v for f, v in keys.items()})
+    if typing:
+        _set_input(comp, tool, node, _write_on(tool), keyframes={first + f: v for f, v in typing.items()})
+    if fades and not _method(it, "SetFades", "21.1")(fades):
+        raise ToolError(f"SetFades {fades} failed on '{it.GetName()}'")
+    return {"title": it.GetName(), "node": node, "set": applied, "animation": animation, "exit": exit,
+            "animation_frames": n, "duration": dur}
+
+
+@_tool
+def animated_title(text: str, animation: str = "fade", exit: str = "fade", frame: int | None = None,
+                   speed: int = 12, font: str | None = None, style: str | None = None, size: float | None = None,
+                   color: list[float] | None = None, position: list[float] | None = None) -> dict:
+    """Insert an animated Fusion title (Text+) at `frame` (absolute, as in list_items; default: the playhead).
+    animation (entrance) and exit: none, fade, pop, zoom, slide_up, slide_down, slide_left, slide_right or
+    typewriter; speed is the animation length in frames (at most a third of the title). font, style ("Bold"), size
+    (0-1 of frame width), color [r, g, b] 0-1 and position [x, y] 0-1 (center 0.5, 0.5; y up) style the text.
+    Fades need Resolve 21.1+. Refine afterwards with set_title_text, set_fusion_input(node="TitleMotion") or
+    list_keyframes."""
+    _, tl = _timeline()
+    it, track, index = _title_at(tl, frame)
+    return {"track": track, "item": index,
+            **_style_title(it, text, animation, exit, speed, font, style, size, color, position)}
+
+
+@_tool
+def lower_third(name: str, role: str | None = None, frame: int | None = None, side: str = "left",
+                animation: str | None = None, exit: str = "fade", speed: int = 10, font: str | None = None,
+                size: float = 0.045, color: list[float] | None = None) -> dict:
+    """A lower third: a person's name with an optional second line (role, title, place) in the lower part of the
+    frame, sliding in from its side (animation defaults to slide_right on the left, slide_left on the right) and
+    fading out. Same frame, font and color rules as animated_title."""
+    if side not in ("left", "right"):
+        raise ToolError("side must be left or right")
+    text = name + (f"\n{role}" if role else "")
+    position = [0.28, 0.16] if side == "left" else [0.72, 0.16]
+    animation = animation or ("slide_right" if side == "left" else "slide_left")
+    _, tl = _timeline()
+    it, track, index = _title_at(tl, frame)
+    return {"track": track, "item": index, "side": side,
+            **_style_title(it, text, animation, exit, speed, font, None, size, color, position)}
+
+
+def _template_path(name):
+    if not name or any(c in name for c in '/\\:*?"<>|') or name.startswith("."):
+        raise ToolError(f"invalid template name: {name!r}")
+    return os.path.join(TEMPLATES_DIR, name + ".comp")
+
+
+@_tool
+def save_template(item: int, name: str, track: int = 1, overwrite: bool = False) -> dict:
+    """Save a video item's Fusion comp (an animated title, a look built with Fusion effects) as a reusable template
+    in the template folder (DAVINCI_MCP_TEMPLATES, default ~/Documents/DaVinci MCP Templates). Use it again with
+    apply_template or batch_titles; list with list_templates."""
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    if int(it.GetFusionCompCount() or 0) == 0:
+        raise ToolError(f"'{it.GetName()}' has no Fusion composition to save")
+    path = _template_path(name)
+    if os.path.exists(path) and not overwrite:
+        raise ToolError(f"template {name} exists (overwrite=True replaces it)")
+    os.makedirs(TEMPLATES_DIR, exist_ok=True)
+    if not it.ExportFusionComp(path, 1) or not os.path.exists(path):
+        raise ToolError(f"ExportFusionComp failed for {path}")
+    _, nodes = _text_nodes(it)
+    meta = {"source": it.GetName(), "duration": int(it.GetDuration()), "title": bool(nodes),
+            "texts": {_tool_attrs(t)[0]: t.GetInput("StyledText") for t in nodes}}
+    with open(path[:-5] + ".json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=1)
+    return {"template": name, "path": path, **meta}
+
+
+@_tool
+def list_templates() -> dict:
+    """Saved templates (save_template) and the Fusion title templates installed in Resolve's Titles folder (insert
+    those by name with insert_title(name, fusion=True))."""
+    saved = []
+    if os.path.isdir(TEMPLATES_DIR):
+        for fn in sorted(os.listdir(TEMPLATES_DIR)):
+            if fn.endswith(".comp"):
+                row = {"template": fn[:-5], "path": os.path.join(TEMPLATES_DIR, fn)}
+                meta = os.path.join(TEMPLATES_DIR, fn[:-5] + ".json")
+                if os.path.exists(meta):
+                    with open(meta, encoding="utf-8") as f:
+                        row.update(json.load(f))
+                saved.append(row)
+    folder = os.path.expandvars(os.path.expanduser(RESOLVE_TITLE_DIRS.get(sys.platform, RESOLVE_TITLE_DIRS["linux"])))
+    installed = []
+    if os.path.isdir(folder):
+        for root, _, files in os.walk(folder):
+            installed += sorted(os.path.splitext(fn)[0] for fn in files if fn.endswith(".setting"))
+    return {"folder": TEMPLATES_DIR, "saved": saved, "installed_titles": installed}
+
+
+def _apply_comp(it, path, fresh):
+    """Import a template comp into an item and make it the active one; on a fresh title, drop the default comp so
+    the template is comp 1. Returns the imported comp."""
+    before = list(it.GetFusionCompNameList() or [])
+    comp = it.ImportFusionComp(path)
+    if not comp:
+        raise ToolError(f"ImportFusionComp failed for {path}")
+    after = list(it.GetFusionCompNameList() or [])
+    if len(after) <= len(before):
+        raise ToolError(f"ImportFusionComp reported success but {it.GetName()} has no new composition")
+    new = [c for c in after if c not in before] or after[-1:]  # a repeated name: the newest comp is last
+    if not it.LoadFusionCompByName(new[0]):
+        raise ToolError(f"imported {os.path.basename(path)} but could not make it the active composition")
+    if fresh:
+        for old in before:
+            it.DeleteFusionCompByName(old)
+    return comp
+
+
+@_tool
+def apply_template(name: str, item: int | None = None, frame: int | None = None, text: str | None = None,
+                   track: int = 1) -> dict:
+    """Use a saved template: without `item`, insert a new title at `frame` (default: the playhead) built from it;
+    with `item`, add it to that video item as its active Fusion composition (e.g. a saved effect look). text
+    replaces the template's text when it has a Text+ node."""
+    path = _template_path(name)
+    if not os.path.exists(path):
+        raise ToolError(f"template not found: {name} (see list_templates)")
+    _, tl = _timeline()
+    if item is None:
+        it, track, index = _title_at(tl, frame)
+    else:
+        it, index = _item(tl, item, track), item
+    comp = _apply_comp(it, path, fresh=item is None)
+    out = {"template": name, "track": track, "item": index, "name": it.GetName()}
+    if text is not None:
+        nodes = list((comp.GetToolList(False, "TextPlus") or {}).values())
+        if not nodes:
+            raise ToolError(f"template {name} has no Text+ node for text")
+        tool = nodes[0]
+        out["text"] = _set_input(comp, tool, _tool_attrs(tool)[0], "StyledText", value=text)["value"]
+    return out
+
+
+@_tool
+def batch_titles(entries: list[dict], template: str | None = None, animation: str = "fade", exit: str = "fade",
+                 speed: int = 12, font: str | None = None, size: float | None = None,
+                 color: list[float] | None = None, position: list[float] | None = None) -> list[dict]:
+    """Many titles in one call, e.g. chapter cards, quotes or a list of names: entries are {"frame": absolute
+    frame, "text": ...} (frame as in list_items). Each is built from a saved `template` (its animation included) or,
+    without one, as an animated_title with the given animation and style. Stops at the first failure and reports
+    what was made."""
+    if not entries:
+        raise ToolError("no entries")
+    for e in entries:
+        if not isinstance(e, dict) or "frame" not in e or not str(e.get("text", "")).strip():
+            raise ToolError(f"each entry needs a frame and a text: {e!r}")
+    if template is not None and not os.path.exists(_template_path(template)):
+        raise ToolError(f"template not found: {template} (see list_templates)")
+    made = []
+    for e in sorted(entries, key=lambda e: int(e["frame"])):
+        try:
+            if template is not None:
+                made.append(apply_template(template, frame=int(e["frame"]), text=str(e["text"])))
+            else:
+                made.append(animated_title(str(e["text"]), animation, exit, int(e["frame"]), speed, font, None, size,
+                                           color, position))
+        except ToolError as err:
+            raise ToolError(f"stopped at frame {e['frame']} after {len(made)} title(s): {err}") from err
+    return made
 
 if __name__ == "__main__":
     _setup_logging()
