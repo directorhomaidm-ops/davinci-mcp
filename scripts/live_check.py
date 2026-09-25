@@ -251,6 +251,19 @@ def run_checks(args, work, is_211):
     step("21.1: create_multicam from the two sequences + append + flatten", lambda: _multicam(seq),
          needs=need211 if have_media is True else have_media)
 
+    print("\nSound effects and music")
+    step("sound: generate_sound 1 kHz tone -20 dBFS into the pool", lambda: d.generate_sound(
+        "tone", str(work / "ref_tone.wav"), seconds=2, bin="Live Check"))
+    step("sound: generate_sound countdown beeps", lambda: d.generate_sound(
+        "beeps", str(work / "beeps.wav"), count=10))
+    step("sound: detect_beats on the beeps (expect 60 bpm)", lambda: _expect_bpm(d.detect_beats(
+        path=str(work / "beeps.wav")), 60))
+    step("21: classify_audio on the tone", lambda: d.classify_audio(clips=["ref_tone.wav"]),
+         needs=True if _version_at_least(21) else "needs Resolve 21")
+    step("studio: generate_voiceover (needs the AI Speech Generator package)",
+         lambda: d.generate_voiceover("davinci-mcp live check.", file_name="vo_check.wav"),
+         needs=studio_note(args) if _version_at_least(21) else "needs Resolve 21")
+
     print("\nAudio")
     step("audio: fairlight_info", d.fairlight_info)
     step("audio: add_track 5.1", lambda: d.add_track(format="5.1", name="Surround"))
@@ -355,6 +368,22 @@ def _delete_from_fairlight():
     d.open_page("edit")
     d.switch_timeline("Check")
     return "deleted 1 item from the Fairlight page"
+
+
+def _expect_bpm(result, bpm):
+    expect(abs(result["bpm"] - bpm) < 1, f"expected about {bpm} bpm: {result['bpm']}")
+    return {"bpm": result["bpm"], "beats": len(result["beats"])}
+
+
+def _version_at_least(major):
+    try:
+        return int(str(d._resolve().GetVersionString()).split(".")[0]) >= major
+    except (TypeError, ValueError):
+        return False
+
+
+def studio_note(args):
+    return True if args.studio else "run with --studio (the free edition blocks on an upgrade dialog)"
 
 
 def _expect_tool_error(fn):
