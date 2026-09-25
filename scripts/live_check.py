@@ -228,6 +228,15 @@ def run_checks(args, work, is_211):
     step("keyframes: list_keyframes item 1", lambda: d.list_keyframes(1), needs=have_items)
     step("keyframes: view_frame mid-animation", lambda: _frame(work / "frame_anim.png"), needs=have_items)
 
+    print("\nVisual effects")
+    step("vfx: vignette on item 2", lambda: d.vignette(2, amount=0.5), needs=have_items,
+         note="confirms EllipseMask Width/Height/SoftEdge/Invert and BrightnessContrast Gain")
+    step("vfx: camera_shake on item 2", lambda: d.camera_shake(2, amount=0.01), needs=have_items)
+    step("vfx: view_frame after vignette + shake", lambda: _frame(work / "frame_vfx.png"), needs=have_items)
+    step("vfx: picture_in_picture (clip on V2, bottom right)", lambda: (_pip(seq), _frame(work / "frame_pip.png"))[0],
+         needs=have_media,
+         note="check frame_pip.png: the small picture must sit bottom right (confirms the Tilt direction)")
+
     print("\nTitles and subtitles")
     step("titles: insert Text+ and set_title_text (text, font, style, size, color)", lambda: _title(),
          needs=have_items, note="confirms the Text+ input names Font / Style / Red1")
@@ -245,6 +254,8 @@ def run_checks(args, work, is_211):
     need211 = True if is_211 else "needs Resolve 21.1"
     step("21.1: add_transition Cross Dissolve 12f", lambda: d.add_transition(1, duration=12), needs=need211)
     step("21.1: set_fades on item 1", lambda: d.set_fades(1, fade_in=6, track_type="video"), needs=need211)
+    step("21.1: letterbox 2.39 on the timeline, frame, then off", lambda: _letterbox(work), needs=need211)
+    step("21.1: transition_all_cuts + list + remove", lambda: _all_cuts(), needs=need211)
     step("21.1: set_speed 50% on last item", lambda: d.set_speed(len(d.list_items()), 50), needs=need211)
     step("21.1: normalize_audio -16 LKFS", lambda: d.normalize_audio([1], loudness=-16),
          needs=need211 if wav else "no audio item")
@@ -311,6 +322,26 @@ def _lut(work):
     expect((work / "grade.cube").exists(), "no .cube written")
     expect(d._resolve().GetCurrentPage() == before, "page not restored")
     return (work / "grade.cube").stat().st_size
+
+
+def _pip(seq):
+    d.append_clips([seq[0]], track=2, start_frame=0, end_frame=23)
+    out = d.picture_in_picture(1, scale=0.3, corner="bottom_right", track=2)
+    return out
+
+
+def _letterbox(work):
+    out = d.letterbox(2.39)
+    _frame(work / "frame_letterbox.png")
+    d.letterbox(None)
+    return out
+
+
+def _all_cuts():
+    out = d.transition_all_cuts(duration=8)
+    listed = d.list_transitions()
+    removed = d.remove_transitions()
+    return {"added": out, "listed": len(listed), "removed": removed}
 
 
 def _multicam(seq):

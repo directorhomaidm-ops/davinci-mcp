@@ -197,7 +197,8 @@ def test_all_tools_registered():
         "get_transcript", "export_transcript", "write_subtitles", "list_titles", "set_title_text",
         "animate_clip", "list_keyframes", "clear_keyframes", "set_color_keyframe_mode", "create_multicam",
         "auto_align_clips", "smart_switch", "flatten_multicam", "generate_voiceover", "classify_audio",
-        "find_audio", "generate_sound", "detect_beats", "mark_beats",
+        "find_audio", "generate_sound", "detect_beats", "mark_beats", "list_transitions", "transition_all_cuts",
+        "remove_transitions", "letterbox", "picture_in_picture", "split_screen", "vignette", "camera_shake",
     }
 
 
@@ -2035,3 +2036,137 @@ def test_mark_beats_errors(project):
         d.mark_beats(1, every=0)
     with pytest.raises(ToolError, match="unknown marker color"):
         d.mark_beats(1, color="Orange")
+
+
+# --- transitions ---
+
+
+def _three_clips(project, names=("a.mov", "b.mov", "a.mov")):
+    d.append_clips(list(names))
+    return project.current.tracks[("video", 1)]
+
+
+def test_transition_all_cuts(project):
+    a, b, c = _three_clips(project)
+    out = d.transition_all_cuts(duration=12)
+    assert out == {"cuts": 2, "added": 2, "skipped_existing": 0, "failed_no_handles": []}
+    trs = d.list_transitions()
+    assert [(t["index"], t["name"], t["duration"]) for t in trs] == [(2, "Cross Dissolve", 12), (4, "Cross Dissolve", 12)]
+    assert trs[0]["between"] == ["a.mov", "b.mov"]
+    # Running again finds the cuts covered and adds nothing.
+    again = d.transition_all_cuts(duration=12)
+    assert (again["added"], again["skipped_existing"]) == (0, 2)
+
+
+def test_transition_all_cuts_reports_missing_handles(project):
+    a, b, c = _three_clips(project)
+    b.name = "b_nohandles"
+    out = d.transition_all_cuts()
+    assert (out["added"], out["failed_no_handles"]) == (1, ["b_nohandles | a.mov"])
+
+
+def test_transition_all_cuts_nothing_possible(project):
+    a, b, c = _three_clips(project)
+    with pytest.raises(ToolError, match="no transition added"):
+        d.transition_all_cuts(type="Page Curl")
+    with pytest.raises(ToolError, match="alignment must be"):
+        d.transition_all_cuts(alignment="top")
+
+
+def test_remove_transitions(project, resolve):
+    _three_clips(project)
+    d.transition_all_cuts()
+    resolve.OpenPage("fairlight")
+    assert d.remove_transitions(items=[2]) == "removed 1 transition(s)"
+    assert resolve.page == "fairlight"
+    assert [t["index"] for t in d.list_transitions()] == [3]
+    with pytest.raises(ToolError, match="item 1 on video track 1 is not a transition"):
+        d.remove_transitions(items=[1])
+    assert d.remove_transitions() == "removed 1 transition(s)"
+    assert d.remove_transitions() == "no transitions to remove"
+    assert [i["name"] for i in d.list_items()] == ["a.mov", "b.mov", "a.mov"]
+
+
+# --- visual effects ---
+
+
+def test_letterbox_timeline_and_pillarbox(project):
+    out = d.letterbox(2.39)  # 1920x1080
+    assert out["bounds"] == {"Top": 138, "Bottom": 941, "Left": 0, "Right": 1920}  # 803 px = 1920 / 2.39
+    assert project.current.blanking == out["bounds"]
+    assert d.letterbox(4 / 3)["bounds"] == {"Top": 0, "Bottom": 1080, "Left": 240, "Right": 1680}
+    assert d.letterbox(None)["bounds"] == {"Top": 0, "Bottom": 1080, "Left": 0, "Right": 1920}
+    with pytest.raises(ToolError, match="aspect must be"):
+        d.letterbox(50)
+
+
+def test_letterbox_clip_override(project):
+    a, _ = _two_items(project)
+    out = d.letterbox(2.0, item=1)
+    assert out["bounds"] == {"Top": 60, "Bottom": 1020, "Left": 0, "Right": 1920}
+    assert (a.use_timeline_blanking, a.blanking) == (False, out["bounds"])  # inheritance turned off first
+    assert d.letterbox(None, item=1) == {"target": "'a.mov'", "blanking": "timeline's"}
+    assert a.use_timeline_blanking is True
+
+
+def test_letterbox_needs_21_1(project, monkeypatch):
+    monkeypatch.delattr(type(project.current), "SetOutputBlanking")
+    with pytest.raises(ToolError, match="SetOutputBlanking needs DaVinci Resolve 21.1"):
+        d.letterbox()
+
+
+def test_picture_in_picture(project):
+    d.append_clips(["a.mov"], track=2, start_frame=0, end_frame=49)
+    item = project.current.tracks[("video", 2)][0]
+    item.SetProperty = lambda k, v: item.props.__setitem__(k, v) or True
+    d.picture_in_picture(1, scale=0.25, corner="bottom_left", margin=0.05)
+    # x: 1920 * 0.75 / 2 - 96 = 624 to the left; y: 1080 * 0.75 / 2 - 54 = 351 down
+    assert item.props == {"ZoomX": 0.25, "ZoomY": 0.25, "Pan": -624.0, "Tilt": -351.0}
+    with pytest.raises(ToolError, match="corner must be"):
+        d.picture_in_picture(1, corner="middle")
+
+
+def test_split_screen(project):
+    d.append_clips(["a.mov"], track=2, start_frame=0, end_frame=49)
+    d.append_clips(["b.mov"], start_frame=0, end_frame=49)
+    left = project.current.tracks[("video", 2)][0]
+    right = project.current.tracks[("video", 1)][0]
+    for it in (left, right):
+        it.SetProperty = (lambda i: lambda k, v: i.props.__setitem__(k, v) or True)(it)
+    d.split_screen(1, 1, gap=0.02)
+    # each clip keeps the middle half minus half the gap: crop 480 + 19.2 px per side, moved a quarter frame
+    assert left.props == {"CropLeft": 499.2, "CropRight": 499.2, "Pan": -480.0}
+    assert right.props == {"CropLeft": 499.2, "CropRight": 499.2, "Pan": 480.0}
+
+
+def test_vignette(project):
+    a, _ = _two_items(project)
+    out = d.vignette(1, amount=0.4, size=0.9, softness=0.5)
+    assert out["set"] == {"VignetteMask.Width": 0.9, "VignetteMask.Height": 0.9, "VignetteMask.SoftEdge": 0.5,
+                          "VignetteMask.Invert": 1, "Vignette.Gain": 0.6}
+    nodes = {n["name"]: n for n in d.fusion_nodes(1)}
+    assert nodes["Vignette"]["inputs"] == {"Input": "MediaIn1", "EffectMask": "VignetteMask"}
+    assert nodes["MediaOut1"]["inputs"] == {"Input": "Vignette"}
+    _assert_lock_rules(a.comps[0])
+    with pytest.raises(ToolError, match="already has a Vignette"):
+        d.vignette(1)
+
+
+def test_camera_shake(project):
+    a, _ = _two_items(project)
+    out = d.camera_shake(1, amount=0.01, every=10, seed=7)
+    assert (out["keyframes"], out["zoom"]) == (11, 1.02)  # frames 0,10..90 and the last frame 99
+    keys = a.comps[0].FindTool("Motion").inputs["Center"].keys
+    assert sorted(keys) == list(range(0, 100, 10)) + [99]
+    assert all(abs(v[1] - 0.5) <= 0.01 and abs(v[2] - 0.5) <= 0.01 for v in keys.values())
+    again = d.camera_shake(1, amount=0.01, every=10, seed=7)
+    assert a.comps[0].FindTool("Motion").inputs["Center"].keys == keys  # same seed, same shake
+    _assert_lock_rules(a.comps[0])
+
+
+def test_camera_shake_keeps_animated_zoom(project):
+    a, _ = _two_items(project)
+    d.animate_clip(1, zoom={0: 1.0, 99: 1.2})
+    out = d.camera_shake(1, amount=0.02)
+    assert out["zoom"].startswith("left as animated")
+    assert a.comps[0].FindTool("Motion").inputs["Size"].keys == {0: 1.0, 99: 1.2}

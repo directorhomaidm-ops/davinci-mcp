@@ -189,6 +189,19 @@ class Item:
     def GetMediaPoolItem(self):
         return self.media
 
+    def GetType(self):
+        return getattr(self, "kind", "video")
+
+    def SetUseTimelineForOutputBlanking(self, use):
+        self.use_timeline_blanking = use
+        return True
+
+    def SetOutputBlanking(self, bounds):
+        if getattr(self, "use_timeline_blanking", True):
+            return False  # measured: refused while the clip inherits the timeline's blanking
+        self.blanking = bounds
+        return True
+
     def GetSourceStartTime(self):
         return getattr(self, "source_start", 0.0)
 
@@ -254,6 +267,7 @@ class Item:
         half = options.get("duration", 8) // 2
         cut = self.end if options["position"] == "end" else self.start
         tr = Item(options["type"], cut - half, cut + half)
+        tr.kind = "transition"
         items = self.timeline.tracks[("video", 1)]
         items.insert(items.index(self) + (1 if options["position"] == "end" else 0), tr)
         return tr
@@ -351,7 +365,8 @@ TOOL_INPUTS = {
     "Merge": {"Background": "Image", "Foreground": "Image", "Blend": "Number"},
     "TextPlus": {"StyledText": "Text", "Font": "Text", "Style": "Text", "Size": "Number", "Center": "Point",
                  "Red1": "Number", "Green1": "Number", "Blue1": "Number"},
-    "EllipseMask": {"Width": "Number", "Center": "Point"},
+    "EllipseMask": {"Width": "Number", "Height": "Number", "SoftEdge": "Number", "Invert": "Number", "Center": "Point"},
+    "BrightnessContrast": {"Input": "Image", "Gain": "Number", "EffectMask": "Mask"},
     "SoftGlow": {"Input": "Image", "Gain": "Number", "Threshold": "Number"},
     "Tracker": {"Input": "Image", "PatternCenter1": "Point", "TrackedCenter1": "Point", "TrackedCenter2": "Point"},
     "BezierSpline": {},
@@ -658,6 +673,10 @@ class Timeline:
 
     def AutoAlignClips(self, items, options):
         self.aligned = (items, options)
+        return True
+
+    def SetOutputBlanking(self, bounds):
+        self.blanking = bounds
         return True
 
     def DetectSceneCuts(self):
