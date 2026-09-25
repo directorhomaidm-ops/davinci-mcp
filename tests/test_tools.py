@@ -498,8 +498,9 @@ def test_fusion_comps_add_import_export(project, tmp_path):
     assert d.add_fusion_comp(1) == {"item": "a.mov", "comp": 1, "comps": ["Composition 1"]}
     tpl = tmp_path / "glow_template.comp"
     tpl.write_text("")
-    assert d.add_fusion_comp(1, import_path=str(tpl))["comps"] == ["Composition 1", "glow_template"]
-    assert d.fusion_comps(1) == ["Composition 1", "glow_template"]
+    # live 21.1 imports into the active comp, keeping its name; a comp of its own keeps Composition 1 intact
+    assert d.add_fusion_comp(1, import_path=str(tpl))["comps"] == ["Composition 1", "Composition 2"]
+    assert d.fusion_comps(1) == ["Composition 1", "Composition 2"]
     with pytest.raises(ToolError, match="file not found"):
         d.add_fusion_comp(1, import_path=str(tmp_path / "missing.comp"))
 
@@ -2771,7 +2772,7 @@ def test_save_list_apply_template(project, templates):
     out = d.apply_template("Episode Card", text="Episode 2")
     assert (out["item"], out["text"]) == (2, "Episode 2")
     new = project.current.tracks[("video", 1)][1]
-    assert [c.name for c in new.comps] == ["Episode Card"] and new.active_comp == "Episode Card"  # the default is gone
+    assert [c.name for c in new.comps] == ["Composition 1"]  # the title's own comp, replaced by the template
     assert d.list_titles()[1]["texts"] == {"Template": "Episode 2"}
 
 
@@ -2779,11 +2780,14 @@ def test_apply_template_to_clip(project, templates):
     a, b = _two_items(project)
     d.insert_fusion_effect(1, "Blur")
     d.save_template(1, "Soft")
+    d.insert_fusion_effect(2, "Blur")
     out = d.apply_template("Soft", item=2)
-    assert out["item"] == 2 and [c.name for c in b.comps] == ["Soft"] and b.active_comp == "Soft"
+    # a new comp holds the template and is active; the clip's own comp and its Blur are kept
+    assert out["item"] == 2 and [c.name for c in b.comps] == ["Composition 1", "Composition 2"]
+    assert b.active_comp == "Composition 2" and b.comps[0].FindTool("Blur1")
     with pytest.raises(ToolError, match="no Text\\+ node"):
         d.apply_template("Soft", item=2, text="x")
-    assert b.active_comp == "Soft 2"  # the second import, made active
+    assert b.active_comp == "Composition 3"  # the second import, in a comp of its own
     with pytest.raises(ToolError, match="template not found"):
         d.apply_template("Nope")
 
@@ -2803,27 +2807,6 @@ def test_batch_titles(project, templates):
 def test_animation_length_capped_at_a_third(project):
     out = d.animated_title("Long", animation="zoom", exit="none", speed=100)
     assert out["animation_frames"] == 40  # 120-frame title
-
-
-def test_apply_template_same_comp_name(project, templates, monkeypatch):
-    a, b = _two_items(project)
-    d.insert_fusion_effect(1, "Blur")
-    d.save_template(1, "Soft")
-    d.apply_template("Soft", item=2)
-    Item = type(b)
-    real = Item.ImportFusionComp
-
-    def same_name(self, path):  # a build that repeats the name instead of numbering it
-        comp = real(self, path)
-        comp.name = "Soft"
-        return comp
-
-    monkeypatch.setattr(Item, "ImportFusionComp", same_name)
-    loaded = []
-    monkeypatch.setattr(Item, "LoadFusionCompByName", lambda self, n: loaded.append(n) or True)
-    d.apply_template("Soft", item=2)
-    assert loaded == ["Soft"] and [c.name for c in b.comps][-1] == "Soft"
-
 
 
 # --- automatic color correction ---

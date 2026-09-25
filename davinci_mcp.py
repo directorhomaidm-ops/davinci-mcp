@@ -992,14 +992,15 @@ def fusion_comps(item: int, track: int = 1) -> list[str]:
 
 @_tool
 def add_fusion_comp(item: int, import_path: str | None = None, track: int = 1) -> dict:
-    """Add a Fusion composition to a video item: empty (MediaIn → MediaOut), or imported from a .comp file."""
+    """Add a Fusion composition to a video item: empty (MediaIn → MediaOut), or imported from a .comp file. The new
+    comp becomes the active one; existing comps are kept."""
     _, tl = _timeline()
     it = _item(tl, item, track)
     if import_path:
         import_path = os.path.abspath(import_path)
         if not os.path.exists(import_path):
             raise ToolError(f"file not found: {import_path}")
-        comp = it.ImportFusionComp(import_path)
+        comp = _apply_comp(it, import_path, fresh=False)
     else:
         comp = it.AddFusionComp()
     if not comp:
@@ -4744,21 +4745,15 @@ def list_templates() -> dict:
 
 
 def _apply_comp(it, path, fresh):
-    """Import a template comp into an item and make it the active one; on a fresh title, drop the default comp so
-    the template is comp 1. Returns the imported comp."""
-    before = list(it.GetFusionCompNameList() or [])
+    """Import a template comp into an item as its active composition. Returns the imported comp. Live 21.1:
+    ImportFusionComp replaces the ACTIVE comp's contents (keeping its name) and adds no comp, so a fresh title's own
+    comp is simply replaced, while an item first gets a new comp (AddFusionComp makes it active) to keep its current
+    one and its effects."""
+    if not fresh and not it.AddFusionComp():
+        raise ToolError(f"could not add a Fusion composition to '{it.GetName()}'")
     comp = it.ImportFusionComp(path)
     if not comp:
         raise ToolError(f"ImportFusionComp failed for {path}")
-    after = list(it.GetFusionCompNameList() or [])
-    if len(after) <= len(before):
-        raise ToolError(f"ImportFusionComp reported success but {it.GetName()} has no new composition")
-    new = [c for c in after if c not in before] or after[-1:]  # a repeated name: the newest comp is last
-    if not it.LoadFusionCompByName(new[0]):
-        raise ToolError(f"imported {os.path.basename(path)} but could not make it the active composition")
-    if fresh:
-        for old in before:
-            it.DeleteFusionCompByName(old)
     return comp
 
 
