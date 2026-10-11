@@ -1785,14 +1785,27 @@ def sync_audio(
     return {"resolve_reported": returned, "synced_audio": synced}
 
 
+def _wait_while_busy(resolve, what, timeout=300):
+    """Wait for a job Resolve runs in the background with a modal progress dialog. Live 21.1.1: TranscribeAudio
+    returns at once, and until the transcript is done GetCurrentPage() is None and Resolve refuses changes (bins,
+    timelines, imports); calls made meanwhile left the job stuck for good. Earlier versions never report None."""
+    deadline = time.monotonic() + timeout
+    while resolve.GetCurrentPage() is None:
+        if time.monotonic() > deadline:
+            raise ToolError(f"{what} still running after {timeout} s; wait for its progress dialog in Resolve")
+        time.sleep(0.5)
+
+
 @_tool
 def transcribe_audio(clips: list[str], speaker_detection: bool = False) -> list[dict]:
     """Transcribe media-pool clips (by name) so text-based editing and captions can use them (Studio).
-    speaker_detection labels who is speaking."""
+    speaker_detection labels who is speaking. Returns once each transcript is done."""
+    resolve = _resolve()
     _, proj = _project()
     out = []
     for c in _pool_clips(proj, clips):
         ok = bool(c.TranscribeAudio(speaker_detection))
+        _wait_while_busy(resolve, f"transcription of {c.GetName()}")
         out.append({"clip": c.GetName(), "transcribed": ok, "preview": c.GetClipProperty("Transcription") or None})
     if not any(r["transcribed"] for r in out):
         raise ToolError("transcription failed (Studio only)")

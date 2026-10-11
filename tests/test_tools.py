@@ -1003,6 +1003,19 @@ def test_sync_audio_errors(project):
         d.sync_audio(["a.mov", "b.mov"], channel="left")
 
 
+def test_transcribe_audio_waits_for_the_background_job(project, resolve, monkeypatch):
+    # live 21.1.1: TranscribeAudio returns at once; while the job runs GetCurrentPage() is None
+    pages = iter([None, None, "edit"])
+    monkeypatch.setattr(type(resolve), "GetCurrentPage", lambda self: next(pages))
+    monkeypatch.setattr(d.time, "sleep", lambda s: None)
+    assert d.transcribe_audio(["a.mov"])[0]["transcribed"]
+    assert next(pages, "used up") == "used up"  # polled until Resolve was free
+    pages = iter([None] * 10 ** 6)
+    monkeypatch.setattr(d.time, "monotonic", iter(range(0, 10 ** 6, 100)).__next__)
+    with pytest.raises(ToolError, match="still running after 300 s"):
+        d.transcribe_audio(["a.mov"])
+
+
 def test_transcribe_audio(project):
     out = d.transcribe_audio(["a.mov"], speaker_detection=True)
     assert out == [{"clip": "a.mov", "transcribed": True, "preview": "hello and welcome..."}]
