@@ -101,8 +101,11 @@ def _tool(fn):
     def wrapper(*args, **kwargs):
         fields = {"tool": fn.__name__, "args": dict(sig.bind(*args, **kwargs).arguments)}
         start = time.perf_counter()
+        _DEPTH[0] += 1
         try:
             result = fn(*args, **kwargs)
+            if _DEPTH[0] == 1 and _DIRTY:
+                _commit_comps()
         except ToolError as e:
             fields.update(outcome="error", error=str(e), duration_ms=round((time.perf_counter() - start) * 1000, 1))
             log.warning("tool call failed", extra={"fields": fields})
@@ -111,6 +114,10 @@ def _tool(fn):
             fields.update(outcome="crash", duration_ms=round((time.perf_counter() - start) * 1000, 1))
             log.exception("tool call crashed", extra={"fields": fields})
             raise
+        finally:
+            _DEPTH[0] -= 1
+            if _DEPTH[0] == 0:
+                _DIRTY.clear()  # a failed call is not committed half-way
         fields.update(outcome="ok", duration_ms=round((time.perf_counter() - start) * 1000, 1))
         log.info("tool call", extra={"fields": fields})
         return result
@@ -494,6 +501,7 @@ def insert_title(name: str = "Text", fusion: bool = False, text: str | None = No
     out = {"title": name, "start": it.GetStart(), "end": it.GetEnd(), "text_set": False}
     if text:
         comp = it.GetFusionCompByIndex(1)
+        _touch(it, 1)
         tool = comp.FindTool("Template") if comp else None
         if tool:
             tool.SetInput("StyledText", text)
@@ -926,13 +934,126 @@ def _undo(comp, name):
         comp.EndUndo(True)
 
 
-def _comp(item, comp, track):
+def _comp(item, comp, track, write=True):
     _, tl = _timeline()
     it = _item(tl, item, track)
     count = int(it.GetFusionCompCount() or 0)
     if not 1 <= comp <= count:
         raise ToolError(f"comp {comp} not found on '{it.GetName()}' ({count} comp(s); see add_fusion_comp)")
+    if write:
+        _touch(it, comp)
     return it, it.GetFusionCompByIndex(comp)
+
+
+# --- Committing Fusion changes, with a tidy node tree ---
+#
+# A comp changed by script renders in Fusion but not in stills or Deliver until it is exported and imported back
+# (live 21.1/21.1.1); script-added nodes also sit stacked at one spot. So every tool that opens a clip's comp for
+# writing marks it, and when the outermost tool call ends each marked comp is laid out (main chain left to right,
+# every branch on its own row, positions from the live connections) and committed with that layout.
+
+FLOW_TYPES = {"Image", "DataType3D", "Mask", "MtlGraph3D"}  # node-tree links; modifiers (splines, paths) are not
+MAIN_INPUTS = ("Input", "Background", "SceneInput")
+FLOW_STEP = (110, 49.5)  # Fusion's own spacing: one node width, one and a half rows
+_DIRTY = {}
+_DEPTH = [0]
+
+
+def _touch(it, index):
+    _DIRTY[_opt(it, "GetUniqueId") or id(it)] = (it, index)
+
+
+def _flow_layout(c):
+    """{node: (x, y)}: the chain into MediaOut1 on row 0 running left, each other input's subtree on a new row above,
+    then anything not connected to the output."""
+    links, hidden = {}, set()
+    for tool in (c.GetToolList(False) or {}).values():
+        (name, kind), ins = _tool_attrs(tool), []
+        if kind == "AudioDisplay":
+            hidden.add(name)
+        for inp in (tool.GetInputList() or {}).values():
+            a = inp.GetAttrs() or {}
+            src = _source(inp)[0]
+            if not src:
+                continue
+            if a.get("INPS_DataType") in FLOW_TYPES:
+                ins.append((a.get("INPS_ID", ""), src))
+            else:
+                hidden.add(src)  # a modifier (spline, path, profile): not a node of the tree
+        links[name] = ins
+    for name in hidden:
+        links.pop(name, None)
+    pos, rows = {}, [0]
+
+    def place(name, x, y):
+        if name in pos or name not in links:
+            return
+        pos[name] = (x, y)
+        main = next((s for i, s in links[name] if i in MAIN_INPUTS), None)
+        if main:
+            place(main, x - FLOW_STEP[0], y)
+        for _, src in links[name]:
+            if src != main and src not in pos:
+                rows[0] -= 1
+                place(src, x - FLOW_STEP[0], rows[0] * FLOW_STEP[1])
+
+    sinks = ["MediaOut1"] if "MediaOut1" in links else []
+    fed = {s for ins in links.values() for _, s in ins}
+    for name in sinks + sorted(n for n in links if n not in fed and n not in sinks):
+        if name not in pos:
+            if pos:
+                rows[0] -= 1
+            place(name, 0, rows[0] * FLOW_STEP[1])
+    return pos
+
+
+def _with_positions(text, pos):
+    """The exported comp text with each laid-out node's ViewInfo replaced by its position. Fusion writes a node's
+    ViewInfo at the end of its block, one line or a nested block; a second one would lose to it."""
+    out, lines, i, node = [], text.split("\n"), 0, None
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if line.startswith("\t\t") and not line.startswith("\t\t\t"):  # a node header or the end of one
+            head = line[2:].split(" = ", 1)[0].strip('[]"') if line.rstrip().endswith("{") else None
+            node = head if head in pos else None
+            out.append(line)
+            if node:
+                out.append("\t\t\tViewInfo = OperatorInfo { Pos = { %g, %g } }," % pos[node])
+            continue
+        if node and line.startswith("\t\t\tViewInfo = "):  # the old position: skip it
+            if line.rstrip().endswith("{"):
+                while i < len(lines) and not lines[i].startswith("\t\t\t}"):
+                    i += 1
+                i += 1
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _commit_comps():
+    """Lay out and commit every comp marked by this tool call (see above)."""
+    for it, index in list(_DIRTY.values()):
+        names = list(it.GetFusionCompNameList() or [])
+        c = it.GetFusionCompByIndex(index)
+        if not c or not 1 <= index <= len(names):
+            continue
+        pos = _flow_layout(c)
+        tmp = tempfile.mkdtemp(prefix="davinci_mcp_")
+        try:
+            path = os.path.join(tmp, "comp.comp")
+            if not it.ExportFusionComp(path, index):
+                raise ToolError(f"could not export {it.GetName()}'s Fusion comp to commit it")
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(_with_positions(text, pos))
+            it.LoadFusionCompByName(names[index - 1])  # the import replaces the active comp
+            if not it.ImportFusionComp(path):
+                raise ToolError(f"could not commit {it.GetName()}'s Fusion comp (import refused)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    _DIRTY.clear()
 
 
 def _node(comp, name):
@@ -1012,7 +1133,7 @@ def add_fusion_comp(item: int, import_path: str | None = None, track: int = 1) -
 @_tool
 def export_fusion_comp(item: int, path: str, comp: int = 1, track: int = 1) -> str:
     """Save a video item's Fusion composition as a .comp file (reusable template)."""
-    it, _ = _comp(item, comp, track)
+    it, _ = _comp(item, comp, track, write=False)
     path = os.path.abspath(path)
     if not it.ExportFusionComp(path, comp):
         raise ToolError(f"export failed: {path}")
@@ -1054,7 +1175,7 @@ def create_fusion_clip(items: list[int], track: int = 1) -> dict:
 def fusion_nodes(item: int, comp: int = 1, track: int = 1) -> list[dict]:
     """Nodes of a Fusion composition with type and wiring: `inputs` maps each connected input to its source
     node; `animated` lists inputs driven by a spline or path."""
-    _, c = _comp(item, comp, track)
+    _, c = _comp(item, comp, track, write=False)
     out = []
     for tool in (c.GetToolList(False) or {}).values():
         name, kind = _tool_attrs(tool)
@@ -1078,7 +1199,7 @@ def fusion_nodes(item: int, comp: int = 1, track: int = 1) -> list[dict]:
 def fusion_inputs(item: int, node: str, filter: str | None = None, comp: int = 1, track: int = 1) -> list[dict]:
     """Inputs of a Fusion node: id, name, type, current value, and source node or animation.
     `filter` keeps only inputs whose id or name contains it (case-insensitive); Text+ has hundreds."""
-    _, c = _comp(item, comp, track)
+    _, c = _comp(item, comp, track, write=False)
     tool = _node(c, node)
     rows = []
     for inp in (tool.GetInputList() or {}).values():
@@ -1216,6 +1337,7 @@ def _clip_comp(it):
     """The item's first Fusion comp, created if it has none."""
     if int(it.GetFusionCompCount() or 0) == 0 and not it.AddFusionComp():
         raise ToolError(f"could not add a Fusion composition to '{it.GetName()}'")
+    _touch(it, 1)
     return it.GetFusionCompByIndex(1)
 
 
@@ -1306,12 +1428,16 @@ def view_frame(timecode: str | None = None, frame: int | None = None, save_to: s
     if timecode is not None and frame is not None:
         raise ToolError("give timecode or frame, not both")
     tc = timecode if timecode is not None else (_timecode(tl, frame) if frame is not None else None)
-    if tc and not tl.SetCurrentTimecode(tc):
-        raise ToolError(f"cannot move playhead to {tc}")
     tmp = None if save_to else tempfile.mkdtemp(prefix="davinci_mcp_")
     path = os.path.abspath(save_to) if save_to else os.path.join(tmp, "frame.png")
+    resolve = _resolve()
+    # The Fusion page has no timeline playhead (live 21.1.1: SetCurrentTimecode fails there): use the Edit page.
+    page = resolve.GetCurrentPage() if resolve.GetCurrentPage() in ("edit", "cut", "color") else "edit"
     try:
-        _export_still(proj, path)
+        with _on_page(resolve, page):
+            if tc and not tl.SetCurrentTimecode(tc):
+                raise ToolError(f"cannot move playhead to {tc}")
+            _export_still(proj, path)
         ext = os.path.splitext(path)[1].lower()
         note = f"frame at {_opt(tl, 'GetCurrentTimecode') or tc}" + (f", saved to {path}" if save_to else "")
         if ext not in (".png", ".jpg", ".jpeg"):
@@ -1482,6 +1608,139 @@ def insert_fusion_effect(item: int, tool_type: str, settings: dict | None = None
     except ToolError as e:
         raise ToolError(f"{node} was added to the chain but a setting failed: {e}") from e
     return {"item": it.GetName(), "node": node, "type": tool_type, "settings": applied}
+
+
+@_tool
+def list_fusion_tools(query: str | None = None, category: str | None = None, limit: int = 200) -> list[dict]:
+    """Node types Fusion can add (insert_fusion_effect, add_fusion_node): [{id, name, category}]. query matches the
+    id or name, category its start (case-insensitive), e.g. category "Resolve FX" for ResolveFX filters, "3D" for
+    3D tools, "Blur", "Color", "Particles". Includes installed third-party tools (Krokodove, Artlist...)."""
+    rows = []
+    for reg in (_resolve().Fusion().GetRegList(1) or {}).values():  # 1 = CT_Tool
+        a = reg.GetAttrs() or {}
+        row = {"id": a.get("REGS_ID", ""), "name": a.get("REGS_Name", ""), "category": a.get("REGS_Category", "")}
+        if query and query.lower() not in (row["id"] + " " + row["name"]).lower():
+            continue
+        if category and not row["category"].lower().startswith(category.lower()):
+            continue
+        rows.append(row)
+    return sorted(rows, key=lambda r: (r["category"], r["name"]))[:limit]
+
+
+OBJECTS_3D = {"text": "Text3D", "shape": "Shape3D", "image": "ImagePlane3D"}
+SHAPES_3D = {k: f"Surface{k.capitalize()}Inputs" for k in ("plane", "cube", "sphere", "cylinder", "cone", "torus", "ico")}
+LIGHTS_3D = {"ambient": "LightAmbient", "directional": "LightDirectional", "point": "LightPoint", "spot": "LightSpot"}
+
+
+def _set_3d(c, tool, node, spec):
+    """position / rotation ([x, y, z]), scale (uniform) and intensity from an object, camera or light spec."""
+    out = {}
+    for key, inp in (("position", "Transform3DOp.Translate"), ("rotation", "Transform3DOp.Rotate")):
+        if spec.get(key) is not None:
+            for axis, v in zip("XYZ", spec[key]):
+                out[f"{inp}.{axis}"] = _set_input(c, tool, node, f"{inp}.{axis}", value=float(v))["value"]
+    if spec.get("scale") is not None:
+        out["Transform3DOp.Scale.X"] = _set_input(c, tool, node, "Transform3DOp.Scale.X", value=float(spec["scale"]))["value"]
+    if spec.get("intensity") is not None:
+        out["Intensity"] = _set_input(c, tool, node, "Intensity", value=float(spec["intensity"]))["value"]
+    return out
+
+
+@_tool
+def fusion_3d_scene(item: int, objects: list[dict], camera: dict | None = None, lights: list[dict] | None = None,
+                    shadows: bool = False, over_clip: bool = True, track: int = 1) -> dict:
+    """Build a Fusion 3D scene in a video item's comp and render it over the clip (over_clip) or instead of it.
+    objects: [{"type": "text", "text": "...", "size": 0.1, "depth": 0.1, "color": [r, g, b]} |
+    {"type": "shape", "shape": plane|cube|sphere|cylinder|cone|torus|ico} | {"type": "image"} (the clip itself
+    on a plane, e.g. to tilt or fly it in 3D)], each with optional position and rotation ([x, y, z]; units: the
+    frame is about 1 wide at the origin) and scale. camera: {"position", "rotation", "angle" (field of view)};
+    default at z = 2 looking at the origin. lights: [{"type": ambient|directional|point|spot, "position",
+    "rotation", "intensity", "color"}]; without lights objects are lit flat. Nodes are named Scene3D, Camera3D,
+    Render3D and Over3D, the objects and lights by Fusion; animate them with set_fusion_input keyframes (e.g.
+    node "Camera3D", input "Transform3DOp.Translate.Z")."""
+    if not objects:
+        raise ToolError("give at least one object")
+    for o in objects:
+        if o.get("type") not in OBJECTS_3D:
+            raise ToolError(f"object type must be one of: {', '.join(OBJECTS_3D)} (got {o.get('type')!r})")
+        if o["type"] == "shape" and o.get("shape", "cube") not in SHAPES_3D:
+            raise ToolError(f"shape must be one of: {', '.join(SHAPES_3D)}")
+    for lt in lights or []:
+        if lt.get("type") not in LIGHTS_3D:
+            raise ToolError(f"light type must be one of: {', '.join(LIGHTS_3D)}")
+    _, tl = _timeline()
+    it = _item(tl, item, track)
+    c = _clip_comp(it)
+    if c.FindTool("Scene3D"):
+        raise ToolError("this clip already has a 3D scene (Scene3D); change it with set_fusion_input")
+    out = _node(c, "MediaOut1")
+    src = _node(c, _source(out["Input"])[0] or "MediaIn1")  # the picture so far, effects included
+
+    def add(kind, name=None):
+        tool = c.AddTool(kind, -1, -1)
+        if not tool:
+            raise ToolError(f"could not add {kind}")
+        if name:
+            tool.SetAttrs({"TOOLS_Name": name})
+        return tool, _tool_attrs(tool)[0]
+
+    with _locked(c):
+        scene, _ = add("Merge3D", "Scene3D")
+        render, _ = add("Renderer3D", "Render3D")
+        cam, _ = add("Camera3D", "Camera3D")
+        made = []
+        for o in objects:
+            tool, name = add(OBJECTS_3D[o["type"]])
+            if o["type"] == "image" and not tool.ConnectInput("MaterialInput", src):
+                raise ToolError("could not put the clip on the image plane")
+            made.append((tool, name, o))
+        lit = [(add(LIGHTS_3D[lt["type"]]), lt) for lt in lights or []]
+        inputs = [t for t, _, _ in made] + [cam] + [t for (t, _), _ in lit]
+        for n, tool in enumerate(inputs, 1):
+            if not scene.ConnectInput(f"SceneInput{n}", tool):
+                raise ToolError(f"could not connect {_tool_attrs(tool)[0]} to Scene3D")
+        if not render.ConnectInput("SceneInput", scene):
+            raise ToolError("could not connect Scene3D to Render3D")
+        if over_clip:
+            over, _ = add("Merge", "Over3D")
+            if not (over.ConnectInput("Background", src) and over.ConnectInput("Foreground", render)):
+                raise ToolError("could not composite the render over the clip")
+            final = over
+        else:
+            final = render
+        if not out.ConnectInput("Input", final):
+            raise ToolError("could not connect the 3D render to MediaOut1")
+    report = {"item": it.GetName(), "nodes": {"scene": "Scene3D", "camera": "Camera3D", "render": "Render3D"}, "objects": []}
+    for tool, name, o in made:
+        set_ = _set_3d(c, tool, name, o)
+        if o["type"] == "text":
+            set_["StyledText"] = _set_input(c, tool, name, "StyledText", value=str(o.get("text", "Text")))["value"]
+            if o.get("size") is not None:
+                set_["Size"] = _set_input(c, tool, name, "Size", value=float(o["size"]))["value"]
+            if o.get("depth"):
+                _set_input(c, tool, name, "Extrusion", value=1)
+                set_["ExtrusionDepth"] = _set_input(c, tool, name, "ExtrusionDepth", value=float(o["depth"]))["value"]
+            for key, v in zip(("Red1", "Green1", "Blue1"), o.get("color") or []):
+                set_[key] = _set_input(c, tool, name, key, value=float(v))["value"]
+        elif o["type"] == "shape":
+            set_["Shape"] = _set_input(c, tool, name, "Shape", value=SHAPES_3D[o.get("shape", "cube")])["value"]
+        report["objects"].append({"node": name, "type": o["type"], "set": set_})
+    cam_spec = {"position": [0, 0, 2], **(camera or {})}
+    cam_set = _set_3d(c, cam, "Camera3D", cam_spec)
+    if cam_spec.get("angle") is not None:
+        cam_set["AoV"] = _set_input(c, cam, "Camera3D", "AoV", value=float(cam_spec["angle"]))["value"]
+    report["camera"] = cam_set
+    report["lights"] = []
+    for (tool, name), lt in lit:
+        set_ = _set_3d(c, tool, name, lt)
+        for key, v in zip(("Red", "Green", "Blue"), lt.get("color") or []):
+            set_[key] = _set_input(c, tool, name, key, value=float(v))["value"]
+        report["lights"].append({"node": name, "type": lt["type"], "set": set_})
+    if lit:
+        _set_input(c, render, "Render3D", "RendererSoftware.LightingEnabled", value=1)
+        if shadows:
+            _set_input(c, render, "Render3D", "RendererSoftware.ShadowsEnabled", value=1)
+    return report
 
 
 
@@ -2990,6 +3249,7 @@ def set_title_text(
     _, tl = _timeline()
     it = _item(tl, item, track)
     comp, nodes = _text_nodes(it)
+    _touch(it, 1)
     if not nodes:
         raise ToolError(f"'{it.GetName()}' is not a Fusion title (no Text+ node); see list_titles")
     if node:
@@ -3063,7 +3323,7 @@ def animate_clip(
 def list_keyframes(item: int, comp: int = 1, track: int = 1) -> list[dict]:
     """Every animated input in a clip's Fusion comp with its keyframes: [{node, input, keyframes: [{frame, value}]}],
     frames counted from the clip's first frame."""
-    _, c = _comp(item, comp, track)
+    _, c = _comp(item, comp, track, write=False)
     _, tl = _timeline()
     first, _ = _comp_range(c, _item(tl, item, track))
     out = []
@@ -4637,6 +4897,7 @@ def _style_title(it, text, animation, exit, speed, font, style, size, color, pos
         if kind not in TITLE_ANIMATIONS:
             raise ToolError(f"animation must be one of: {', '.join(TITLE_ANIMATIONS)} (got {kind!r})")
     comp, nodes = _text_nodes(it)
+    _touch(it, 1)
     if not nodes:
         raise ToolError(f"'{it.GetName()}' has no Text+ node to set")
     tool = nodes[0]

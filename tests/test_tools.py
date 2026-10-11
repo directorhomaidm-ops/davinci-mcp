@@ -196,7 +196,7 @@ def test_all_tools_registered():
         "fusion_nodes", "fusion_inputs", "add_fusion_node", "connect_fusion_nodes", "delete_fusion_node",
         "set_fusion_input", "timeline_overview", "view_frame", "add_transition", "delete_items",
         "set_clip_enabled", "stabilize", "smart_reframe", "detect_scene_cuts", "dynamic_zoom",
-        "insert_fusion_effect", "fairlight_info", "apply_fairlight_preset", "add_track", "set_track",
+        "insert_fusion_effect", "list_fusion_tools", "fusion_3d_scene", "fairlight_info", "apply_fairlight_preset", "add_track", "set_track",
         "delete_track", "voice_isolation", "normalize_audio", "set_fades", "set_speed", "convert_to_stereo",
         "insert_audio", "sync_audio", "transcribe_audio", "create_subtitles", "magic_mask", "link_mask_to_tracker",
         "render_queue", "start_render", "delete_render_jobs", "save_render_preset", "browse_storage", "create_bin",
@@ -3149,3 +3149,51 @@ def test_levenberg_sees_through_a_channel_mixing_display():
     identity = ([1.0] * 3, [0.0] * 3, [1.0] * 3)
     (cdl, st), used = d._levenberg(display, identity, display(identity), goal, budget=48)
     assert d._error(st, goal) < 0.015 and used <= 48
+
+
+def test_list_fusion_tools(project):
+    assert [r["id"] for r in d.list_fusion_tools(category="3d")] == ["Merge3D", "Text3D"]  # sorted by name
+    assert d.list_fusion_tools(query="glow") == [
+        {"id": "ofx.com.blackmagicdesign.resolvefx.Glow", "name": "Glow", "category": "Resolve FX Light"}]
+
+
+def _comp1(project):
+    return project.current.tracks[("video", 1)][0].comps[0]
+
+
+def test_fusion_3d_scene_builds_wires_and_commits_a_tidy_tree(project):
+    d.append_clips(["a.mov"])
+    out = d.fusion_3d_scene(1, [{"type": "text", "text": "Hi", "depth": 0.1, "position": [0, 0.2, 0]},
+                                {"type": "shape", "shape": "sphere", "scale": 0.5}, {"type": "image"}],
+                            lights=[{"type": "spot", "intensity": 2}], shadows=True)
+    c = _comp1(project)
+    links = {t.name: {k: i.source.tool.name for k, i in t.inputs.items() if i.source} for t in c.tools}
+    assert links["Scene3D"] == {"SceneInput1": "Text3D1", "SceneInput2": "Shape3D1", "SceneInput3": "ImagePlane3D1",
+                                "SceneInput4": "Camera3D", "SceneInput5": "LightSpot1"}
+    assert links["ImagePlane3D1"]["MaterialInput"] == "MediaIn1"  # the clip on the plane
+    assert links["Over3D"] == {"Background": "MediaIn1", "Foreground": "Render3D"} and links["MediaOut1"] == {"Input": "Over3D"}
+    assert out["objects"][1]["set"]["Shape"] == "SurfaceSphereInputs" and out["camera"]["Transform3DOp.Translate.Z"] == 2
+    assert c.FindTool("Render3D").GetInput("RendererSoftware.ShadowsEnabled") == 1
+    # committed once, with every node of the tree at its own spot: main chain on row 0 left to right
+    item = project.current.tracks[("video", 1)][0]
+    assert item.imports == 1
+    pos = {t.name: t.pos for t in c.tools if hasattr(t, "pos")}
+    assert len(set(pos.values())) == len(pos) == len(c.tools)
+    assert pos["MediaIn1"][1] == pos["Over3D"][1] == pos["MediaOut1"][1] == 0
+    assert pos["MediaIn1"][0] < pos["Over3D"][0] < pos["MediaOut1"][0]
+    assert pos["Render3D"][1] < 0 and pos["Scene3D"][0] < pos["Render3D"][0]  # the branch above, flowing right
+    with pytest.raises(ToolError, match="already has a 3D scene"):
+        d.fusion_3d_scene(1, [{"type": "text"}])
+    for bad, msg in (([{"type": "cloud"}], "object type"), ([{"type": "shape", "shape": "star"}], "shape must be")):
+        with pytest.raises(ToolError, match=msg):
+            d.fusion_3d_scene(1, bad)
+
+
+def test_reading_a_comp_does_not_commit_it(project):
+    d.append_clips(["a.mov"])
+    d.insert_fusion_effect(1, "Blur")
+    item = project.current.tracks[("video", 1)][0]
+    assert item.imports == 1
+    d.fusion_nodes(1)
+    d.fusion_inputs(1, "Blur1")
+    assert item.imports == 1

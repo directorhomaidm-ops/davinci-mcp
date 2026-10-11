@@ -293,6 +293,10 @@ def run_checks(args, work, is_211):
     step("vfx: split_screen red left, blue right, 2% gap", lambda: _split(seq, work),
          needs=have_media, note="each clip must fill its half of the frame, whatever the clip's shape")
 
+    step("fusion: list_fusion_tools (ResolveFX and 3D)", lambda: _fusion_tools(), note="the ids insert_fusion_effect takes")
+    step("fusion: fusion_3d_scene gold 3D text over the clip shows in the frame", lambda: _scene_3d(seq, work),
+         needs=have_media, note="also proves the comp commit: script-built comps otherwise do not show in stills")
+
     print("\nTitles and subtitles")
     step("titles: insert Text+ and set_title_text (text, font, style, size, color)", lambda: _title(),
          needs=have_items, note="confirms the Text+ input names Font / Style / Red1")
@@ -600,6 +604,24 @@ def _still_box(path, match):
     if not pts:
         return (w, h), None
     return (w, h), (min(x for x, _ in pts), max(x for x, _ in pts) + 4, min(y for _, y in pts), max(y for _, y in pts) + 4)
+
+
+def _fusion_tools():
+    fx, three_d = d.list_fusion_tools(category="Resolve FX"), d.list_fusion_tools(category="3D")
+    expect(fx and any(t["id"] == "Text3D" for t in three_d), f"no ResolveFX or no Text3D: {len(fx)}, {three_d[:3]}")
+    return {"resolvefx": len(fx), "3d": len(three_d), "sample": [t["id"] for t in fx[:3]]}
+
+
+def _scene_3d(seq, work):
+    d.create_timeline("3D")
+    d.append_clips([seq[0]], start_frame=0, end_frame=23)  # blue
+    out = d.fusion_3d_scene(1, [{"type": "text", "text": "3D", "size": 0.3, "depth": 0.1, "color": [1, 0.85, 0.2]}],
+                            lights=[{"type": "directional", "rotation": [-30, 20, 0]}, {"type": "ambient", "intensity": 0.4}])
+    d.view_frame(frame=d.list_items()[0]["start"] + 12, save_to=str(work / "frame_3d.png"))
+    _, gold = _still_box(work / "frame_3d.png", lambda p: p[0] > 150 and p[1] > 110 and p[2] < 110)
+    d.switch_timeline("Check")
+    expect(gold, "the 3D text is not in the frame: the comp was not committed, or the scene did not render")
+    return {"objects": [o["node"] for o in out["objects"]], "lights": [l["node"] for l in out["lights"]], "gold_box": gold}
 
 
 def _split(seq, work):
