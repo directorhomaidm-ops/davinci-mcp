@@ -2825,6 +2825,20 @@ def test_animation_length_capped_at_a_third(project):
 # --- automatic color correction ---
 
 
+def test_shot_match_color_managed_matches_brightness_and_cast_only(project):
+    # live 21.1.1: on a color-managed timeline matching the levels too did not converge, so they are left alone
+    project.color["colorScienceMode"] = "davinciYRGBColorManagedv2"
+    _looks(project, {"lo": 0.1, "hi": 0.9}, {"lo": 0.05, "hi": 0.6, "cast": (0.85, 1.0, 1.2)})
+    out = d.shot_match(1, [2])
+    row = out["matched"][0]
+    assert "color-managed" in out["matched_on"] and row["error"] < 0.02
+    ref = out["reference"]
+    assert row["after"]["luma_mean"] == pytest.approx(ref["luma_mean"], abs=0.02)
+    cast = lambda n: [v - sum(n) / 3 for v in n]  # noqa: E731
+    assert cast(row["after"]["neutral"]) == pytest.approx(cast(ref["neutral"]), abs=0.02)
+    assert row["after"]["white"] != pytest.approx(out["reference"]["white"], abs=0.02)  # levels not chased
+
+
 def test_png_decoder_all_filters(tmp_path):
     class It:
         look, cdl = {"lo": 0.1, "hi": 0.8, "cast": (1.1, 1.0, 0.9)}, None

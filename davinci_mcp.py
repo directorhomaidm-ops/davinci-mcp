@@ -5071,10 +5071,12 @@ def _residuals(st, goal):
     # A clipped black or white point reads 0 or 1 however far past it the picture is, which gives the refinement
     # nothing to follow (live 21.1: S-Log3-decoded frames clipped a third of their pixels). When the goal is not
     # clipped itself, the share of pixels at the clip is added to the miss: it shrinks as the level comes back.
-    res = [st["black"][c] - goal["black"][c]
-           - (st["crushed_share"][c] if st["black"][c] <= 0.005 < goal["black"][c] else 0.0) for c in range(3)]
-    res += [st["white"][c] - goal["white"][c]
-            + (st["clipped_share"][c] if st["white"][c] >= 0.995 > goal["white"][c] else 0.0) for c in range(3)]
+    res = []
+    if goal.get("levels", True):
+        res += [st["black"][c] - goal["black"][c]
+                - (st["crushed_share"][c] if st["black"][c] <= 0.005 < goal["black"][c] else 0.0) for c in range(3)]
+        res += [st["white"][c] - goal["white"][c]
+                + (st["clipped_share"][c] if st["white"][c] >= 0.995 > goal["white"][c] else 0.0) for c in range(3)]
     if goal["neutral"] is not None:
         res += [st["neutral"][c] - goal["neutral"][c] for c in range(3)]
     else:
@@ -5293,10 +5295,17 @@ def auto_color(items: list[int], node: int = 1, levels: bool = True, balance: bo
                                        for i, it in targets])
 
 
+def _color_managed(proj, tl):
+    source = tl if str(tl.GetSetting("useCustomSettings")) == "1" else proj
+    return str(source.GetSetting("colorScienceMode") or "").startswith(("davinciYRGBColorManaged", "aces"))
+
+
 @_tool
 def shot_match(reference: int, targets: list[int], node: int = 1, iterations: int = 4, track: int = 1) -> dict:
     """Match video items to a reference shot: each target's black and white points, brightness and neutral color
     are driven to the reference's (measured at the middle frames) with a CDL on `node`, refined in a closed loop.
+    On a color-managed timeline only the mean brightness and the color cast are matched: there the CDL acts on log values
+    through Resolve's own tone mapping, and matching the levels too did not converge (live 21.1.1, error 0.05-0.2).
     The reference is not changed. Works best between shots of the same scene."""
     if not targets:
         raise ToolError("give the items to match")
@@ -5307,13 +5316,25 @@ def shot_match(reference: int, targets: list[int], node: int = 1, iterations: in
     proj, tl = _timeline()
     ref = _item(tl, reference, track)
     items = [(i, _item(tl, i, track)) for i in targets]
+    managed = _color_managed(proj, tl)
 
     def run():
         want = _measure(proj, tl, _mid_frame(ref))
         goal = {"black": want["black"], "white": want["white"], "mid": want["luma"]["mean"],
                 "neutral": want["neutral"], "cast": None}
-        rows = [_correct(proj, tl, i, it, node, lambda _st: goal, iterations, track) for i, it in items]
-        return {"reference": {"item": reference, "name": ref.GetName(), "verdict": _verdict(want),
+        if managed:
+            # the reference's mean brightness and its cast (neutral color relative to its own gray), as auto_color
+            # does: smoother than absolute neutral values, which follow a set of pixels that moves with the grade.
+            # Each target keeps its own levels as the model's black and white targets.
+            gray = sum(want["neutral"]) / 3
+            goal_of = lambda st: {"black": st["black"], "white": st["white"], "mid": want["luma"]["mean"],  # noqa: E731
+                                  "neutral": None, "cast": [n - gray for n in want["neutral"]], "levels": False}
+        else:
+            goal_of = lambda _st: goal  # noqa: E731
+        rows = [_correct(proj, tl, i, it, node, goal_of, iterations, track) for i, it in items]
+        return {"matched_on": "brightness and color cast (color-managed timeline)" if managed
+                else "levels, brightness and neutral color",
+                "reference": {"item": reference, "name": ref.GetName(), "verdict": _verdict(want),
                               "black": want["black"], "white": want["white"], "luma_mean": want["luma"]["mean"],
                               "neutral": want["neutral"]}, "matched": rows}
     return _with_playhead(tl, run)
