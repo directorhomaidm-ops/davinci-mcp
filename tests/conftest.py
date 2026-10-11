@@ -1,5 +1,6 @@
 """In-memory stand-in for DaVinci Resolve's scripting API, so the tools can be tested without Resolve."""
 import sys
+import re
 import types
 from pathlib import Path
 
@@ -9,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 UI = {"page": "edit"}
+EXPORTED = {}  # comp file path -> the fake comp written there, so an import restores its contents
 
 KNOWN_SPACES = {"Rec.709 Gamma 2.4", "Rec.2100 ST2084", "Rec.2100 HLG", "DaVinci WG/Intermediate", "ARRI LogC4"}
 SETTING_ENUMS = {
@@ -446,14 +448,26 @@ class Item:
             return None
         active = getattr(self, "active_comp", None)
         i = next((i for i, c in enumerate(self.comps) if c.name == active), len(self.comps) - 1)
-        self.comps[i] = FuComp(self.comps[i].name, template="TextPlus" in Path(path).read_text())
+        text = Path(path).read_text()
+        source = EXPORTED.get(str(Path(path).resolve()))
+        if source is not self.comps[i]:  # another comp's file (a template): a comp like it, under this comp's name
+            self.comps[i] = FuComp(self.comps[i].name, template="TextPlus" in text)
+        self.imports = getattr(self, "imports", 0) + 1
+        for name, x, y in re.findall(r"^\t\t(\w+) = \w+ \{\n\t\t\tViewInfo = OperatorInfo \{ Pos = \{ ([-\d.]+), ([-\d.]+) \} \},",
+                                     text, re.M):
+            tool = self.comps[i].FindTool(name)
+            if tool:
+                tool.pos = (float(x), float(y))
         return self.comps[i]
 
     def ExportFusionComp(self, path, index):
         self.exported_comp = (path, index)
         if not 1 <= index <= len(self.comps):
             return False
-        Path(path).write_text("{ Tools = { " + ", ".join(t.kind for t in self.comps[index - 1].tools) + " } }")
+        comp = self.comps[index - 1]
+        EXPORTED[str(Path(path).resolve())] = comp
+        Path(path).write_text("Composition {\n\tTools = ordered() {\n" + "".join(
+            f"\t\t{t.name} = {t.kind} {{\n\t\t\tInputs = {{\n\t\t\t}},\n\t\t}},\n" for t in comp.tools) + "\t},\n}\n")
         return True
 
     def LoadFusionCompByName(self, name):
@@ -542,7 +556,30 @@ TOOL_INPUTS = {
     "BezierSpline": {},
     "PolyPath": {},
 }
+# Fusion 3D, with the input names measured on live 21.1.1
+_XFORM3D = {f"Transform3DOp.{op}.{axis}": "Number" for op in ("Translate", "Rotate", "Scale") for axis in "XYZ"}
+TOOL_INPUTS.update({
+    "Merge3D": {**{f"SceneInput{n}": "DataType3D" for n in range(1, 9)}, **_XFORM3D},
+    "Renderer3D": {"SceneInput": "DataType3D", "RendererSoftware.LightingEnabled": "Number",
+                   "RendererSoftware.ShadowsEnabled": "Number"},
+    "Camera3D": {"SceneInput": "DataType3D", "AoV": "Number", **_XFORM3D},
+    "Text3D": {"SceneInput": "DataType3D", "StyledText": "Text", "Size": "Number", "Extrusion": "Number",
+               "ExtrusionDepth": "Number", "Red1": "Number", "Green1": "Number", "Blue1": "Number", **_XFORM3D},
+    "Shape3D": {"SceneInput": "DataType3D", "MaterialInput": "MtlGraph3D", "Shape": "Text", **_XFORM3D},
+    "ImagePlane3D": {"SceneInput": "DataType3D", "MaterialInput": "Image", **_XFORM3D},
+    **{k: {"SceneInput": "DataType3D", "Intensity": "Number", "Red": "Number", "Green": "Number", "Blue": "Number",
+           **_XFORM3D} for k in ("LightAmbient", "LightDirectional", "LightPoint", "LightSpot")},
+})
+TOOL_INPUTS["Merge"] = {**TOOL_INPUTS["Merge"], "Background": "Image", "Foreground": "Image"}
 DEFAULTS = {"Number": 0.0, "Point": {1: 0.5, 2: 0.5}, "Text": ""}
+FUSION_REGISTRY = [("Blur", "Blur", "Blur"), ("Text3D", "Text 3D", "3D"), ("Merge3D", "Merge 3D", "3D"),
+                   ("ofx.com.blackmagicdesign.resolvefx.Glow", "Glow", "Resolve FX Light")]
+
+
+class FusionApp:
+    def GetRegList(self, kind):
+        return {n: types.SimpleNamespace(GetAttrs=lambda r=r: {"REGS_ID": r[0], "REGS_Name": r[1], "REGS_Category": r[2]})
+                for n, r in enumerate(FUSION_REGISTRY, 1)}
 
 
 class FuOutput:
@@ -640,7 +677,7 @@ class FuTool:
                 inp.value = inp.keys[max(inp.keys)]
             inp.source, inp.keys = None, {}
             return True
-        if not inp or inp.kind not in ("Image", "Mask"):
+        if not inp or inp.kind not in ("Image", "Mask", "DataType3D", "MtlGraph3D"):
             return False
         inp.source = src.output if src else None
         return True
@@ -1414,6 +1451,9 @@ class MediaStorage:
 
 
 class Resolve:
+    def Fusion(self):
+        return FusionApp()
+
     EXPORT_LUT_17PTCUBE, EXPORT_LUT_33PTCUBE, EXPORT_LUT_65PTCUBE = 0, 1, 2
     EXPORT_NONE, EXPORT_AAF_NEW, EXPORT_AAF_EXISTING, EXPORT_CDL, EXPORT_SDL, EXPORT_MISSING_CLIPS = 0, 1, 2, 3, 4, 5
     EXPORT_AAF, EXPORT_DRT, EXPORT_EDL, EXPORT_FCP_7_XML, EXPORT_OTIO = 10, 11, 12, 13, 14
